@@ -1,0 +1,117 @@
+# Runa Scaffold, Ownership and Reflection Ready
+
+## Summary
+- Build a final-shape scaffold with active roots: `bootstrap/`, `compiler/`, `toolchain/`, and `libraries/`.
+- Keep `runa` as the primary CLI.
+- Keep runtime tiny, private, and under `compiler/`.
+- Make explicit ownership and reflection first-class language features from day one.
+- Assume self-hosting architecturally, but do not create a real `selfhost/` tree yet.
+
+## Key Changes
+- Top-level roots:
+  - `cmd/`
+  - `bootstrap/`
+  - `compiler/`
+  - `toolchain/`
+  - `libraries/`
+  - `docs/`
+  - `spec/`
+  - `tests/`
+  - `examples/`
+- `compiler/` uses dense domain roots:
+  - `driver/`, `session/`, `query/`
+  - `source/`, `diag/`, `syntax/`, `parse/`
+  - `ast/`, `lowering/`, `hir/`, `typed/`
+  - `types/`, `resolve/`, `intern/`, `metadata/`
+  - `ownership/`, `borrow/`, `lifetimes/`, `regions/`
+  - `reflect/`, `ctfe/`
+  - `mir/`, `ir/`, `codegen/`, `link/`
+  - `target/`, `abi/`, `runtime/`
+- Explicit ownership surface is reserved now:
+  - `read`, `edit`, `take`
+  - `hold` as a retained-borrow qualifier
+  - `&read`, `&edit`
+- Ownership intent is explicit by default.
+- Lifetimes or regions are explicit in source.
+- Semantic assumptions for scaffold purposes:
+  - `take` is consuming ownership
+  - `read` and `edit` are ephemeral borrows
+  - `hold read` and `hold edit` are retained borrows
+  - `hold edit` stays exclusive for its lifetime
+  - `&` is borrow syntax, not shared ownership
+- Compiler pipeline contract:
+  - syntax, AST, HIR, and typed forms preserve explicit ownership and lifetime data
+  - type checking produces `typed/`
+  - ownership and borrow validation runs as a post-type pass
+  - MIR lowering happens only after ownership validation succeeds
+- Reflection model:
+  - compile-time reflection is first-class
+  - reserve `compiler/ctfe/` for compile-time evaluation and reflection-driven meta execution
+  - runtime reflection exists only through explicit metadata emission
+  - reflection exposes a rich semantic view: types, fields, functions, generics, ownership qualifiers, and lifetimes or regions
+- Runtime reflection privacy:
+  - runtime reflection can inspect only metadata explicitly exported for reflection
+- `libraries/` owns public shipped libraries, especially:
+  - `std/`
+  - `std/reflect/` as the public reflection surface
+- `compiler/runtime/` is private and tiny:
+  - `entry/`
+  - `abort/`
+  - `target/`
+- `compiler/runtime/` owns only:
+  - program entry or startup leaf code
+  - fatal abort or termination leaf code
+  - unavoidable target-isolated leaf code
+- `compiler/runtime/` must not own:
+  - allocation policy
+  - `defer`
+  - syscalls or OS convenience wrappers
+  - threading, scheduling, async, GC, unwinding, or recovery
+  - language-visible APIs
+- `toolchain/` owns broad tooling:
+  - `workspace/`, `build/`, `package/`
+  - `fmt/`, `doc/`, `lsp/`, `test/`
+- `bootstrap/zig/` contains Zig stage0 integration and bootstrap entrypoints only.
+- Add `llm.md` to each root needing local guidance: `compiler/`, `toolchain/`, `libraries/`, `docs/`, and `tests/`.
+
+## Public Interfaces
+- Primary public command:
+  - `runa`
+- Reserve Rust-like workflow subcommands:
+  - `new`, `build`, `check`, `test`, `fmt`, `doc`
+- Public language/library surfaces reserved now:
+  - explicit ownership qualifiers and reference forms
+  - `std.reflect` as the public reflection API
+- `runa check` and compiler diagnostics must eventually report:
+  - type errors
+  - ownership violations
+  - borrow violations
+  - lifetime or region mismatches
+  - reflection metadata or export misuse
+- Runtime remains a compiler or linker detail, not a public API.
+
+## Test Plan
+- Build smoke targets for `runa` and reserved secondary binaries.
+- Add scaffold-shape tests to enforce required roots and prevent monolithic collapse.
+- Add compiler smoke tests for:
+  - parsing explicit ownership forms
+  - parsing explicit lifetime or region forms
+  - lowering ownership data through HIR and typed forms
+  - post-type ownership and borrow validation
+  - MIR and IR gating on successful ownership checks
+  - compile-time reflection queries
+  - CTFE startup and reflection-driven meta execution
+  - zero runtime metadata when not opted in
+  - exported-only runtime reflection metadata
+  - C ABI boundary fixtures
+  - runtime entry and abort fixtures
+  - target-isolated runtime fixtures for Windows and Linux
+
+## Assumptions
+- `Runa` is the fixed toolchain name.
+- Broad tooling is a hard requirement, so `toolchain/` is dense from day one.
+- Self-hosting is assumed architecturally, but no real `selfhost/` tree is created yet.
+- Runtime is implemented in Zig first, but kept narrow enough to later rewrite in Runa.
+- `defer` is compiler-owned; std may add extra behavior, but runtime is not involved.
+- Runtime failures are abort-only: no fallback paths, no recovery behavior.
+- Runtime reflection metadata is explicit opt-in, not always emitted.

@@ -1,0 +1,22 @@
+.zig-cache/
+zig-out/
+
+# Local editor state
+.vscode/
+.idea/
+.vs/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local Codex scratch files
+.codex_tmp*
+.tmp_*
+
+# Common local noise
+*.log
+*.tmp
+*.bak
+*.orig
