@@ -104,7 +104,15 @@ The goal is to implement all specs, not a partial showcase subset.
 - [x] Replace raw-name/string-pattern coherence validation with canonical trait/type-head coherence over session-owned indexes
 - [x] Route typed-produced body diagnostics through checked-body statement/expression diagnostic facts
 - [x] Replace typed-produced body diagnostics with fully query-originated statement and expression diagnostic facts
+- [x] Replace remaining typed-owned signature diagnostics with query-owned checked-signature and module-signature validation
+- [x] Replace remaining typed-owned trait/impl signature diagnostics with query-owned trait completeness, default-body syntax, and executable-method duplicate validation
 - [x] Expand domain-state storage escape analysis beyond constructor writes to assignment and other non-domain storage paths
+- [x] Remove `checkedBody` dependence on typed finalization by making query-owned body parsing/lowering the live path
+- [x] Replace typed-owned default-method synthesis with query-owned declared, inherited, and imported method facts
+- [x] Replace typed-payload-based checked-signature fact construction with query-owned syntax lowering
+- [x] Lower const-required sites from stored syntax rather than reparsed text
+- [x] Reduce `typed` to prepared structure only: no live semantic diagnostics, body parsing, const lowering, or synthetic default methods
+- [x] Delete old typed declaration/signature/body parser helpers after query ownership cutover
 
 ## Async And Runtime
 - [x] Structured child-task teardown semantics

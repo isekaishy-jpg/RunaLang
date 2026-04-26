@@ -1,4 +1,5 @@
 const const_ir = @import("const_ir.zig");
+const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const std = @import("std");
 const typed = @import("../typed/root.zig");
@@ -7,14 +8,16 @@ pub const summary = "Query-owned const IR lowering and evaluation.";
 
 pub const Resolver = *const fn (active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!const_ir.Value;
 pub const AssociatedResolver = *const fn (active: *session.Session, module_id: session.ModuleId, owner_name: []const u8, const_name: []const u8) anyerror!const_ir.Value;
+pub const SignatureResolver = *const fn (active: *session.Session, item_id: session.ItemId) anyerror!query_types.CheckedSignature;
 
 pub fn evalExpr(
     active: *session.Session,
     module_id: session.ModuleId,
     expr: *const const_ir.Expr,
     resolve_identifier: Resolver,
+    resolve_signature: SignatureResolver,
 ) anyerror!const_ir.Value {
-    return evalExprWithAssociated(active, module_id, expr, resolve_identifier, null);
+    return evalExprWithAssociated(active, module_id, expr, resolve_identifier, null, resolve_signature);
 }
 
 pub fn evalExprWithAssociated(
@@ -23,12 +26,14 @@ pub fn evalExprWithAssociated(
     expr: *const const_ir.Expr,
     resolve_identifier: Resolver,
     resolve_associated_const: ?AssociatedResolver,
+    resolve_signature: SignatureResolver,
 ) anyerror!const_ir.Value {
     return const_ir.evalExpr(active.allocator, EvalContext{
         .active = active,
         .module_id = module_id,
         .resolve_identifier = resolve_identifier,
         .resolve_associated_const = resolve_associated_const,
+        .resolve_signature = resolve_signature,
     }, expr, resolveIdentifier);
 }
 
@@ -37,6 +42,7 @@ const EvalContext = struct {
     module_id: session.ModuleId,
     resolve_identifier: Resolver,
     resolve_associated_const: ?AssociatedResolver,
+    resolve_signature: SignatureResolver,
 
     pub fn structFieldName(self: EvalContext, type_name: []const u8, index: usize) ?[]const u8 {
         return structFieldNameFor(self, type_name, index);
@@ -61,16 +67,16 @@ fn resolveIdentifier(context: EvalContext, name: []const u8) anyerror!const_ir.V
 }
 
 fn structFieldNameFor(context: EvalContext, type_name: []const u8, index: usize) ?[]const u8 {
-    const item = typeItem(context.active, context.module_id, type_name) orelse return null;
-    return switch (item.payload) {
+    const checked = typeSignature(context, type_name) orelse return null;
+    return switch (checked.facts) {
         .struct_type => |struct_type| if (index < struct_type.fields.len) struct_type.fields[index].name else null,
         else => null,
     };
 }
 
 fn enumPayloadFieldNameFor(context: EvalContext, enum_name: []const u8, variant_name: []const u8, index: usize) ?[]const u8 {
-    const item = typeItem(context.active, context.module_id, enum_name) orelse return null;
-    const enum_type = switch (item.payload) {
+    const checked = typeSignature(context, enum_name) orelse return null;
+    const enum_type = switch (checked.facts) {
         .enum_type => |enum_type| enum_type,
         else => return null,
     };
@@ -83,8 +89,8 @@ fn enumPayloadFieldNameFor(context: EvalContext, enum_name: []const u8, variant_
 }
 
 fn enumVariantTagFor(context: EvalContext, enum_name: []const u8, variant_name: []const u8) ?i32 {
-    const item = typeItem(context.active, context.module_id, enum_name) orelse return null;
-    const enum_type = switch (item.payload) {
+    const checked = typeSignature(context, enum_name) orelse return null;
+    const enum_type = switch (checked.facts) {
         .enum_type => |enum_type| enum_type,
         else => return null,
     };
@@ -94,12 +100,17 @@ fn enumVariantTagFor(context: EvalContext, enum_name: []const u8, variant_name: 
     return null;
 }
 
-fn typeItem(active: *session.Session, module_id: session.ModuleId, type_name: []const u8) ?*const typed.Item {
+fn typeSignature(context: EvalContext, type_name: []const u8) ?query_types.CheckedSignature {
+    const item_id = typeItemId(context.active, context.module_id, type_name) orelse return null;
+    return context.resolve_signature(context.active, item_id) catch null;
+}
+
+fn typeItemId(active: *session.Session, module_id: session.ModuleId, type_name: []const u8) ?session.ItemId {
     for (active.semantic_index.items.items, 0..) |entry, index| {
         if (entry.module_id.index != module_id.index) continue;
         const item = active.item(.{ .index = index });
         if (item.category != .type_decl) continue;
-        if (std.mem.eql(u8, item.name, type_name)) return item;
+        if (std.mem.eql(u8, item.name, type_name)) return .{ .index = index };
     }
     const module = active.module(module_id);
     for (module.imports.items) |binding| {
@@ -107,7 +118,7 @@ fn typeItem(active: *session.Session, module_id: session.ModuleId, type_name: []
         for (active.semantic_index.items.items, 0..) |_, index| {
             const item = active.item(.{ .index = index });
             if (item.category != .type_decl) continue;
-            if (std.mem.eql(u8, item.symbol_name, binding.target_symbol)) return item;
+            if (std.mem.eql(u8, item.symbol_name, binding.target_symbol)) return .{ .index = index };
         }
     }
     return null;

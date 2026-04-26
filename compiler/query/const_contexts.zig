@@ -5,7 +5,7 @@ const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("../typed/text.zig");
+const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
 
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;
@@ -93,7 +93,7 @@ fn validateEnumDiscriminants(
     resolve_associated_const: AssociatedResolver,
     summary: *Summary,
 ) !void {
-    const repr = try reprEnumInfo(active, checked.item.attributes);
+        const repr = try reprEnumInfo(active, checked.item.attributes);
     if (!repr.has_repr) {
         for (variants) |variant| {
             if (variant.discriminant != null) {
@@ -150,7 +150,7 @@ fn validateEnumDiscriminants(
         };
 
         summary.checked_enum_discriminants += 1;
-        const site = findConstRequiredExpr(checked.item.const_required_exprs, .enum_discriminant, variant.name, discriminant) orelse {
+        const site = findConstRequiredExpr(checked.const_required_expr_sites, .enum_discriminant, variant.name, discriminant) orelse {
             summary.rejected_enum_discriminants += 1;
             try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, error.UnsupportedConstExpr);
             continue;
@@ -211,7 +211,7 @@ fn reprEnumInfo(active: *session.Session, attributes: []const @import("../ast/ro
 fn evalEnumDiscriminant(
     active: *session.Session,
     module_id: session.ModuleId,
-    site: typed.ConstRequiredExpr,
+    site: query_types.ConstRequiredExprSite,
     result_type: types.Builtin,
     resolve_identifier: Resolver,
     resolve_associated_const: AssociatedResolver,
@@ -222,11 +222,11 @@ fn evalEnumDiscriminant(
 }
 
 fn findConstRequiredExpr(
-    sites: []const typed.ConstRequiredExpr,
-    kind: typed.ConstRequiredExprKind,
+    sites: []const query_types.ConstRequiredExprSite,
+    kind: query_types.ConstRequiredExprKind,
     owner_name: []const u8,
     source_text: []const u8,
-) ?typed.ConstRequiredExpr {
+) ?query_types.ConstRequiredExprSite {
     for (sites) |site| {
         if (site.kind != kind) continue;
         if (!std.mem.eql(u8, site.owner_name, owner_name)) continue;
@@ -289,7 +289,7 @@ fn validateArrayLengthSites(
     resolve_associated_const: AssociatedResolver,
     summary: *Summary,
 ) !void {
-    for (checked.item.const_required_exprs) |site| {
+    for (checked.const_required_expr_sites) |site| {
         if (site.kind != .array_length) continue;
         summary.checked_array_lengths += 1;
         _ = evalArrayLength(active, checked.module_id, site, resolve_identifier, resolve_associated_const) catch |err| {
@@ -302,7 +302,7 @@ fn validateArrayLengthSites(
 fn evalArrayLength(
     active: *session.Session,
     module_id: session.ModuleId,
-    site: typed.ConstRequiredExpr,
+    site: query_types.ConstRequiredExprSite,
     resolve_identifier: Resolver,
     resolve_associated_const: AssociatedResolver,
 ) !usize {
@@ -314,13 +314,11 @@ fn evalArrayLength(
 fn evalConstRequiredExpr(
     active: *session.Session,
     module_id: session.ModuleId,
-    site: typed.ConstRequiredExpr,
+    site: query_types.ConstRequiredExprSite,
     resolve_identifier: Resolver,
     resolve_associated_const: AssociatedResolver,
 ) !const_ir.Value {
-    const typed_expr = site.expr orelse return site.parse_error orelse error.UnsupportedConstExpr;
-    const lowered = try const_ir.lowerExpr(active.allocator, typed_expr);
-    defer const_ir.destroyExpr(active.allocator, lowered);
+    const lowered = site.expr orelse return site.lower_error orelse error.UnsupportedConstExpr;
 
     return const_ir.evalExpr(active.allocator, EvalContext{
         .active = active,

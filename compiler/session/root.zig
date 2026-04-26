@@ -3,7 +3,6 @@ const driver = @import("../driver/root.zig");
 const intern = @import("../intern/root.zig");
 const query = @import("../query/root.zig");
 const query_types = @import("../query/types.zig");
-const typed = @import("../typed/root.zig");
 const cache = @import("cache.zig");
 const ids = @import("ids.zig");
 const Allocator = std.mem.Allocator;
@@ -96,7 +95,6 @@ pub const Session = struct {
         item_id: ItemId,
         module: *const @import("../typed/root.zig").Module,
         item: *const @import("../typed/root.zig").Item,
-        function: *const @import("../typed/root.zig").FunctionData,
     } {
         const entry = self.semantic_index.bodyEntry(id);
         const body_item = self.item(entry.item_id);
@@ -105,7 +103,6 @@ pub const Session = struct {
             .item_id = entry.item_id,
             .module = self.module(entry.module_id),
             .item = body_item,
-            .function = &body_item.payload.function,
         };
     }
 
@@ -123,19 +120,6 @@ pub const Session = struct {
     pub fn popActiveQuery(self: *Session) void {
         _ = self.active_queries.pop();
     }
-
-    pub fn ensureTypedModuleFinalized(self: *Session, module_id: ModuleId) !void {
-        const module_entry = self.semantic_index.moduleEntry(module_id);
-        var module_pipeline = &self.pipeline.modules.items[module_entry.pipeline_index];
-        if (module_pipeline.typed_finalized) return;
-        try typed.finalizePreparedModule(
-            self.allocator,
-            &module_pipeline.typed,
-            &module_pipeline.prototypes,
-            &self.pipeline.diagnostics,
-        );
-        module_pipeline.typed_finalized = true;
-    }
 };
 
 pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
@@ -151,8 +135,6 @@ pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
     errdefer active.pipeline.deinit();
     errdefer active.interner.deinit();
 
-    try prepareSyntheticSemanticItems(&active);
-
     for (active.pipeline.modules.items) |module| {
         for (module.resolved.symbols.items) |symbol| {
             if (symbol.name.len == 0) continue;
@@ -167,16 +149,6 @@ pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
     errdefer active.caches.deinit(allocator);
 
     return active;
-}
-
-fn prepareSyntheticSemanticItems(active: *Session) !void {
-    for (active.pipeline.modules.items) |*module_pipeline| {
-        try typed.prepareImportedDefaultMethods(
-            active.allocator,
-            &module_pipeline.typed,
-            &module_pipeline.prototypes,
-        );
-    }
 }
 
 pub fn intoPipeline(self: *Session) driver.Pipeline {

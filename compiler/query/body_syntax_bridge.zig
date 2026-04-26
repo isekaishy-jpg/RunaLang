@@ -3,7 +3,7 @@ const ast = @import("../ast/root.zig");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
 const item_syntax_bridge = @import("item_syntax_bridge.zig");
-const typed_decls = @import("declarations.zig");
+const typed_decls = @import("../typed/declarations.zig");
 const signatures = @import("signatures.zig");
 const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
@@ -17,6 +17,8 @@ const EnumVariant = typed_decls.EnumVariant;
 const TraitMethod = typed_decls.TraitMethod;
 const TraitAssociatedType = typed_decls.TraitAssociatedType;
 const TraitAssociatedConst = typed_decls.TraitAssociatedConst;
+const TraitAssociatedTypeBinding = typed_decls.TraitAssociatedTypeBinding;
+const TraitAssociatedConstBinding = typed_decls.TraitAssociatedConstBinding;
 const ParameterMode = typed_decls.ParameterMode;
 const isPlainIdentifier = typed_text.isPlainIdentifier;
 const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
@@ -304,6 +306,110 @@ pub fn parseImplMethodsFromSyntax(
     return try methods.toOwnedSlice();
 }
 
+pub fn parseImplAssociatedTypesFromSyntax(
+    allocator: Allocator,
+    associated_types: []const ast.AssociatedTypeDeclSyntax,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) ![]TraitAssociatedTypeBinding {
+    var lowered = std.array_list.Managed(TraitAssociatedTypeBinding).init(allocator);
+    errdefer lowered.deinit();
+
+    for (associated_types) |associated_type| {
+        const name = associated_type.name orelse {
+            try diagnostics.add(.@"error", "type.impl.associated_type", span, "malformed impl associated type binding", .{});
+            continue;
+        };
+        const value = associated_type.value orelse {
+            try diagnostics.add(.@"error", "type.impl.associated_type", span, "impl associated type '{s}' requires '= Type'", .{name.text});
+            continue;
+        };
+
+        const name_text = std.mem.trim(u8, name.text, " \t");
+        const value_text = std.mem.trim(u8, value.text, " \t");
+        if (!isPlainIdentifier(name_text) or value_text.len == 0) {
+            try diagnostics.add(.@"error", "type.impl.associated_type", span, "malformed impl associated type binding '{s}'", .{name.text});
+            continue;
+        }
+
+        var duplicate = false;
+        for (lowered.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name_text)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            try diagnostics.add(.@"error", "type.impl.associated_duplicate", span, "duplicate associated type binding '{s}' in impl", .{name_text});
+            continue;
+        }
+
+        try lowered.append(.{
+            .name = name_text,
+            .value_type_name = value_text,
+            .value_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(value_text)),
+        });
+    }
+
+    return lowered.toOwnedSlice();
+}
+
+pub fn parseImplAssociatedConstsFromSyntax(
+    allocator: Allocator,
+    associated_consts: []const ast.ConstSignatureSyntax,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) ![]TraitAssociatedConstBinding {
+    var lowered = std.array_list.Managed(TraitAssociatedConstBinding).init(allocator);
+    errdefer {
+        for (lowered.items) |*binding| binding.deinit(allocator);
+        lowered.deinit();
+    }
+
+    for (associated_consts) |associated_const| {
+        const name = associated_const.name orelse {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding", .{});
+            continue;
+        };
+        const type_text = associated_const.ty orelse {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "impl associated const '{s}' requires an explicit type", .{name.text});
+            continue;
+        };
+        if (associated_const.initializer == null) {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "impl associated const '{s}' requires a const initializer", .{name.text});
+            continue;
+        }
+
+        const name_text = std.mem.trim(u8, name.text, " \t");
+        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        if (!isPlainIdentifier(name_text) or type_name.len == 0) {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding '{s}'", .{name.text});
+            continue;
+        }
+
+        var duplicate = false;
+        for (lowered.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name_text)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            try diagnostics.add(.@"error", "type.impl.associated_const_duplicate", span, "duplicate associated const binding '{s}' in impl", .{name_text});
+            continue;
+        }
+
+        var const_data = try item_syntax_bridge.parseConstDataFromSyntax(allocator, associated_const, span, diagnostics);
+        errdefer const_data.deinit(allocator);
+        try lowered.append(.{
+            .name = name_text,
+            .const_data = const_data,
+        });
+    }
+
+    return lowered.toOwnedSlice();
+}
+
 pub fn parseExecutableMethodFromSyntax(
     allocator: Allocator,
     target_type: []const u8,
@@ -401,8 +507,6 @@ fn parseTraitMethodFromSyntax(
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !TraitMethod {
-    var method_syntax = try method.clone(allocator);
-    errdefer method_syntax.deinit(allocator);
     const signature_name = method.signature.name orelse {
         try diagnostics.add(.@"error", "type.trait.member", span, "unsupported trait member", .{});
         return .{
@@ -411,6 +515,8 @@ fn parseTraitMethodFromSyntax(
             .has_default_body = method.block_syntax != null,
         };
     };
+    var method_syntax = try method.clone(allocator);
+    errdefer method_syntax.deinit(allocator);
 
     const local_generic_params = try item_syntax_bridge.parseGenericParamsFromSpan(allocator, method.signature.generic_params, span, diagnostics);
     errdefer if (local_generic_params.len != 0) allocator.free(local_generic_params);

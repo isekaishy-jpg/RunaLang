@@ -755,6 +755,98 @@ test "query diagnostics are not repeated for cached signature and body results" 
     try std.testing.expect(saw_return_missing_value);
 }
 
+test "checked signature does not demand body parsing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    let value: I32 = true
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const before_signature = active.pipeline.diagnostics.items.items.len;
+    _ = try compiler.query.checkedSignature(&active, main_id);
+    try std.testing.expectEqual(before_signature, active.pipeline.diagnostics.items.items.len);
+
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    _ = try compiler.query.checkedBody(&active, body_id);
+
+    var found_body_mismatch = false;
+    for (active.pipeline.diagnostics.items.items[before_signature..]) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.binding.mismatch")) {
+            found_body_mismatch = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_body_mismatch);
+}
+
+test "checked signature facts come from stored syntax not typed payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const main_entry = active.semantic_index.itemEntry(main_id);
+    const typed_item = &active.pipeline.modules.items[main_entry.pipeline_module_index].typed.items.items[main_entry.item_index];
+    switch (typed_item.payload) {
+        .none => {},
+        else => return error.UnexpectedStructure,
+    }
+
+    const checked = try compiler.query.checkedSignature(&active, main_id);
+    const function = switch (checked.facts) {
+        .function => |function| function,
+        else => return error.UnexpectedStructure,
+    };
+    try std.testing.expect(function.return_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
+    try std.testing.expectEqualStrings("I32", function.return_type_name);
+
+    try compiler.query.finalizeSemanticChecks(&active);
+    const mir_module = active.pipeline.modules.items[main_entry.pipeline_module_index].mir.?;
+    var found_main = false;
+    for (mir_module.items.items) |mir_item| {
+        if (!std.mem.eql(u8, mir_item.name, "main")) continue;
+        found_main = true;
+        const mir_function = switch (mir_item.payload) {
+            .function => |mir_function| mir_function,
+            else => return error.UnexpectedStructure,
+        };
+        try std.testing.expect(mir_function.return_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
+    }
+    try std.testing.expect(found_main);
+}
+
 test "query cycle failures cache by family key without repeated diagnostics" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3896,6 +3988,161 @@ test "c abi validation rejects unsupported conventions and types" {
     try std.testing.expect(saw_param_type);
 }
 
+test "query signature validation owns item shape and const mismatch diagnostics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#bogus
+        \\fn missing() -> Unit
+        \\
+        \\opaque type Blob:
+        \\    value: I32
+        \\
+        \\const FLAG: Bool = 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_unknown_attr = false;
+    var saw_missing_body = false;
+    var saw_opaque_body = false;
+    var saw_const_mismatch = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.unknown")) saw_unknown_attr = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.fn.body")) saw_missing_body = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.opaque.body")) saw_opaque_body = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.const.mismatch")) saw_const_mismatch = true;
+    }
+    try std.testing.expect(saw_unknown_attr);
+    try std.testing.expect(saw_missing_body);
+    try std.testing.expect(saw_opaque_body);
+    try std.testing.expect(saw_const_mismatch);
+}
+
+test "query signature validation rejects unsupported stage0 foreign signature types" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\#unsafe
+        \\extern["c"] fn take_box(value: Box) -> Box
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_return = false;
+    var saw_param = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.stage0.return")) saw_return = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.stage0.param_type")) saw_param = true;
+    }
+    try std.testing.expect(saw_return);
+    try std.testing.expect(saw_param);
+}
+
+test "query module signature validation rejects duplicate imported bindings and methods" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct LocalA:
+        \\    value: I32
+        \\
+        \\impl LocalA:
+        \\    fn reset(edit self) -> Unit:
+        \\        return
+        \\
+        \\struct LocalB:
+        \\    value: I32
+        \\
+        \\impl LocalB:
+        \\    fn reset(edit self) -> Unit:
+        \\        return
+        \\
+        \\fn main() -> Unit:
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+    const module_pipeline = &active.pipeline.modules.items[0];
+    const span = compiler.source.Span{
+        .file_id = module_pipeline.resolved.file_id,
+        .start = 0,
+        .end = 0,
+    };
+    try module_pipeline.import_binding_sites.append(.{
+        .local_name = "Counter",
+        .span = span,
+    });
+    try module_pipeline.import_binding_sites.append(.{
+        .local_name = "Counter",
+        .span = span,
+    });
+    const local_a = for (module_pipeline.typed.items.items) |item| {
+        if (std.mem.eql(u8, item.name, "LocalA")) break item;
+    } else return error.TestExpectedEqual;
+    const local_b = for (module_pipeline.typed.items.items) |item| {
+        if (std.mem.eql(u8, item.name, "LocalB")) break item;
+    } else return error.TestExpectedEqual;
+    try module_pipeline.typed.imports.append(.{
+        .local_name = "Counter",
+        .target_name = local_a.name,
+        .target_symbol = local_a.symbol_name,
+        .category = .type_decl,
+    });
+    try module_pipeline.typed.imports.append(.{
+        .local_name = "Counter",
+        .target_name = local_b.name,
+        .target_symbol = local_b.symbol_name,
+        .category = .type_decl,
+    });
+    const summary = try compiler.query.moduleSignatureDiagnostics(&active, .{ .index = 0 });
+
+    var saw_duplicate_import = false;
+    var saw_duplicate_method = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.import.duplicate")) saw_duplicate_import = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.method.duplicate")) saw_duplicate_method = true;
+    }
+    try std.testing.expectEqual(@as(usize, 2), summary.summary.prepared_issue_count);
+    try std.testing.expect(saw_duplicate_import);
+    try std.testing.expect(saw_duplicate_method);
+}
+
 test "publication validation rejects unresolved path dependencies" {
     const bad_manifest =
         \\[package]
@@ -4537,8 +4784,8 @@ test "query associated const evaluation rejects invalid compile-time conversions
 
     var impl_const_id: ?compiler.session.AssociatedConstId = null;
     for (active.semantic_index.associated_consts.items, 0..) |entry, index| {
-        const item = active.item(entry.item_id);
-        const impl_block = switch (item.payload) {
+        const checked = compiler.query.checkedSignature(&active, entry.item_id) catch continue;
+        const impl_block = switch (checked.facts) {
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
@@ -6975,10 +7222,14 @@ test "semantic accepts trait impl associated type binding" {
     try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
     try std.testing.expectEqual(@as(usize, 1), active.semantic_index.impls.items.len);
     const impl_id = compiler.session.ImplId{ .index = 0 };
-    const impl_item = active.item(active.semantic_index.implEntry(impl_id).item_id);
-    try std.testing.expectEqual(@as(usize, 1), impl_item.payload.impl_block.associated_types.len);
-    try std.testing.expectEqualStrings("Item", impl_item.payload.impl_block.associated_types[0].name);
-    try std.testing.expectEqualStrings("I32", impl_item.payload.impl_block.associated_types[0].value_type_name);
+    const impl_sig = try compiler.query.checkedSignature(&active, active.semantic_index.implEntry(impl_id).item_id);
+    const impl_block = switch (impl_sig.facts) {
+        .impl_block => |impl_block| impl_block,
+        else => return error.UnexpectedTestResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), impl_block.associated_types.len);
+    try std.testing.expectEqualStrings("Item", impl_block.associated_types[0].name);
+    try std.testing.expectEqualStrings("I32", impl_block.associated_types[0].value_type_name);
 }
 
 test "semantic rejects missing trait impl associated type binding" {
@@ -7095,8 +7346,8 @@ test "semantic accepts trait impl associated const binding" {
 
     var impl_const_id: ?compiler.session.AssociatedConstId = null;
     for (active.semantic_index.associated_consts.items, 0..) |entry, index| {
-        const item = active.item(entry.item_id);
-        const impl_block = switch (item.payload) {
+        const checked = compiler.query.checkedSignature(&active, entry.item_id) catch continue;
+        const impl_block = switch (checked.facts) {
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
@@ -10705,6 +10956,55 @@ test "stage0 check rejects missing required trait impl methods" {
         }
     }
     try std.testing.expect(found_missing);
+}
+
+test "query signature validation rejects missing trait default method syntax" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\trait Reset:
+        \\    fn reset(take self) -> I32:
+        \\        return 1
+        \\
+        \\struct Counter:
+        \\    value: I32
+        \\
+        \\impl Reset for Counter:
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const reset_item_id = compiler.query.testing.findItemIdByName(&active, "Reset").?;
+    const reset_entry = active.semantic_index.itemEntry(reset_item_id);
+    var reset_item = &active.pipeline.modules.items[reset_entry.pipeline_module_index].hir.items.items[reset_entry.item_index];
+    switch (reset_item.body_syntax) {
+        .trait_body => |*trait_body| {
+            trait_body.methods[0].signature.name = null;
+        },
+        else => return error.UnexpectedStructure,
+    }
+
+    try compiler.query.finalizeSemanticChecks(&active);
+
+    var found_missing_syntax = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.method.syntax.missing")) {
+            found_missing_syntax = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_missing_syntax);
 }
 
 test "stage0 check rejects duplicate executable methods on one type" {

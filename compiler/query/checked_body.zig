@@ -1,5 +1,6 @@
 const callee_helpers = @import("callee_helpers.zig");
-const callable_types = @import("../typed/callable_types.zig");
+const callable_types = @import("callable_types.zig");
+const const_ir = @import("const_ir.zig");
 const source = @import("../source/root.zig");
 const std = @import("std");
 const typed = @import("../typed/root.zig");
@@ -203,6 +204,8 @@ pub const SelectArmSite = struct {
     bindings: []const SelectBindingSite,
     body_block_id: usize,
     pattern_irrefutable: bool = false,
+    constant_pattern_expr: ?*const const_ir.Expr = null,
+    constant_pattern_lower_error: ?anyerror = null,
 };
 
 pub const StatementSite = struct {
@@ -241,14 +244,16 @@ pub const LocalConstDeclSite = struct {
     ty: types.TypeRef,
     explicit_type: bool,
     span: source.Span,
-    expr: *const typed.Expr,
+    expr: ?*const const_ir.Expr = null,
+    lower_error: ?anyerror = null,
 };
 
 pub const ArrayRepetitionLengthSite = struct {
     statement_index: usize,
     scope_id: usize,
     span: ?source.Span,
-    length_expr: *const typed.Expr,
+    length_expr: ?*const const_ir.Expr = null,
+    lower_error: ?anyerror = null,
 };
 
 pub const CallArgumentSite = struct {
@@ -354,6 +359,7 @@ pub const Facts = struct {
         allocator.free(self.block_sites);
         for (self.statement_sites) |site| {
             for (site.select_arms) |arm| {
+                if (arm.constant_pattern_expr) |expr| const_ir.destroyExpr(allocator, expr);
                 if (arm.bindings.len != 0) allocator.free(arm.bindings);
             }
             if (site.select_arms.len != 0) allocator.free(site.select_arms);
@@ -372,7 +378,13 @@ pub const Facts = struct {
         allocator.free(self.pattern_diagnostic_sites);
         allocator.free(self.repeat_iteration_sites);
         allocator.free(self.lexical_scopes);
+        for (self.local_const_decl_sites) |site| {
+            if (site.expr) |expr| const_ir.destroyExpr(allocator, expr);
+        }
         allocator.free(self.local_const_decl_sites);
+        for (self.array_repetition_length_sites) |site| {
+            if (site.length_expr) |expr| const_ir.destroyExpr(allocator, expr);
+        }
         allocator.free(self.array_repetition_length_sites);
         allocator.free(self.call_argument_sites);
         allocator.free(self.constructor_argument_sites);
@@ -525,7 +537,13 @@ const Builder = struct {
         self.pattern_diagnostic_sites.deinit();
         self.repeat_iteration_sites.deinit();
         self.lexical_scopes.deinit();
+        for (self.local_const_decl_sites.items) |site| {
+            if (site.expr) |expr| const_ir.destroyExpr(self.allocator, expr);
+        }
         self.local_const_decl_sites.deinit();
+        for (self.array_repetition_length_sites.items) |site| {
+            if (site.length_expr) |expr| const_ir.destroyExpr(self.allocator, expr);
+        }
         self.array_repetition_length_sites.deinit();
         self.call_argument_sites.deinit();
         self.constructor_argument_sites.deinit();
@@ -694,6 +712,7 @@ const Builder = struct {
                 site.binding_expr = binding.expr;
                 self.summary.const_count += 1;
                 self.summary.binding_count += 1;
+                const lowered = try self.lowerConstExpr(binding.expr);
                 try self.local_const_decl_sites.append(.{
                     .statement_index = statement_index,
                     .scope_id = self.currentScopeId(),
@@ -701,7 +720,8 @@ const Builder = struct {
                     .ty = binding.ty,
                     .explicit_type = binding.explicit_type,
                     .span = binding.span,
-                    .expr = binding.expr,
+                    .expr = lowered.expr,
+                    .lower_error = lowered.lower_error,
                 });
                 try self.addPlace(.{
                     .kind = .local_const,
@@ -775,6 +795,7 @@ const Builder = struct {
                         .body_block_id = 0,
                         .pattern_irrefutable = arm.pattern_irrefutable,
                     };
+                    try self.recordConstantPatternExpr(&owned_select_arms[arm_index], select_data.subject_temp_name);
                     try self.visitExpr(callable_resolver, statement_index, null, arm.condition);
                     self.summary.binding_count += arm.bindings.len;
                     for (arm.bindings) |binding| {
@@ -879,6 +900,7 @@ const Builder = struct {
 
     fn freeSelectArms(self: *Builder, arms: []const SelectArmSite) void {
         for (arms) |arm| {
+            if (arm.constant_pattern_expr) |expr| const_ir.destroyExpr(self.allocator, expr);
             if (arm.bindings.len != 0) self.allocator.free(arm.bindings);
         }
         if (arms.len != 0) self.allocator.free(arms);
@@ -959,11 +981,13 @@ const Builder = struct {
                 for (array.items) |item| try self.visitExpr(callable_resolver, statement_index, span, item);
             },
             .array_repeat => |array_repeat| {
+                const lowered = try self.lowerConstExpr(array_repeat.length);
                 try self.array_repetition_length_sites.append(.{
                     .statement_index = statement_index,
                     .scope_id = self.currentScopeId(),
                     .span = span,
-                    .length_expr = array_repeat.length,
+                    .length_expr = lowered.expr,
+                    .lower_error = lowered.lower_error,
                 });
                 try self.visitExpr(callable_resolver, statement_index, span, array_repeat.value);
                 try self.visitExpr(callable_resolver, statement_index, span, array_repeat.length);
@@ -1188,6 +1212,25 @@ const Builder = struct {
         });
     }
 
+    fn lowerConstExpr(self: *Builder, expr: *const typed.Expr) !struct {
+        expr: ?*const const_ir.Expr,
+        lower_error: ?anyerror,
+    } {
+        const lowered = const_ir.lowerExpr(self.allocator, expr) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .expr = null, .lower_error = err },
+        };
+        return .{ .expr = lowered, .lower_error = null };
+    }
+
+    fn recordConstantPatternExpr(self: *Builder, arm_site: *SelectArmSite, subject_temp_name: ?[]const u8) !void {
+        const temp_name = subject_temp_name orelse return;
+        const pattern_expr = equalityPatternExpr(arm_site.condition, temp_name) orelse return;
+        const lowered = try self.lowerConstExpr(pattern_expr);
+        arm_site.constant_pattern_expr = lowered.expr;
+        arm_site.constant_pattern_lower_error = lowered.lower_error;
+    }
+
     fn recordSubjectPatterns(self: *Builder, statement_index: usize, select_data: *const typed.Statement.SelectData) !void {
         var saw_irrefutable = false;
         for (select_data.arms, 0..) |arm, arm_index| {
@@ -1237,3 +1280,33 @@ const Builder = struct {
         return null;
     }
 };
+
+fn equalityPatternExpr(expr: *const typed.Expr, subject_temp_name: []const u8) ?*const typed.Expr {
+    return switch (expr.node) {
+        .binary => |binary| {
+            if (binary.op != .eq) return null;
+            if (isSubjectPatternComparable(binary.lhs, subject_temp_name)) return binary.rhs;
+            if (isSubjectPatternComparable(binary.rhs, subject_temp_name)) return binary.lhs;
+            return null;
+        },
+        else => null,
+    };
+}
+
+fn isSubjectPatternComparable(expr: *const typed.Expr, subject_temp_name: []const u8) bool {
+    return isSubjectTemp(expr, subject_temp_name) or isSubjectTag(expr, subject_temp_name);
+}
+
+fn isSubjectTemp(expr: *const typed.Expr, subject_temp_name: []const u8) bool {
+    return switch (expr.node) {
+        .identifier => |name| std.mem.eql(u8, name, subject_temp_name),
+        else => false,
+    };
+}
+
+fn isSubjectTag(expr: *const typed.Expr, subject_temp_name: []const u8) bool {
+    return switch (expr.node) {
+        .field => |field| std.mem.eql(u8, field.field_name, "tag") and isSubjectTemp(field.base, subject_temp_name),
+        else => false,
+    };
+}

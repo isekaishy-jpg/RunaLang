@@ -17,7 +17,7 @@ This spec governs:
 
 - `session`
 - `query`
-- `typed`
+- `typed` as a prepared-structure layer
 - trait solving
 - CTFE
 - reflection metadata construction
@@ -32,7 +32,8 @@ Runa uses one semantic pipeline over one shared frontend.
 
 - `session` owns semantic identities, caches, and cycle tracking.
 - `query` exposes demand-driven semantic operations over stable keys.
-- `typed` computes checked signatures and checked bodies.
+- `typed` prepares declaration structure, imported binding data, and syntax handles.
+- `query` computes checked signatures and checked bodies.
 - ownership, borrow, lifetimes, and regions remain explicit semantic analyzers
   over checked bodies.
 - CTFE and reflection consume checked semantic facts, not raw syntax text.
@@ -143,19 +144,23 @@ This is the permanent quality target for speed and durability in v1.
 
 Type checking remains an explicit semantic stage with query-backed boundaries.
 
+- Frontend and prep stages establish declaration kinds, declared names,
+  imported binding data, and raw syntax handles.
 - Resolution facts feed signature checking.
-- Signature checking establishes item-level type, generic, and associated-const facts.
-- Type aliases resolve as items, but canonical semantic type facts use the underlying aliased type.
+- Query-owned signature checking establishes item-level type, generic,
+  associated-type, and associated-const facts.
+- Type aliases resolve as items, but canonical semantic type facts use the
+  underlying aliased type.
 - Body checking consumes resolved signatures, active `where` environment,
   and trait-solver services.
 - Checked body output is the semantic substrate for ownership, borrow,
   lifetime, region, CTFE, and reflection work where applicable.
 
-Typed logic must not smear trait solving, const evaluation, and reflection
-collection into one-off ad hoc helpers. Those are permanent semantic services
-with explicit query boundaries.
+Prep-layer logic must not own semantic diagnostics, default-method inheritance,
+const evaluation, or checked-body construction. Those are permanent semantic
+services with explicit query boundaries.
 
-The permanent checked-body substrate is one explicit typed-body result keyed by
+The permanent checked-body substrate is one explicit checked-body result keyed by
 body identity.
 
 - Ownership results are queried separately from that body identity.
@@ -349,10 +354,13 @@ This semantic architecture is complete only when:
 
 - `session` owns semantic caches and cycle tracking
 - `query` is a real semantic API rather than a thin facade
+- `query` owns checked signatures and checked bodies
 - trait solving is exposed as reusable goal solving
 - CTFE uses dedicated const-evaluable semantic representation
 - reflection metadata construction is query-backed and declaration-oriented
-- typed, ownership, borrow, lifetimes, and regions consume the same semantic
+- `typed` remains a prep layer only and does not own semantic diagnostics,
+  checked-body parsing, const lowering, or synthetic default methods
+- ownership, borrow, lifetimes, and regions consume the same semantic
   architecture without duplicate paths
 
 Until then, fail loudly on unsupported semantic slices instead of preserving

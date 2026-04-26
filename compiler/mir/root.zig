@@ -12,12 +12,53 @@ pub const requires_ownership_validation = true;
 pub const BinaryOp = typed.BinaryOp;
 pub const UnaryOp = typed.UnaryOp;
 pub const ConversionMode = typed.ConversionMode;
-pub const ImportedBinding = typed.ImportedBinding;
 pub const ConstExpr = const_ir.Expr;
 pub const ConstValue = const_ir.Value;
 
+pub const ImportedBinding = struct {
+    local_name: []const u8,
+    target_name: []const u8,
+    target_symbol: []const u8,
+    category: typed.ItemCategory,
+    const_type: ?types.TypeRef = null,
+    function_return_type: ?types.TypeRef = null,
+    function_generic_params: []typed.GenericParam = &.{},
+    function_where_predicates: []typed.WherePredicate = &.{},
+    function_is_suspend: bool = false,
+    function_parameter_types: ?[]types.TypeRef = null,
+    function_parameter_type_names: ?[]const []const u8 = null,
+    function_parameter_modes: ?[]typed.ParameterMode = null,
+    struct_fields: ?[]typed.StructField = null,
+    enum_variants: ?[]typed.EnumVariant = null,
+    trait_methods: ?[]typed.TraitMethod = null,
+
+    pub fn deinit(self: ImportedBinding, allocator: Allocator) void {
+        if (self.function_generic_params.len != 0) allocator.free(self.function_generic_params);
+        if (self.function_where_predicates.len != 0) allocator.free(self.function_where_predicates);
+        if (self.function_parameter_types) |value| allocator.free(value);
+        if (self.function_parameter_type_names) |value| allocator.free(value);
+        if (self.function_parameter_modes) |value| allocator.free(value);
+        if (self.struct_fields) |fields| allocator.free(fields);
+        if (self.enum_variants) |variants| {
+            for (variants) |*variant| variant.deinit(allocator);
+            allocator.free(variants);
+        }
+        if (self.trait_methods) |methods| {
+            for (methods) |*method| method.deinit(allocator);
+            allocator.free(methods);
+        }
+    }
+};
+
+pub const ModuleInput = struct {
+    file_id: source.FileId,
+    module_path: []const u8,
+    imports: []const ImportedBinding,
+};
+
 pub const Expr = struct {
     ty: types.TypeRef,
+    owned_callee: ?[]u8 = null,
     node: Node,
 
     pub const Node = union(enum) {
@@ -102,6 +143,7 @@ pub const Expr = struct {
     };
 
     fn deinit(self: *Expr, allocator: Allocator) void {
+        if (self.owned_callee) |owned_callee| allocator.free(owned_callee);
         switch (self.node) {
             .enum_construct => |construct| {
                 for (construct.args) |arg| {
@@ -418,13 +460,17 @@ pub const Payload = union(enum) {
 
 pub const Item = struct {
     name: []const u8,
+    owned_name: ?[]u8 = null,
     symbol_name: []const u8,
+    owned_symbol_name: ?[]u8 = null,
     kind: typed.ItemCategory,
     is_entry_candidate: bool,
     span: source.Span,
     payload: Payload = .none,
 
-    fn deinit(self: *Item, allocator: Allocator) void {
+    pub fn deinit(self: *Item, allocator: Allocator) void {
+        if (self.owned_name) |owned_name| allocator.free(owned_name);
+        if (self.owned_symbol_name) |owned_symbol_name| allocator.free(owned_symbol_name);
         self.payload.deinit(allocator);
     }
 };
@@ -433,15 +479,26 @@ pub const Module = struct {
     file_id: source.FileId,
     module_path: []const u8,
     items: array_list.Managed(Item),
-    imports: array_list.Managed(typed.ImportedBinding),
+    imports: array_list.Managed(ImportedBinding),
+    retained_checked_functions: []*typed.FunctionData = &.{},
 
     pub fn init(allocator: Allocator, file_id: source.FileId, module_path: []const u8) Module {
         return .{
             .file_id = file_id,
             .module_path = module_path,
             .items = array_list.Managed(Item).init(allocator),
-            .imports = array_list.Managed(typed.ImportedBinding).init(allocator),
+            .imports = array_list.Managed(ImportedBinding).init(allocator),
         };
+    }
+
+    pub fn appendRetainedCheckedFunction(self: *Module, function: *typed.FunctionData) !void {
+        const allocator = self.items.allocator;
+        const next_len = self.retained_checked_functions.len + 1;
+        self.retained_checked_functions = if (self.retained_checked_functions.len == 0)
+            try allocator.alloc(*typed.FunctionData, next_len)
+        else
+            try allocator.realloc(self.retained_checked_functions, next_len);
+        self.retained_checked_functions[next_len - 1] = function;
     }
 
     pub fn deinit(self: *Module) void {
@@ -449,20 +506,30 @@ pub const Module = struct {
         self.items.deinit();
         for (self.imports.items) |binding| binding.deinit(self.items.allocator);
         self.imports.deinit();
+        for (self.retained_checked_functions) |function| {
+            var owned = function;
+            owned.deinit(self.items.allocator);
+            self.items.allocator.destroy(owned);
+        }
+        if (self.retained_checked_functions.len != 0) self.items.allocator.free(self.retained_checked_functions);
         self.items.allocator.free(self.module_path);
     }
 };
 
 fn lowerModuleWithFacts(
     allocator: Allocator,
-    module: typed.Module,
+    module: ModuleInput,
     checked_signatures: []const query_types.CheckedSignature,
     checked_bodies: []const query_types.CheckedBody,
 ) !Module {
     var mir_module = Module.init(allocator, module.file_id, try allocator.dupe(u8, module.module_path));
     errdefer mir_module.deinit();
+    for (checked_bodies) |checked_body| {
+        const function = checked_body.owned_function orelse continue;
+        try mir_module.appendRetainedCheckedFunction(function);
+    }
 
-    for (module.imports.items) |binding| {
+    for (module.imports) |binding| {
         try mir_module.imports.append(.{
             .local_name = binding.local_name,
             .target_name = binding.target_name,
@@ -470,8 +537,11 @@ fn lowerModuleWithFacts(
             .category = binding.category,
             .const_type = binding.const_type,
             .function_return_type = binding.function_return_type,
+            .function_generic_params = if (binding.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, binding.function_generic_params) else &.{},
+            .function_where_predicates = if (binding.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, binding.function_where_predicates) else &.{},
             .function_is_suspend = binding.function_is_suspend,
             .function_parameter_types = if (binding.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
+            .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
             .function_parameter_modes = if (binding.function_parameter_modes) |values| try allocator.dupe(typed.ParameterMode, values) else null,
             .struct_fields = if (binding.struct_fields) |fields| try allocator.dupe(typed.StructField, fields) else null,
             .enum_variants = if (binding.enum_variants) |variants| try duplicateImportedEnumVariants(allocator, variants) else null,
@@ -491,7 +561,7 @@ fn lowerModuleWithFacts(
         };
         errdefer mir_item.deinit(allocator);
 
-        switch (item.payload) {
+        switch (checked_signature.facts) {
             .function => |function| {
                 const checked_body = findCheckedBodyByItemId(checked_bodies, checked_signature.item_id) orelse return error.MissingCheckedBody;
                 const parameters = checked_body.parameters;
@@ -518,11 +588,7 @@ fn lowerModuleWithFacts(
                     .foreign = function.foreign,
                 } };
             },
-            .const_item => {
-                const const_signature = switch (checked_signature.facts) {
-                    .const_item => |const_item| const_item,
-                    else => return error.InvalidMirLowering,
-                };
+            .const_item => |const_signature| {
                 const expr = const_signature.expr orelse return error.InvalidMirLowering;
                 mir_item.payload = .{ .const_item = .{
                     .ty = const_signature.ty,
@@ -579,10 +645,7 @@ fn lowerModuleWithFacts(
             .opaque_type => {
                 mir_item.payload = .{ .opaque_type = .{} };
             },
-            .union_type => {},
-            .trait_type => {},
-            .impl_block => {},
-            .none => {},
+            .union_type, .trait_type, .impl_block, .none => {},
         }
 
         try mir_module.items.append(mir_item);
@@ -593,20 +656,16 @@ fn lowerModuleWithFacts(
 
 pub fn lowerModuleFromCheckedFacts(
     allocator: Allocator,
-    module: typed.Module,
+    module: ModuleInput,
     checked_signatures: anytype,
     checked_bodies: anytype,
 ) !Module {
     for (checked_signatures) |checked_signature| {
-        switch (checked_signature.item.payload) {
+        switch (checked_signature.facts) {
             .function => {
                 if (findCheckedBodyByItemId(checked_bodies, checked_signature.item_id) == null) return error.MissingCheckedBody;
             },
-            .const_item => {
-                const const_signature = switch (checked_signature.facts) {
-                    .const_item => |const_item| const_item,
-                    else => return error.InvalidMirLowering,
-                };
+            .const_item => |const_signature| {
                 if (const_signature.expr == null) return error.InvalidMirLowering;
             },
             else => {},
@@ -616,11 +675,154 @@ pub fn lowerModuleFromCheckedFacts(
     return lowerModuleWithFacts(allocator, module, checked_signatures, checked_bodies);
 }
 
+pub fn lowerTypedFunctionItem(
+    allocator: Allocator,
+    name: []const u8,
+    symbol_name: []const u8,
+    span: source.Span,
+    function: *const typed.FunctionData,
+    is_entry_candidate: bool,
+) !Item {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_symbol_name = try allocator.dupe(u8, symbol_name);
+    errdefer allocator.free(owned_symbol_name);
+
+    const params = try allocator.alloc(Parameter, function.parameters.items.len);
+    errdefer allocator.free(params);
+    for (function.parameters.items, 0..) |parameter, index| {
+        params[index] = .{
+            .name = parameter.name,
+            .mode = parameter.mode,
+            .ty = parameter.ty,
+        };
+    }
+
+    var body = try lowerTypedBlock(allocator, &function.body);
+    errdefer body.deinit(allocator);
+
+    return .{
+        .name = owned_name,
+        .owned_name = owned_name,
+        .symbol_name = owned_symbol_name,
+        .owned_symbol_name = owned_symbol_name,
+        .kind = .value,
+        .is_entry_candidate = is_entry_candidate,
+        .span = span,
+        .payload = .{ .function = .{
+            .return_type = function.return_type,
+            .parameters = params,
+            .body = body,
+            .export_name = function.export_name,
+            .is_suspend = function.is_suspend,
+            .foreign = function.foreign,
+        } },
+    };
+}
+
 fn findCheckedBodyByItemId(checked_bodies: []const query_types.CheckedBody, item_id: @import("../session/ids.zig").ItemId) ?query_types.CheckedBody {
     for (checked_bodies) |body| {
         if (body.item_id.index == item_id.index) return body;
     }
     return null;
+}
+
+fn lowerTypedBlock(allocator: Allocator, block: *const typed.Block) anyerror!Block {
+    var lowered = Block.init(allocator);
+    errdefer lowered.deinit(allocator);
+    for (block.statements.items) |statement| {
+        try lowered.statements.append(try lowerTypedStatement(allocator, statement));
+    }
+    return lowered;
+}
+
+fn lowerTypedStatement(allocator: Allocator, statement: typed.Statement) anyerror!Statement {
+    return switch (statement) {
+        .placeholder => .placeholder,
+        .let_decl => |binding| .{ .let_decl = .{
+            .name = binding.name,
+            .ty = binding.ty,
+            .expr = try cloneTypedExpr(allocator, binding.expr),
+        } },
+        .const_decl => |binding| .{ .const_decl = .{
+            .name = binding.name,
+            .ty = binding.ty,
+            .expr = try cloneTypedExpr(allocator, binding.expr),
+        } },
+        .assign_stmt => |assign| .{ .assign_stmt = .{
+            .name = assign.name,
+            .ty = assign.ty,
+            .op = assign.op,
+            .expr = try cloneTypedExpr(allocator, assign.expr),
+        } },
+        .select_stmt => |select_data| blk: {
+            var arms = try allocator.alloc(Statement.SelectArm, select_data.arms.len);
+            errdefer allocator.free(arms);
+            for (select_data.arms, 0..) |arm, index| {
+                const arm_body = try allocator.create(Block);
+                errdefer allocator.destroy(arm_body);
+                arm_body.* = try lowerTypedBlock(allocator, arm.body);
+                errdefer arm_body.deinit(allocator);
+
+                const bindings = try allocator.alloc(Statement.SelectBinding, arm.bindings.len);
+                errdefer allocator.free(bindings);
+                for (arm.bindings, 0..) |binding, binding_index| {
+                    bindings[binding_index] = .{
+                        .name = binding.name,
+                        .ty = binding.ty,
+                        .expr = try cloneTypedExpr(allocator, binding.expr),
+                    };
+                }
+                arms[index] = .{
+                    .condition = try cloneTypedExpr(allocator, arm.condition),
+                    .bindings = bindings,
+                    .body = arm_body,
+                };
+            }
+
+            var else_body: ?*Block = null;
+            if (select_data.else_body) |body| {
+                const lowered_else = try allocator.create(Block);
+                errdefer allocator.destroy(lowered_else);
+                lowered_else.* = try lowerTypedBlock(allocator, body);
+                else_body = lowered_else;
+            }
+
+            const result = try allocator.create(Statement.SelectData);
+            errdefer allocator.destroy(result);
+            result.* = .{
+                .subject = if (select_data.subject) |subject| try cloneTypedExpr(allocator, subject) else null,
+                .subject_temp_name = if (select_data.subject_temp_name) |value| try allocator.dupe(u8, value) else null,
+                .arms = arms,
+                .else_body = else_body,
+            };
+            break :blk .{ .select_stmt = result };
+        },
+        .loop_stmt => |loop_data| blk: {
+            const lowered_body = try allocator.create(Block);
+            errdefer allocator.destroy(lowered_body);
+            lowered_body.* = try lowerTypedBlock(allocator, loop_data.body);
+
+            const result = try allocator.create(Statement.LoopData);
+            errdefer allocator.destroy(result);
+            result.* = .{
+                .condition = if (loop_data.condition) |condition| try cloneTypedExpr(allocator, condition) else null,
+                .body = lowered_body,
+            };
+            break :blk .{ .loop_stmt = result };
+        },
+        .unsafe_block => |body| blk: {
+            const lowered_body = try allocator.create(Block);
+            errdefer allocator.destroy(lowered_body);
+            lowered_body.* = try lowerTypedBlock(allocator, body);
+            break :blk .{ .unsafe_block = lowered_body };
+        },
+        .defer_stmt => |expr| .{ .defer_stmt = try cloneTypedExpr(allocator, expr) },
+        .break_stmt => .break_stmt,
+        .continue_stmt => .continue_stmt,
+        .return_stmt => |maybe_expr| .{ .return_stmt = if (maybe_expr) |expr| try cloneTypedExpr(allocator, expr) else null },
+        .expr_stmt => |expr| .{ .expr_stmt = try cloneTypedExpr(allocator, expr) },
+    };
 }
 
 pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Module {
@@ -636,8 +838,11 @@ pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Modul
                 .category = binding.category,
                 .const_type = binding.const_type,
                 .function_return_type = binding.function_return_type,
+                .function_generic_params = if (binding.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, binding.function_generic_params) else &.{},
+                .function_where_predicates = if (binding.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, binding.function_where_predicates) else &.{},
                 .function_is_suspend = binding.function_is_suspend,
                 .function_parameter_types = if (binding.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
+                .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
                 .function_parameter_modes = if (binding.function_parameter_modes) |values| try allocator.dupe(typed.ParameterMode, values) else null,
                 .struct_fields = if (binding.struct_fields) |fields| try allocator.dupe(typed.StructField, fields) else null,
                 .enum_variants = if (binding.enum_variants) |variants| try duplicateImportedEnumVariants(allocator, variants) else null,
@@ -924,6 +1129,7 @@ fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
     errdefer allocator.destroy(result);
 
     result.ty = expr.ty;
+    var owned_callee: ?[]u8 = null;
     result.node = switch (expr.node) {
         .integer => |value| .{ .integer = value },
         .bool_lit => |value| .{ .bool_lit = value },
@@ -963,8 +1169,12 @@ fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
             for (call.args, 0..) |arg, index| {
                 args[index] = try cloneTypedExpr(allocator, arg);
             }
+            owned_callee = try allocator.dupe(u8, call.callee);
+            errdefer {
+                if (owned_callee) |value| allocator.free(value);
+            }
             break :blk .{ .call = .{
-                .callee = call.callee,
+                .callee = owned_callee.?,
                 .args = args,
             } };
         },
@@ -1017,6 +1227,7 @@ fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
             .rhs = try cloneTypedExpr(allocator, binary.rhs),
         } },
     };
+    result.owned_callee = owned_callee;
 
     return result;
 }
@@ -1026,6 +1237,7 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
     errdefer allocator.destroy(result);
 
     result.ty = expr.ty;
+    var owned_callee: ?[]u8 = null;
     result.node = switch (expr.node) {
         .integer => |value| .{ .integer = value },
         .bool_lit => |value| .{ .bool_lit = value },
@@ -1053,8 +1265,12 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
             for (call.args, 0..) |arg, index| {
                 args[index] = try cloneExpr(allocator, arg);
             }
+            owned_callee = try allocator.dupe(u8, call.callee);
+            errdefer {
+                if (owned_callee) |value| allocator.free(value);
+            }
             break :blk .{ .call = .{
-                .callee = call.callee,
+                .callee = owned_callee.?,
                 .args = args,
             } };
         },
@@ -1106,6 +1322,7 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
             .rhs = try cloneExpr(allocator, binary.rhs),
         } },
     };
+    result.owned_callee = owned_callee;
 
     return result;
 }

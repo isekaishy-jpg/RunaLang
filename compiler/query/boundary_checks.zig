@@ -2,8 +2,8 @@ const std = @import("std");
 const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
-const type_support = @import("../typed/type_support.zig");
-const typed_text = @import("../typed/text.zig");
+const type_support = @import("type_support.zig");
+const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
 
 const baseTypeName = typed_text.baseTypeName;

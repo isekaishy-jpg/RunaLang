@@ -4,7 +4,7 @@ const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const trait_solver = @import("trait_solver.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("../typed/text.zig");
+const typed_text = @import("text.zig");
 
 const baseTypeName = typed_text.baseTypeName;
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;

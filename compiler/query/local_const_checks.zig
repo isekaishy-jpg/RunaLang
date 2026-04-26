@@ -4,7 +4,7 @@ const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("../typed/text.zig");
+const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
 const checked_body = @import("checked_body.zig");
 const query_types = @import("types.zig");
@@ -18,6 +18,7 @@ pub const Summary = struct {
 
 pub const Resolver = *const fn (active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!const_ir.Value;
 pub const AssociatedResolver = *const fn (active: *session.Session, module_id: session.ModuleId, owner_name: []const u8, const_name: []const u8) anyerror!const_ir.Value;
+pub const SignatureResolver = *const fn (active: *session.Session, item_id: session.ItemId) anyerror!query_types.CheckedSignature;
 
 const LocalConstState = enum {
     not_started,
@@ -41,6 +42,7 @@ const LocalEnv = struct {
     decls: []LocalDecl,
     resolve_identifier: Resolver,
     resolve_associated_const: AssociatedResolver,
+    resolve_signature: SignatureResolver,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -48,6 +50,7 @@ const LocalEnv = struct {
         body: query_types.CheckedBody,
         resolve_identifier: Resolver,
         resolve_associated_const: AssociatedResolver,
+        resolve_signature: SignatureResolver,
     ) !LocalEnv {
         const decls = try allocator.alloc(LocalDecl, body.local_const_decl_sites.len);
         errdefer allocator.free(decls);
@@ -62,6 +65,7 @@ const LocalEnv = struct {
             .decls = decls,
             .resolve_identifier = resolve_identifier,
             .resolve_associated_const = resolve_associated_const,
+            .resolve_signature = resolve_signature,
         };
     }
 
@@ -99,8 +103,9 @@ pub fn analyzeBody(
     diagnostics: *diag.Bag,
     resolve_identifier: Resolver,
     resolve_associated_const: AssociatedResolver,
+    resolve_signature: SignatureResolver,
 ) !Summary {
-    var env = try LocalEnv.init(active.allocator, active, body, resolve_identifier, resolve_associated_const);
+    var env = try LocalEnv.init(active.allocator, active, body, resolve_identifier, resolve_associated_const, resolve_signature);
     defer env.deinit();
 
     var summary = Summary{};
@@ -159,7 +164,7 @@ fn analyzeArrayRepetitionLength(
     summary: *Summary,
 ) !void {
     summary.checked_array_repetition_lengths += 1;
-    var value = evalLocalConst(env, site.length_expr, site.scope_id, site.statement_index) catch |err| {
+    var value = evalLoweredConst(env, site.length_expr, site.lower_error, site.scope_id, site.statement_index) catch |err| {
         summary.rejected_array_repetition_lengths += 1;
         try reportArrayRepetitionLengthError(diagnostics, site.span, err);
         return;
@@ -192,7 +197,7 @@ fn evalLocalDecl(decl_index: usize, env: *LocalEnv) anyerror!const_ir.Value {
     }
 
     env.decls[decl_index].state = .in_progress;
-    const value = evalLocalConst(env, site.expr, site.scope_id, site.statement_index) catch |err| {
+    const value = evalLoweredConst(env, site.expr, site.lower_error, site.scope_id, site.statement_index) catch |err| {
         env.decls[decl_index].state = .failed;
         env.decls[decl_index].err = err;
         return err;
@@ -203,11 +208,14 @@ fn evalLocalDecl(decl_index: usize, env: *LocalEnv) anyerror!const_ir.Value {
     return value;
 }
 
-fn evalLocalConst(env: *LocalEnv, expr: *const typed.Expr, scope_id: usize, statement_index: usize) anyerror!const_ir.Value {
-    var arena = std.heap.ArenaAllocator.init(env.allocator);
-    defer arena.deinit();
-
-    const lowered = try const_ir.lowerExpr(arena.allocator(), expr);
+fn evalLoweredConst(
+    env: *LocalEnv,
+    expr: ?*const const_ir.Expr,
+    lower_error: ?anyerror,
+    scope_id: usize,
+    statement_index: usize,
+) anyerror!const_ir.Value {
+    const lowered = expr orelse return lower_error orelse error.UnsupportedConstExpr;
     return const_ir.evalExpr(env.allocator, EvalContext{
         .env = env,
         .scope_id = scope_id,
@@ -221,16 +229,16 @@ const EvalContext = struct {
     statement_index: usize,
 
     pub fn structFieldName(self: EvalContext, type_name: []const u8, index: usize) ?[]const u8 {
-        const item = typeItem(self.env, type_name) orelse return null;
-        return switch (item.payload) {
+        const checked = typeSignature(self.env, type_name) orelse return null;
+        return switch (checked.facts) {
             .struct_type => |struct_type| if (index < struct_type.fields.len) struct_type.fields[index].name else null,
             else => null,
         };
     }
 
     pub fn enumPayloadFieldName(self: EvalContext, enum_name: []const u8, variant_name: []const u8, index: usize) ?[]const u8 {
-        const item = typeItem(self.env, enum_name) orelse return null;
-        const enum_type = switch (item.payload) {
+        const checked = typeSignature(self.env, enum_name) orelse return null;
+        const enum_type = switch (checked.facts) {
             .enum_type => |enum_type| enum_type,
             else => return null,
         };
@@ -243,8 +251,8 @@ const EvalContext = struct {
     }
 
     pub fn enumVariantTag(self: EvalContext, enum_name: []const u8, variant_name: []const u8) ?i32 {
-        const item = typeItem(self.env, enum_name) orelse return null;
-        const enum_type = switch (item.payload) {
+        const checked = typeSignature(self.env, enum_name) orelse return null;
+        const enum_type = switch (checked.facts) {
             .enum_type => |enum_type| enum_type,
             else => return null,
         };
@@ -266,12 +274,17 @@ fn resolveIdentifier(context: EvalContext, name: []const u8) anyerror!const_ir.V
     return context.env.resolve_identifier(context.env.active, context.env.module_id, name);
 }
 
-fn typeItem(env: *LocalEnv, type_name: []const u8) ?*const typed.Item {
+fn typeSignature(env: *LocalEnv, type_name: []const u8) ?query_types.CheckedSignature {
+    const item_id = typeItemId(env, type_name) orelse return null;
+    return env.resolve_signature(env.active, item_id) catch null;
+}
+
+fn typeItemId(env: *LocalEnv, type_name: []const u8) ?session.ItemId {
     for (env.active.semantic_index.items.items, 0..) |entry, index| {
         if (entry.module_id.index != env.module_id.index) continue;
         const item = env.active.item(.{ .index = index });
         if (item.category != .type_decl) continue;
-        if (std.mem.eql(u8, item.name, type_name)) return item;
+        if (std.mem.eql(u8, item.name, type_name)) return .{ .index = index };
     }
     const module = env.active.module(env.module_id);
     for (module.imports.items) |binding| {
@@ -279,7 +292,7 @@ fn typeItem(env: *LocalEnv, type_name: []const u8) ?*const typed.Item {
         for (env.active.semantic_index.items.items, 0..) |_, index| {
             const item = env.active.item(.{ .index = index });
             if (item.category != .type_decl) continue;
-            if (std.mem.eql(u8, item.symbol_name, binding.target_symbol)) return item;
+            if (std.mem.eql(u8, item.symbol_name, binding.target_symbol)) return .{ .index = index };
         }
     }
     return null;
@@ -469,8 +482,9 @@ fn constSafeNamedType(env: *LocalEnv, name: []const u8) bool {
     const trimmed = std.mem.trim(u8, name, " \t");
     if (std.mem.startsWith(u8, trimmed, "[")) return constSafeArrayType(env, trimmed);
     if (constSafeKnownNominalType(env, trimmed)) |is_safe| return is_safe;
-    const item = typeItem(env, name) orelse return false;
-    return switch (item.payload) {
+    const item_id = typeItemId(env, trimmed) orelse return false;
+    const signature = env.resolve_signature(env.active, item_id) catch return false;
+    return switch (signature.facts) {
         .struct_type => |struct_type| blk: {
             for (struct_type.fields) |field| {
                 if (!constSafeType(env, field.ty)) break :blk false;

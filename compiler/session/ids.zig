@@ -117,6 +117,7 @@ pub const SemanticIndex = struct {
             });
 
             for (module_pipeline.typed.items.items, 0..) |item, item_index| {
+                const source_item = module_pipeline.hir.items.items[item_index];
                 const item_id = ItemId{ .index = index.items.items.len };
                 var entry = ItemEntry{
                     .module_id = module_id,
@@ -124,38 +125,47 @@ pub const SemanticIndex = struct {
                     .item_index = item_index,
                 };
 
-                switch (item.payload) {
-                    .function => {
+                switch (source_item.kind) {
+                    .function, .suspend_function, .foreign_function => {
                         entry.body_id = BodyId{ .index = index.bodies.items.len };
                         try index.bodies.append(.{
                             .module_id = module_id,
                             .item_id = item_id,
                         });
                     },
-                    .trait_type => |trait_type| {
+                    .trait_type => {
                         entry.trait_id = TraitId{ .index = index.traits.items.len };
                         try index.traits.append(.{ .item_id = item_id });
-                        for (trait_type.associated_types, 0..) |_, associated_index| {
-                            try index.associated_types.append(.{
-                                .item_id = item_id,
-                                .associated_index = associated_index,
-                            });
-                        }
-                        for (trait_type.associated_consts, 0..) |_, associated_index| {
-                            try index.associated_consts.append(.{
-                                .item_id = item_id,
-                                .associated_index = associated_index,
-                            });
+                        const body = switch (source_item.body_syntax) {
+                            .trait_body => |body| body,
+                            else => null,
+                        };
+                        if (body) |trait_body| {
+                            for (trait_body.associated_types, 0..) |_, associated_index| {
+                                try index.associated_types.append(.{
+                                    .item_id = item_id,
+                                    .associated_index = associated_index,
+                                });
+                            }
+                            for (trait_body.associated_consts, 0..) |_, associated_index| {
+                                try index.associated_consts.append(.{
+                                    .item_id = item_id,
+                                    .associated_index = associated_index,
+                                });
+                            }
                         }
                     },
-                    .impl_block => |impl_block| {
+                    .impl_block => {
                         entry.impl_id = ImplId{ .index = index.impls.items.len };
                         try index.impls.append(.{ .item_id = item_id });
-                        for (impl_block.associated_consts, 0..) |_, associated_index| {
-                            try index.associated_consts.append(.{
-                                .item_id = item_id,
-                                .associated_index = associated_index,
-                            });
+                        switch (source_item.body_syntax) {
+                            .impl_body => |body| for (body.associated_consts, 0..) |_, associated_index| {
+                                try index.associated_consts.append(.{
+                                    .item_id = item_id,
+                                    .associated_index = associated_index,
+                                });
+                            },
+                            else => {},
                         }
                     },
                     .const_item => {

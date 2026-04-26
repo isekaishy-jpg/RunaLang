@@ -4,7 +4,7 @@ const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("../typed/text.zig");
+const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
 const checked_body = @import("checked_body.zig");
 const query_types = @import("types.zig");
@@ -140,9 +140,8 @@ fn validateConstantPatterns(
             else => {},
         }
         summary.checked_constant_pattern_count += 1;
-        var arena = std.heap.ArenaAllocator.init(active.allocator);
-        defer arena.deinit();
-        const lowered = const_ir.lowerExpr(arena.allocator(), pattern_expr) catch |err| {
+        const lowered = arm.constant_pattern_expr orelse {
+            const err = arm.constant_pattern_lower_error orelse error.UnsupportedConstExpr;
             summary.rejected_constant_pattern_count += 1;
             try reportConstantPatternError(diagnostics, body.item.span, err);
             continue;

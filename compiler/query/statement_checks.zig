@@ -3,8 +3,8 @@ const body_scope = @import("body_scope.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("../typed/text.zig");
-const type_support = @import("../typed/type_support.zig");
+const typed_text = @import("text.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -420,11 +420,8 @@ fn resolveAssignmentTarget(
 }
 
 fn findStructFields(body: query_types.CheckedBody, name: []const u8) ?[]const typed.StructField {
-    for (body.module.items.items) |item| {
-        switch (item.payload) {
-            .struct_type => |struct_type| if (std.mem.eql(u8, item.name, name)) return struct_type.fields,
-            else => {},
-        }
+    for (body.struct_prototypes) |prototype| {
+        if (std.mem.eql(u8, prototype.name, name)) return prototype.fields;
     }
     for (body.module.imports.items) |binding| {
         const fields = binding.struct_fields orelse continue;

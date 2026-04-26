@@ -1,6 +1,6 @@
 const query_types = @import("types.zig");
 const typed = @import("../typed/root.zig");
-const type_support = @import("../typed/type_support.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -97,19 +97,8 @@ pub const ScopeStack = struct {
 };
 
 pub fn seedModuleConsts(scope: *ScopeStack, body: query_types.CheckedBody) !void {
-    for (body.module.items.items) |item| {
-        switch (item.payload) {
-            .const_item => |const_item| {
-                if (item.name.len == 0) continue;
-                try scope.putWithOrigin(item.name, const_item.type_ref, false, type_support.boundaryFromTypeRef(const_item.type_ref));
-            },
-            else => {},
-        }
-    }
-
-    for (body.module.imports.items) |binding| {
-        const ty = binding.const_type orelse continue;
-        try scope.putWithOrigin(binding.local_name, ty, false, type_support.boundaryFromTypeRef(ty));
+    for (body.module_consts) |binding| {
+        try scope.putWithOrigin(binding.name, binding.ty, false, type_support.boundaryFromTypeRef(binding.ty));
     }
 }
 

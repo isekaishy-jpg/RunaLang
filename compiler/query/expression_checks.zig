@@ -6,8 +6,8 @@ const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("../typed/text.zig");
-const type_support = @import("../typed/type_support.zig");
+const typed_text = @import("text.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -505,7 +505,7 @@ fn analyzeExpr(
                     else => return,
                 };
                 const method_name = std.mem.trim(u8, field.field_name.text, " \t");
-                const prototype = findMethodPrototype(body.module.methods.items, target_type_name, method_name) orelse return;
+                const prototype = findMethodPrototype(body.method_prototypes, target_type_name, method_name) orelse return;
                 try validateMethodCall(scope, body, target_type_name, method_name, prototype, typed_args, syntax_expr.span, diagnostics, summary);
                 return;
             }
@@ -523,8 +523,7 @@ fn analyzeExpr(
 
 const ResolvedFunction = union(enum) {
     local: struct {
-        item: *const typed.Item,
-        function: *const typed.FunctionData,
+        prototype: *const typed.FunctionPrototype,
     },
     imported: struct {
         binding: *const typed.ImportedBinding,
@@ -533,49 +532,49 @@ const ResolvedFunction = union(enum) {
 
     fn unsafeRequired(self: ResolvedFunction) bool {
         return switch (self) {
-            .local => |local| local.item.is_unsafe,
+            .local => |local| local.prototype.unsafe_required,
             .imported => |imported| imported.unsafe_required,
         };
     }
 
     fn isSuspend(self: ResolvedFunction) bool {
         return switch (self) {
-            .local => |local| local.function.is_suspend,
+            .local => |local| local.prototype.is_suspend,
             .imported => |imported| imported.binding.function_is_suspend,
         };
     }
 
     fn genericParams(self: ResolvedFunction) []const typed.GenericParam {
         return switch (self) {
-            .local => |local| local.function.generic_params,
+            .local => |local| local.prototype.generic_params,
             .imported => |imported| imported.binding.function_generic_params,
         };
     }
 
     fn parameterCount(self: ResolvedFunction) usize {
         return switch (self) {
-            .local => |local| local.function.parameters.items.len,
+            .local => |local| local.prototype.parameter_types.len,
             .imported => |imported| importedParameterTypes(imported.binding).len,
         };
     }
 
     fn parameterType(self: ResolvedFunction, index: usize) types.TypeRef {
         return switch (self) {
-            .local => |local| local.function.parameters.items[index].ty,
+            .local => |local| local.prototype.parameter_types[index],
             .imported => |imported| importedParameterTypes(imported.binding)[index],
         };
     }
 
     fn parameterTypeName(self: ResolvedFunction, index: usize) []const u8 {
         return switch (self) {
-            .local => |local| local.function.parameters.items[index].type_name,
+            .local => |local| local.prototype.parameter_type_names[index],
             .imported => |imported| importedParameterTypeNames(imported.binding)[index],
         };
     }
 
     fn parameterMode(self: ResolvedFunction, index: usize) typed.ParameterMode {
         return switch (self) {
-            .local => |local| local.function.parameters.items[index].mode,
+            .local => |local| local.prototype.parameter_modes[index],
             .imported => |imported| importedParameterModes(imported.binding)[index],
         };
     }
@@ -594,17 +593,9 @@ fn importedParameterModes(binding: *const typed.ImportedBinding) []const typed.P
 }
 
 fn resolveDirectFunction(active: *session.Session, body: query_types.CheckedBody, name: []const u8) !?ResolvedFunction {
-    for (body.module.items.items) |*item| {
-        switch (item.payload) {
-            .function => |*function| {
-                if (!std.mem.eql(u8, item.name, name)) continue;
-                return .{ .local = .{
-                    .item = item,
-                    .function = function,
-                } };
-            },
-            else => {},
-        }
+    for (body.function_prototypes) |*prototype| {
+        if (!std.mem.eql(u8, prototype.name, name)) continue;
+        return .{ .local = .{ .prototype = prototype } };
     }
 
     for (body.module.imports.items) |*binding| {
@@ -669,10 +660,7 @@ fn validateDirectCall(
 
     try validateBorrowArguments(scope, callee_name, span, resolved, args, diagnostics, summary);
     const parameter_type_names = try resolvedParameterTypeNames(diagnostics.allocator, resolved);
-    const free_parameter_type_names = switch (resolved) {
-        .local => true,
-        .imported => false,
-    };
+    const free_parameter_type_names = false;
     defer if (free_parameter_type_names and parameter_type_names.len != 0) diagnostics.allocator.free(parameter_type_names);
     try validateRetainedCallArguments(
         scope,
@@ -680,7 +668,7 @@ fn validateDirectCall(
         parameter_type_names,
         resolved.genericParams(),
         switch (resolved) {
-            .local => |local| local.function.where_predicates,
+            .local => |local| local.prototype.where_predicates,
             .imported => |imported| imported.binding.function_where_predicates,
         },
         args,
@@ -997,13 +985,10 @@ fn validateRetainedStorageArguments(
 }
 
 fn resolvedParameterTypeNames(allocator: std.mem.Allocator, resolved: ResolvedFunction) ![]const []const u8 {
+    _ = allocator;
     return switch (resolved) {
         .imported => |imported| importedParameterTypeNames(imported.binding),
-        .local => |local| blk: {
-            const names = try allocator.alloc([]const u8, local.function.parameters.items.len);
-            for (local.function.parameters.items, 0..) |parameter, index| names[index] = parameter.type_name;
-            break :blk names;
-        },
+        .local => |local| local.prototype.parameter_type_names,
     };
 }
 
@@ -1093,11 +1078,8 @@ fn moduleHasNamedBinding(body: query_types.CheckedBody, name: []const u8) bool {
 }
 
 fn findStructFields(body: query_types.CheckedBody, name: []const u8) ?[]const typed.StructField {
-    for (body.module.items.items) |item| {
-        switch (item.payload) {
-            .struct_type => |struct_type| if (std.mem.eql(u8, item.name, name)) return struct_type.fields,
-            else => {},
-        }
+    for (body.struct_prototypes) |prototype| {
+        if (std.mem.eql(u8, prototype.name, name)) return prototype.fields;
     }
     for (body.module.imports.items) |binding| {
         const fields = binding.struct_fields orelse continue;

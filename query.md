@@ -26,7 +26,8 @@
 3. **Split semantic checking into query-backed signatures and bodies**
 - Introduce query families for checked signatures by `ItemId` and checked bodies by `BodyId`.
 - Move trait declarations, impl declarations, associated-type bindings, associated-const declarations and bindings, callable signatures, reflectability flags, boundary flags, and const declarations into checked-signature facts.
-- Build one shared `CheckedBody` substrate containing typed expressions/statements, local bindings, canonical places, CFG edges, effect sites, and suspension/spawn markers.
+- Keep `typed` as prepared structure and syntax only; checked signatures and checked bodies are query-owned facts.
+- Build one shared `CheckedBody` substrate containing checked expressions/statements, local bindings, canonical places, CFG edges, effect sites, and suspension/spawn markers.
 - MIR lowering must depend on checked-body queries rather than direct driver state.
 - Spec refs: `spec/semantic-query-and-checking.md`, `spec/functions.md`, `spec/callables.md`, `spec/patterns.md`.
 
@@ -93,7 +94,7 @@
 - Make driver orchestration go through query entrypoints only.
 - Remove direct eager calls that treat driver-owned modules as semantic truth.
 - Ensure MIR lowering runs only after required query-backed semantic results succeed.
-- Delete the old CTFE path, reflection scan path, and module-wide body-analysis flow once the query-backed replacements are in.
+- Delete the old CTFE path, reflection scan path, module-wide body-analysis flow, pre-query default-method synthesis, and eager typed semantic finalization once the query-backed replacements are in.
 - Spec refs: `spec/semantic-query-and-checking.md`, `implement.md`.
 
 ## Public Interfaces and Semantic Types

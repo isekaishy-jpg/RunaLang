@@ -5,9 +5,9 @@ const typed = @import("../typed/root.zig");
 const callee_helpers = @import("callee_helpers.zig");
 const boundary_checks = @import("boundary_checks.zig");
 const query_types = @import("types.zig");
-const typed_domain_state = @import("../typed/domain_state.zig");
-const type_support = @import("../typed/type_support.zig");
-const typed_text = @import("../typed/text.zig");
+const domain_state_types = @import("domain_state_types.zig");
+const type_support = @import("type_support.zig");
+const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
 
 const parseBoundaryType = type_support.parseBoundaryType;
@@ -23,15 +23,15 @@ pub const DomainTypeRef = struct {
     };
 };
 
-const Anchor = typed_domain_state.Anchor;
-const AnchorAccess = typed_domain_state.AnchorAccess;
+const Anchor = domain_state_types.Anchor;
+const AnchorAccess = domain_state_types.AnchorAccess;
 
 pub fn signatureForItem(
     active: *const session.Session,
     module_id: session.ModuleId,
     item: *const typed.Item,
     facts: query_types.SignatureFacts,
-) typed_domain_state.ItemSignature {
+) domain_state_types.ItemSignature {
     if (item.kind != .struct_type) return .none;
     if (!item.is_domain_root and !item.is_domain_context) return .none;
 

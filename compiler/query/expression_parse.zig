@@ -2,8 +2,8 @@ const std = @import("std");
 const array_list = std.array_list;
 const ast = @import("../ast/root.zig");
 const callable_types = @import("callable_types.zig");
-const typed_decls = @import("declarations.zig");
-const typed_expr = @import("expr.zig");
+const typed_decls = @import("../typed/declarations.zig");
+const typed_expr = @import("../typed/expr.zig");
 const signatures = @import("signatures.zig");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
@@ -1447,51 +1447,6 @@ const ExprToken = struct {
     kind: ExprTokenKind,
     lexeme: []const u8,
 };
-
-pub fn parseExpressionText(
-    allocator: Allocator,
-    text: []const u8,
-    expected_type: types.TypeRef,
-    scope: anytype,
-    current_where_predicates: []const WherePredicate,
-    prototypes: anytype,
-    method_prototypes: anytype,
-    struct_prototypes: anytype,
-    enum_prototypes: anytype,
-    diagnostics: *diag.Bag,
-    span: source.Span,
-    suspend_context: bool,
-    unsafe_context: bool,
-) anyerror!*Expr {
-    var tokens = array_list.Managed(ExprToken).init(allocator);
-    defer tokens.deinit();
-    try appendRawExprTokens(&tokens, text);
-    try tokens.append(.{ .kind = .eof, .lexeme = "" });
-
-    const Parser = ExprParser(
-        @TypeOf(scope),
-        @TypeOf(prototypes),
-        @TypeOf(method_prototypes),
-        @TypeOf(struct_prototypes),
-        @TypeOf(enum_prototypes),
-    );
-    var parser = Parser{
-        .allocator = allocator,
-        .diagnostics = diagnostics,
-        .scope = scope,
-        .current_where_predicates = current_where_predicates,
-        .prototypes = prototypes,
-        .method_prototypes = method_prototypes,
-        .struct_prototypes = struct_prototypes,
-        .enum_prototypes = enum_prototypes,
-        .span = span,
-        .tokens = tokens.items,
-        .expected_type = expected_type,
-        .suspend_context = suspend_context,
-        .unsafe_context = unsafe_context,
-    };
-    return parser.parse();
-}
 
 pub fn parseExpressionSyntax(
     allocator: Allocator,

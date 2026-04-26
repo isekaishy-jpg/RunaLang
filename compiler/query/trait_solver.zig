@@ -1,12 +1,12 @@
 const std = @import("std");
-const callable_types = @import("../typed/callable_types.zig");
+const callable_types = @import("callable_types.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
 const boundary_checks = @import("boundary_checks.zig");
-const type_support = @import("../typed/type_support.zig");
-const typed_text = @import("../typed/text.zig");
+const type_support = @import("type_support.zig");
+const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
 
 const baseTypeName = typed_text.baseTypeName;
@@ -268,7 +268,7 @@ fn solveGoal(
         .builtin_send => return .{
             .key = key,
             .satisfied = whereEnvironmentSatisfies(active, key) or
-                solveBuiltinSend(active, key.module_id, keySelfTypeName(active, key)),
+                solveBuiltinSend(active, key.module_id, keySelfTypeName(active, key), signature_resolver),
         },
         .opaque_name => return .{ .key = key, .satisfied = whereEnvironmentSatisfies(active, key) },
         .trait_item => {},
@@ -693,10 +693,10 @@ fn boundPredicateMatchesGoal(
     return std.mem.eql(u8, std.mem.trim(u8, bound.subject_name, " \t"), keySelfTypeName(active, key));
 }
 
-fn solveBuiltinSend(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8) bool {
+fn solveBuiltinSend(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8, signature_resolver: SignatureResolver) bool {
     var visiting = std.array_list.Managed([]const u8).init(active.allocator);
     defer visiting.deinit();
-    return solveBuiltinSendInner(active, module_id, raw_type_name, &visiting);
+    return solveBuiltinSendInner(active, module_id, raw_type_name, &visiting, signature_resolver);
 }
 
 fn solveBuiltinSendInner(
@@ -704,6 +704,7 @@ fn solveBuiltinSendInner(
     module_id: session.ModuleId,
     raw_type_name: []const u8,
     visiting: *std.array_list.Managed([]const u8),
+    signature_resolver: SignatureResolver,
 ) bool {
     const boundary = parseBoundaryType(raw_type_name);
     if (boundary.kind != .value) return false;
@@ -717,7 +718,7 @@ fn solveBuiltinSendInner(
         const parts = typed_text.splitTopLevelCommaParts(active.allocator, inner) catch return false;
         defer active.allocator.free(parts);
         for (parts) |part| {
-            if (!solveBuiltinSendInner(active, module_id, part, visiting)) return false;
+            if (!solveBuiltinSendInner(active, module_id, part, visiting, signature_resolver)) return false;
         }
         return true;
     }
@@ -727,10 +728,10 @@ fn solveBuiltinSendInner(
         if (close_index + 1 != trimmed.len) return false;
         const inner = trimmed[1..close_index];
         const separator = findTopLevelHeaderScalar(inner, ';') orelse return false;
-        return solveBuiltinSendInner(active, module_id, std.mem.trim(u8, inner[0..separator], " \t"), visiting);
+        return solveBuiltinSendInner(active, module_id, std.mem.trim(u8, inner[0..separator], " \t"), visiting, signature_resolver);
     }
 
-    if (isKnownStandardSendFamily(active, module_id, trimmed, visiting)) return true;
+    if (isKnownStandardSendFamily(active, module_id, trimmed, visiting, signature_resolver)) return true;
 
     const base_name = baseTypeName(trimmed);
     const builtin = types.Builtin.fromName(base_name);
@@ -746,11 +747,12 @@ fn solveBuiltinSendInner(
     const item_id = resolveItemByName(active, module_id, base_name) orelse return false;
     const item = active.item(item_id);
     if (boundary_checks.kindForItem(item) == .capability) return false;
+    const checked = signature_resolver(active, item_id) catch return false;
 
-    return switch (item.payload) {
+    return switch (checked.facts) {
         .struct_type => |struct_type| blk: {
             for (struct_type.fields) |field| {
-                if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting)) break :blk false;
+                if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting, signature_resolver)) break :blk false;
             }
             break :blk true;
         },
@@ -759,10 +761,10 @@ fn solveBuiltinSendInner(
                 switch (variant.payload) {
                     .none => {},
                     .tuple_fields => |fields| for (fields) |field| {
-                        if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting)) break :blk false;
+                        if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting, signature_resolver)) break :blk false;
                     },
                     .named_fields => |fields| for (fields) |field| {
-                        if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting)) break :blk false;
+                        if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting, signature_resolver)) break :blk false;
                     },
                 }
             }
@@ -777,6 +779,7 @@ fn isKnownStandardSendFamily(
     module_id: session.ModuleId,
     raw_type_name: []const u8,
     visiting: *std.array_list.Managed([]const u8),
+    signature_resolver: SignatureResolver,
 ) bool {
     const base_name = baseTypeName(raw_type_name);
     if (std.mem.eql(u8, base_name, "Str") or
@@ -795,12 +798,12 @@ fn isKnownStandardSendFamily(
     defer active.allocator.free(parts);
 
     if (std.mem.eql(u8, base_name, "Option") or std.mem.eql(u8, base_name, "List")) {
-        return parts.len == 1 and solveBuiltinSendInner(active, module_id, parts[0], visiting);
+        return parts.len == 1 and solveBuiltinSendInner(active, module_id, parts[0], visiting, signature_resolver);
     }
     if (std.mem.eql(u8, base_name, "Result") or std.mem.eql(u8, base_name, "Map")) {
         return parts.len == 2 and
-            solveBuiltinSendInner(active, module_id, parts[0], visiting) and
-            solveBuiltinSendInner(active, module_id, parts[1], visiting);
+            solveBuiltinSendInner(active, module_id, parts[0], visiting, signature_resolver) and
+            solveBuiltinSendInner(active, module_id, parts[1], visiting, signature_resolver);
     }
     return false;
 }

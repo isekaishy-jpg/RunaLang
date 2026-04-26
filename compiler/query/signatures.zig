@@ -1,6 +1,7 @@
 const std = @import("std");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
+const base_signatures = @import("../signature_types.zig");
 const typed_text = @import("text.zig");
 const Allocator = std.mem.Allocator;
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;
@@ -8,43 +9,13 @@ const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const isPlainIdentifier = typed_text.isPlainIdentifier;
 const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 
-pub const GenericParamKind = enum {
-    type_param,
-    lifetime_param,
-};
-
-pub const GenericParam = struct {
-    name: []const u8,
-    kind: GenericParamKind,
-};
-
-pub const BoundPredicate = struct {
-    subject_name: []const u8,
-    contract_name: []const u8,
-};
-
-pub const ProjectionEqualityPredicate = struct {
-    subject_name: []const u8,
-    associated_name: []const u8,
-    value_type_name: []const u8,
-};
-
-pub const LifetimeOutlivesPredicate = struct {
-    longer_name: []const u8,
-    shorter_name: []const u8,
-};
-
-pub const TypeOutlivesPredicate = struct {
-    type_name: []const u8,
-    lifetime_name: []const u8,
-};
-
-pub const WherePredicate = union(enum) {
-    bound: BoundPredicate,
-    projection_equality: ProjectionEqualityPredicate,
-    lifetime_outlives: LifetimeOutlivesPredicate,
-    type_outlives: TypeOutlivesPredicate,
-};
+pub const GenericParamKind = base_signatures.GenericParamKind;
+pub const GenericParam = base_signatures.GenericParam;
+pub const BoundPredicate = base_signatures.BoundPredicate;
+pub const ProjectionEqualityPredicate = base_signatures.ProjectionEqualityPredicate;
+pub const LifetimeOutlivesPredicate = base_signatures.LifetimeOutlivesPredicate;
+pub const TypeOutlivesPredicate = base_signatures.TypeOutlivesPredicate;
+pub const WherePredicate = base_signatures.WherePredicate;
 
 pub const NamedHeader = struct {
     name: []const u8,

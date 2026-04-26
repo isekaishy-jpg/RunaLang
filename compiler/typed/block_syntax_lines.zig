@@ -1,9 +1,12 @@
 const std = @import("std");
 const ast = @import("../ast/root.zig");
-const declaration_parse = @import("declaration_parse.zig");
 const Allocator = std.mem.Allocator;
 
-pub const BodyLine = declaration_parse.BodyLine;
+pub const BodyLine = struct {
+    raw: []const u8,
+    trimmed: []const u8,
+    indent: usize,
+};
 
 pub fn collectBlockLines(allocator: Allocator, block: ast.BlockSyntax) ![]BodyLine {
     var lines = std.array_list.Managed(BodyLine).init(allocator);

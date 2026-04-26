@@ -9,7 +9,7 @@ const reflect = @import("../reflect/root.zig");
 const regions = @import("../regions/root.zig");
 const intern = @import("../intern/root.zig");
 const session_ids = @import("../session/ids.zig");
-const domain_state = @import("../typed/domain_state.zig");
+const domain_state = @import("domain_state_types.zig");
 const typed = @import("../typed/root.zig");
 const types = @import("../types/root.zig");
 
@@ -218,10 +218,32 @@ pub const FunctionSignature = struct {
     abi: ?[]const u8,
 };
 
+pub const ConstRequiredExprKind = enum {
+    array_length,
+    enum_discriminant,
+};
+
+pub const ConstRequiredExprSite = struct {
+    kind: ConstRequiredExprKind,
+    source: []const u8,
+    owner_name: []const u8 = "",
+    expr: ?*const const_ir.Expr = null,
+    lower_error: ?anyerror = null,
+
+    pub fn deinit(self: *ConstRequiredExprSite, allocator: @import("std").mem.Allocator) void {
+        if (self.expr) |expr| const_ir.destroyExpr(allocator, expr);
+        self.* = .{
+            .kind = .array_length,
+            .source = "",
+        };
+    }
+};
+
 pub const ConstSignature = struct {
     type_name: []const u8,
     ty: types.Builtin,
     type_ref: types.TypeRef,
+    initializer_type_ref: types.TypeRef,
     initializer_source: []const u8,
     expr: ?*const const_ir.Expr,
     lower_error: ?anyerror = null,
@@ -292,18 +314,77 @@ pub const CheckedSignature = struct {
     reflectable: bool,
     exported: bool,
     unsafe_required: bool,
+    const_required_expr_sites: []const ConstRequiredExprSite,
     facts: SignatureFacts,
 
     pub fn deinit(self: CheckedSignature, allocator: @import("std").mem.Allocator) void {
+        for (self.const_required_expr_sites) |site| {
+            var owned = site;
+            owned.deinit(allocator);
+        }
+        if (self.const_required_expr_sites.len != 0) allocator.free(self.const_required_expr_sites);
         switch (self.facts) {
+            .function => |function| {
+                if (function.generic_params.len != 0) allocator.free(function.generic_params);
+                if (function.where_predicates.len != 0) allocator.free(function.where_predicates);
+                if (function.parameters.len != 0) allocator.free(function.parameters);
+            },
             .const_item => |const_item| {
+                switch (const_item.initializer_type_ref) {
+                    .named => |name| allocator.free(name),
+                    else => {},
+                }
                 if (const_item.expr) |expr| const_ir.destroyExpr(allocator, expr);
             },
+            .struct_type => |struct_type| {
+                if (struct_type.generic_params.len != 0) allocator.free(struct_type.generic_params);
+                if (struct_type.where_predicates.len != 0) allocator.free(struct_type.where_predicates);
+                if (struct_type.fields.len != 0) allocator.free(struct_type.fields);
+            },
+            .union_type => |union_type| {
+                if (union_type.fields.len != 0) allocator.free(union_type.fields);
+            },
+            .enum_type => |enum_type| {
+                if (enum_type.generic_params.len != 0) allocator.free(enum_type.generic_params);
+                if (enum_type.where_predicates.len != 0) allocator.free(enum_type.where_predicates);
+                for (enum_type.variants) |variant| {
+                    var owned = variant;
+                    owned.deinit(allocator);
+                }
+                if (enum_type.variants.len != 0) allocator.free(enum_type.variants);
+            },
+            .opaque_type => |opaque_type| {
+                if (opaque_type.generic_params.len != 0) allocator.free(opaque_type.generic_params);
+                if (opaque_type.where_predicates.len != 0) allocator.free(opaque_type.where_predicates);
+            },
+            .trait_type => |trait_type| {
+                if (trait_type.generic_params.len != 0) allocator.free(trait_type.generic_params);
+                if (trait_type.where_predicates.len != 0) allocator.free(trait_type.where_predicates);
+                for (trait_type.methods) |method| {
+                    var owned = method;
+                    owned.deinit(allocator);
+                }
+                if (trait_type.methods.len != 0) allocator.free(trait_type.methods);
+                if (trait_type.associated_types.len != 0) allocator.free(trait_type.associated_types);
+                if (trait_type.associated_consts.len != 0) allocator.free(trait_type.associated_consts);
+            },
             .impl_block => |impl_block| {
+                if (impl_block.generic_params.len != 0) allocator.free(impl_block.generic_params);
+                if (impl_block.where_predicates.len != 0) allocator.free(impl_block.where_predicates);
+                if (impl_block.associated_types.len != 0) allocator.free(impl_block.associated_types);
                 for (impl_block.associated_consts) |binding| {
+                    switch (binding.const_item.initializer_type_ref) {
+                        .named => |name| allocator.free(name),
+                        else => {},
+                    }
                     if (binding.const_item.expr) |expr| const_ir.destroyExpr(allocator, expr);
                 }
                 if (impl_block.associated_consts.len != 0) allocator.free(impl_block.associated_consts);
+                for (impl_block.methods) |method| {
+                    var owned = method;
+                    owned.deinit(allocator);
+                }
+                if (impl_block.methods.len != 0) allocator.free(impl_block.methods);
             },
             else => {},
         }
@@ -317,6 +398,11 @@ pub const CheckedBody = struct {
     module: *const typed.Module,
     item: *const typed.Item,
     function: *const typed.FunctionData,
+    owned_function: ?*typed.FunctionData = null,
+    function_prototypes: []const typed.FunctionPrototype = &.{},
+    method_prototypes: []const typed.MethodPrototype = &.{},
+    struct_prototypes: []const typed.StructPrototype = &.{},
+    module_consts: []const ModuleConstBinding = &.{},
     parameters: []const typed.Parameter,
     root_block_id: usize,
     block_sites: []const checked_body.BlockSite,
@@ -343,6 +429,23 @@ pub const CheckedBody = struct {
     expression_sites: []const checked_body.ExpressionSite,
 
     pub fn deinit(self: CheckedBody, allocator: @import("std").mem.Allocator) void {
+        if (self.owned_function) |function| {
+            var owned = function;
+            owned.deinit(allocator);
+            allocator.destroy(owned);
+        }
+        for (self.function_prototypes) |prototype| {
+            var owned = prototype;
+            owned.deinit(allocator);
+        }
+        if (self.function_prototypes.len != 0) allocator.free(self.function_prototypes);
+        for (self.method_prototypes) |prototype| {
+            var owned = prototype;
+            owned.deinit(allocator);
+        }
+        if (self.method_prototypes.len != 0) allocator.free(self.method_prototypes);
+        if (self.struct_prototypes.len != 0) allocator.free(self.struct_prototypes);
+        if (self.module_consts.len != 0) allocator.free(self.module_consts);
         const facts = checked_body.Facts{
             .summary = self.summary,
             .root_block_id = self.root_block_id,
@@ -370,6 +473,11 @@ pub const CheckedBody = struct {
         };
         facts.deinit(allocator);
     }
+};
+
+pub const ModuleConstBinding = struct {
+    name: []const u8,
+    ty: types.TypeRef,
 };
 
 pub const ReflectionMetadata = struct {

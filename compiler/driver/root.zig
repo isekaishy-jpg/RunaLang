@@ -5,6 +5,8 @@ const hir = @import("../hir/root.zig");
 const lowering = @import("../lowering/root.zig");
 const mir = @import("../mir/root.zig");
 const parse = @import("../parse/root.zig");
+const query_body_syntax_bridge = @import("../query/body_syntax_bridge.zig");
+const query_item_syntax_bridge = @import("../query/item_syntax_bridge.zig");
 const resolve = @import("../resolve/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
@@ -35,6 +37,11 @@ pub const GraphInput = struct {
     roots: []const GraphRoot,
 };
 
+pub const ImportBindingSite = struct {
+    local_name: []const u8,
+    span: source.Span,
+};
+
 pub const ModulePipeline = struct {
     root_index: usize,
     package_index: usize,
@@ -43,13 +50,14 @@ pub const ModulePipeline = struct {
     hir: hir.Module,
     resolved: resolve.Module,
     prototypes: array_list.Managed(typed.FunctionPrototype),
+    import_binding_sites: array_list.Managed(ImportBindingSite),
     typed: typed.Module,
-    typed_finalized: bool = false,
     mir: ?mir.Module = null,
 
     pub fn deinit(self: *ModulePipeline, allocator: Allocator) void {
         if (self.mir) |*module| module.deinit();
         self.typed.deinit(allocator);
+        self.import_binding_sites.deinit();
         for (self.prototypes.items) |prototype| prototype.deinit(allocator);
         self.prototypes.deinit();
         self.resolved.deinit();
@@ -182,6 +190,7 @@ fn discoverSinglePackageModuleTree(
 
     var lowered_typed = try typed.prepareModule(allocator, lowered_hir, try allocator.dupe(u8, module_path), "", &pipeline.diagnostics, &prototypes);
     errdefer lowered_typed.deinit(allocator);
+    try appendPreparedFunctionPrototypes(allocator, lowered_hir, &lowered_typed, &prototypes);
 
     try pipeline.modules.append(.{
         .root_index = root_index,
@@ -191,6 +200,7 @@ fn discoverSinglePackageModuleTree(
         .hir = lowered_hir,
         .resolved = resolved,
         .prototypes = prototypes,
+        .import_binding_sites = array_list.Managed(ImportBindingSite).init(allocator),
         .typed = lowered_typed,
         .mir = null,
     });
@@ -220,11 +230,11 @@ const GlobalItem = struct {
     target_name: []const u8,
     target_symbol: []const u8,
     const_type: ?types.TypeRef,
-    function_return_type: ?types.TypeRef,
+    function_return_type: ?types.TypeRef = null,
     function_generic_params: []typed.GenericParam = &.{},
     function_where_predicates: []typed.WherePredicate = &.{},
     function_is_suspend: bool = false,
-    function_parameter_types: ?[]types.TypeRef,
+    function_parameter_types: ?[]types.TypeRef = null,
     function_parameter_type_names: ?[]const []const u8 = null,
     function_parameter_modes: ?[]typed.ParameterMode,
     function_unsafe_required: bool = false,
@@ -232,6 +242,185 @@ const GlobalItem = struct {
     enum_variants: ?[]typed.EnumVariant = null,
     trait_methods: ?[]typed.TraitMethod = null,
 };
+
+fn appendPreparedFunctionPrototypes(
+    allocator: Allocator,
+    module: hir.Module,
+    typed_module: *const typed.Module,
+    prototypes: *array_list.Managed(typed.FunctionPrototype),
+) !void {
+    for (module.items.items, 0..) |item, item_index| {
+        switch (item.kind) {
+            .function, .suspend_function, .foreign_function => {},
+            else => continue,
+        }
+        const typed_item = typed_module.items.items[item_index];
+        var diagnostics = diag.Bag.init(allocator);
+        defer diagnostics.deinit();
+
+        var function = typed.FunctionData.init(allocator, item.kind == .suspend_function, item.kind == .foreign_function);
+        defer function.deinit(allocator);
+        const signature = switch (item.syntax) {
+            .function => |signature| signature,
+            else => continue,
+        };
+        try query_item_syntax_bridge.fillFunctionDataFromSyntax(allocator, &function, signature, item.span, &diagnostics);
+
+        const parameter_types = try allocator.alloc(types.TypeRef, function.parameters.items.len);
+        errdefer allocator.free(parameter_types);
+        const parameter_type_names = try duplicateParameterTypeNames(allocator, function.parameters.items);
+        errdefer allocator.free(parameter_type_names);
+        const parameter_modes = try allocator.alloc(typed.ParameterMode, function.parameters.items.len);
+        errdefer allocator.free(parameter_modes);
+        for (function.parameters.items, 0..) |parameter, parameter_index| {
+            parameter_types[parameter_index] = parameter.ty;
+            parameter_modes[parameter_index] = parameter.mode;
+        }
+
+        try prototypes.append(.{
+            .name = item.name,
+            .target_name = item.name,
+            .target_symbol = typed_item.symbol_name,
+            .return_type = function.return_type,
+            .generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{},
+            .where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{},
+            .is_suspend = function.is_suspend,
+            .parameter_types = parameter_types,
+            .parameter_type_names = parameter_type_names,
+            .parameter_modes = parameter_modes,
+            .unsafe_required = typed_item.is_unsafe,
+        });
+    }
+}
+
+fn duplicateParameterTypeNames(allocator: Allocator, parameters: []const typed.Parameter) ![]const []const u8 {
+    const names = try allocator.alloc([]const u8, parameters.len);
+    for (parameters, 0..) |parameter, index| {
+        names[index] = parameter.type_name;
+    }
+    return names;
+}
+
+fn collectGlobalItemMetadata(
+    allocator: Allocator,
+    module_pipeline: *const ModulePipeline,
+    source_module_index: usize,
+    item_index: usize,
+) !GlobalItem {
+    const item = module_pipeline.typed.items.items[item_index];
+    const source_item = module_pipeline.hir.items.items[item_index];
+    var metadata = GlobalItem{
+        .source_module_index = source_module_index,
+        .category = item.category,
+        .target_name = item.name,
+        .target_symbol = item.symbol_name,
+        .const_type = null,
+        .function_parameter_modes = null,
+    };
+    errdefer deinitGlobalItemMetadata(allocator, &metadata);
+
+    var diagnostics = diag.Bag.init(allocator);
+    defer diagnostics.deinit();
+
+    switch (source_item.kind) {
+        .function, .suspend_function, .foreign_function => {
+            var function = typed.FunctionData.init(allocator, source_item.kind == .suspend_function, source_item.kind == .foreign_function);
+            defer function.deinit(allocator);
+            const signature = switch (source_item.syntax) {
+                .function => |signature| signature,
+                else => return metadata,
+            };
+            try query_item_syntax_bridge.fillFunctionDataFromSyntax(allocator, &function, signature, source_item.span, &diagnostics);
+            metadata.function_return_type = resolveModuleValueType(&module_pipeline.typed, function.return_type, function.return_type_name);
+            metadata.function_generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{};
+            metadata.function_where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{};
+            metadata.function_is_suspend = function.is_suspend;
+            metadata.function_parameter_types = try allocator.alloc(types.TypeRef, function.parameters.items.len);
+            metadata.function_parameter_type_names = try duplicateParameterTypeNames(allocator, function.parameters.items);
+            metadata.function_parameter_modes = try allocator.alloc(typed.ParameterMode, function.parameters.items.len);
+            for (function.parameters.items, 0..) |parameter, parameter_index| {
+                metadata.function_parameter_types.?[parameter_index] = resolveModuleValueType(
+                    &module_pipeline.typed,
+                    parameter.ty,
+                    parameter.type_name,
+                );
+                metadata.function_parameter_modes.?[parameter_index] = parameter.mode;
+            }
+            metadata.function_unsafe_required = item.is_unsafe;
+        },
+        .const_item => {
+            var const_item = switch (source_item.syntax) {
+                .const_item => |signature| try query_item_syntax_bridge.parseConstDataFromSyntax(allocator, signature, source_item.span, &diagnostics),
+                else => return metadata,
+            };
+            defer const_item.deinit(allocator);
+            metadata.const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, const_item.type_name);
+        },
+        .struct_type => switch (source_item.body_syntax) {
+            .struct_fields => |fields| {
+                metadata.struct_fields = try query_body_syntax_bridge.parseFieldsFromSyntax(allocator, fields, source_item.name, source_item.span, &diagnostics);
+                resolveStructFieldsInPlace(&module_pipeline.typed, metadata.struct_fields.?);
+            },
+            .none => metadata.struct_fields = try allocator.alloc(typed.StructField, 0),
+            else => {},
+        },
+        .enum_type => switch (source_item.body_syntax) {
+            .enum_variants => |variants| {
+                metadata.enum_variants = try query_body_syntax_bridge.parseEnumVariantsFromSyntax(allocator, variants, source_item.name, source_item.span, &diagnostics);
+                resolveEnumVariantsInPlace(&module_pipeline.typed, metadata.enum_variants.?);
+            },
+            .none => metadata.enum_variants = try allocator.alloc(typed.EnumVariant, 0),
+            else => {},
+        },
+        .trait_type => {
+            var header = switch (source_item.syntax) {
+                .named_decl => |signature| try query_item_syntax_bridge.parseNamedDeclData(allocator, signature, true, source_item.span, &diagnostics),
+                else => return metadata,
+            };
+            defer header.deinit(allocator);
+            var parsed = switch (source_item.body_syntax) {
+                .trait_body => |body| try query_body_syntax_bridge.parseTraitBodyFromSyntax(allocator, header.generic_params, body, source_item.name, source_item.span, &diagnostics),
+                .none => query_body_syntax_bridge.ParsedTraitBody{
+                    .methods = try allocator.alloc(typed.TraitMethod, 0),
+                    .associated_types = try allocator.alloc(typed.TraitAssociatedType, 0),
+                    .associated_consts = try allocator.alloc(typed.TraitAssociatedConst, 0),
+                },
+                else => return metadata,
+            };
+            defer parsed.deinit(allocator);
+            metadata.trait_methods = parsed.methods;
+            parsed.methods = &.{};
+        },
+        else => {},
+    }
+
+    return metadata;
+}
+
+fn deinitGlobalItemMetadata(allocator: Allocator, item: *GlobalItem) void {
+    if (item.function_generic_params.len != 0) allocator.free(item.function_generic_params);
+    if (item.function_where_predicates.len != 0) allocator.free(item.function_where_predicates);
+    if (item.function_parameter_types) |value| allocator.free(value);
+    if (item.function_parameter_type_names) |value| allocator.free(value);
+    if (item.function_parameter_modes) |value| allocator.free(value);
+    if (item.struct_fields) |fields| allocator.free(fields);
+    if (item.enum_variants) |variants| {
+        for (variants) |*variant| variant.deinit(allocator);
+        allocator.free(variants);
+    }
+    if (item.trait_methods) |methods| {
+        for (methods) |*method| method.deinit(allocator);
+        allocator.free(methods);
+    }
+    item.* = .{
+        .source_module_index = 0,
+        .category = .value,
+        .target_name = "",
+        .target_symbol = "",
+        .const_type = null,
+        .function_parameter_modes = null,
+    };
+}
 
 fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void {
     var modules = std.StringHashMap(usize).init(allocator);
@@ -268,7 +457,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
     }
 
     for (pipeline.modules.items, 0..) |module_pipeline, module_index| {
-        for (module_pipeline.typed.items.items) |item| {
+        for (module_pipeline.typed.items.items, 0..) |item, item_index| {
             if (item.is_synthetic) continue;
             if (item.name.len == 0) continue;
             if (item.kind == .module_decl or item.kind == .use_decl) continue;
@@ -276,80 +465,15 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
             const canonical = try canonicalPath(allocator, module_pipeline.module_path, item.name);
             errdefer allocator.free(canonical);
 
-            var function_return_type: ?types.TypeRef = null;
-            var function_generic_params: []typed.GenericParam = &.{};
-            var function_where_predicates: []typed.WherePredicate = &.{};
-            var function_is_suspend = false;
-            var function_parameter_types: ?[]types.TypeRef = null;
-            var function_parameter_type_names: ?[]const []const u8 = null;
-            var function_parameter_modes: ?[]typed.ParameterMode = null;
-            var const_type: ?types.TypeRef = null;
-            var struct_fields: ?[]typed.StructField = null;
-            var enum_variants: ?[]typed.EnumVariant = null;
-            var trait_methods: ?[]typed.TraitMethod = null;
-            switch (item.payload) {
-                .function => |function| {
-                    function_return_type = resolveModuleValueType(&module_pipeline.typed, function.return_type, function.return_type_name);
-                    function_generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{};
-                    function_where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{};
-                    function_is_suspend = function.is_suspend;
-                    function_parameter_types = try allocator.alloc(types.TypeRef, function.parameters.items.len);
-                    const parameter_type_names = try allocator.alloc([]const u8, function.parameters.items.len);
-                    function_parameter_type_names = parameter_type_names;
-                    function_parameter_modes = try allocator.alloc(typed.ParameterMode, function.parameters.items.len);
-                    for (function.parameters.items, 0..) |parameter, parameter_index| {
-                        function_parameter_types.?[parameter_index] = resolveModuleValueType(&module_pipeline.typed, parameter.ty, parameter.type_name);
-                        parameter_type_names[parameter_index] = parameter.type_name;
-                        function_parameter_modes.?[parameter_index] = parameter.mode;
-                    }
-                },
-                .const_item => |const_item| const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, const_item.type_name),
-                .struct_type => |struct_type| struct_fields = try resolveStructFieldsForImport(allocator, &module_pipeline.typed, struct_type.fields),
-                .enum_type => |enum_type| enum_variants = try resolveEnumVariantsForImport(allocator, &module_pipeline.typed, enum_type.variants),
-                .opaque_type => {},
-                .union_type => {},
-                .trait_type => |trait_type| trait_methods = try duplicateTraitMethods(allocator, trait_type.methods),
-                .impl_block => {},
-                .none => {},
-            }
+            var metadata = try collectGlobalItemMetadata(allocator, &module_pipeline, module_index, item_index);
 
             const entry = try items.getOrPut(canonical);
             if (entry.found_existing) {
                 allocator.free(canonical);
-                if (function_generic_params.len != 0) allocator.free(function_generic_params);
-                if (function_where_predicates.len != 0) allocator.free(function_where_predicates);
-                if (function_parameter_types) |value| allocator.free(value);
-                if (function_parameter_type_names) |value| allocator.free(value);
-                if (function_parameter_modes) |value| allocator.free(value);
-                if (struct_fields) |fields| allocator.free(fields);
-                if (enum_variants) |variants| {
-                    for (variants) |*variant| variant.deinit(allocator);
-                    allocator.free(variants);
-                }
-                if (trait_methods) |methods| {
-                    for (methods) |*method| method.deinit(allocator);
-                    allocator.free(methods);
-                }
+                deinitGlobalItemMetadata(allocator, &metadata);
                 continue;
             }
-            entry.value_ptr.* = .{
-                .source_module_index = module_index,
-                .category = item.category,
-                .target_name = item.name,
-                .target_symbol = item.symbol_name,
-                .const_type = const_type,
-                .function_return_type = function_return_type,
-                .function_generic_params = function_generic_params,
-                .function_where_predicates = function_where_predicates,
-                .function_is_suspend = function_is_suspend,
-                .function_parameter_types = function_parameter_types,
-                .function_parameter_type_names = function_parameter_type_names,
-                .function_parameter_modes = function_parameter_modes,
-                .function_unsafe_required = item.is_unsafe,
-                .struct_fields = struct_fields,
-                .enum_variants = enum_variants,
-                .trait_methods = trait_methods,
-            };
+            entry.value_ptr.* = metadata;
         }
     }
 
@@ -377,6 +501,10 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
                     .enum_variants = if (target.enum_variants) |variants| try duplicateEnumVariants(allocator, variants) else null,
                     .trait_methods = if (target.trait_methods) |methods| try duplicateTraitMethods(allocator, methods) else null,
                 };
+                try module_pipeline.import_binding_sites.append(.{
+                    .local_name = symbol.name,
+                    .span = symbol.span,
+                });
                 try typed.addImportedBinding(allocator, &module_pipeline.typed, imported);
 
                 if (imported.function_parameter_types) |values| {
@@ -395,13 +523,6 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
                     });
                 }
                 if (target.category == .type_decl) {
-                    try appendImportedMethodsForType(
-                        allocator,
-                        &module_pipeline.typed,
-                        &pipeline.modules.items[target.source_module_index].typed,
-                        target.target_name,
-                        imported.local_name,
-                    );
                 }
                 continue;
             }
@@ -463,6 +584,7 @@ fn discoverGraphModuleTree(
         &prototypes,
     );
     errdefer lowered_typed.deinit(allocator);
+    try appendPreparedFunctionPrototypes(allocator, lowered_hir, &lowered_typed, &prototypes);
 
     try pipeline.modules.append(.{
         .root_index = root_index,
@@ -472,6 +594,7 @@ fn discoverGraphModuleTree(
         .hir = lowered_hir,
         .resolved = resolved,
         .prototypes = prototypes,
+        .import_binding_sites = array_list.Managed(ImportBindingSite).init(allocator),
         .typed = lowered_typed,
         .mir = null,
     });
@@ -532,7 +655,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
     }
 
     for (pipeline.modules.items, 0..) |module_pipeline, module_index| {
-        for (module_pipeline.typed.items.items) |item| {
+        for (module_pipeline.typed.items.items, 0..) |item, item_index| {
             if (item.is_synthetic) continue;
             if (item.name.len == 0) continue;
             if (item.kind == .module_decl or item.kind == .use_decl) continue;
@@ -540,80 +663,15 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
             const local_key = try scopedCanonicalPath(allocator, module_pipeline.root_index, module_pipeline.package_index, module_pipeline.module_path, item.name);
             errdefer allocator.free(local_key);
 
-            var function_return_type: ?types.TypeRef = null;
-            var function_generic_params: []typed.GenericParam = &.{};
-            var function_where_predicates: []typed.WherePredicate = &.{};
-            var function_is_suspend = false;
-            var function_parameter_types: ?[]types.TypeRef = null;
-            var function_parameter_type_names: ?[]const []const u8 = null;
-            var function_parameter_modes: ?[]typed.ParameterMode = null;
-            var const_type: ?types.TypeRef = null;
-            var struct_fields: ?[]typed.StructField = null;
-            var enum_variants: ?[]typed.EnumVariant = null;
-            var trait_methods: ?[]typed.TraitMethod = null;
-            switch (item.payload) {
-                .function => |function| {
-                    function_return_type = resolveModuleValueType(&module_pipeline.typed, function.return_type, function.return_type_name);
-                    function_generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{};
-                    function_where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{};
-                    function_is_suspend = function.is_suspend;
-                    function_parameter_types = try allocator.alloc(types.TypeRef, function.parameters.items.len);
-                    const parameter_type_names = try allocator.alloc([]const u8, function.parameters.items.len);
-                    function_parameter_type_names = parameter_type_names;
-                    function_parameter_modes = try allocator.alloc(typed.ParameterMode, function.parameters.items.len);
-                    for (function.parameters.items, 0..) |parameter, parameter_index| {
-                        function_parameter_types.?[parameter_index] = resolveModuleValueType(&module_pipeline.typed, parameter.ty, parameter.type_name);
-                        parameter_type_names[parameter_index] = parameter.type_name;
-                        function_parameter_modes.?[parameter_index] = parameter.mode;
-                    }
-                },
-                .const_item => |const_item| const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, const_item.type_name),
-                .struct_type => |struct_type| struct_fields = try resolveStructFieldsForImport(allocator, &module_pipeline.typed, struct_type.fields),
-                .enum_type => |enum_type| enum_variants = try resolveEnumVariantsForImport(allocator, &module_pipeline.typed, enum_type.variants),
-                .opaque_type => {},
-                .union_type => {},
-                .trait_type => |trait_type| trait_methods = try duplicateTraitMethods(allocator, trait_type.methods),
-                .impl_block => {},
-                .none => {},
-            }
+            var metadata = try collectGlobalItemMetadata(allocator, &module_pipeline, module_index, item_index);
 
             const entry = try items.getOrPut(local_key);
             if (entry.found_existing) {
                 allocator.free(local_key);
-                if (function_generic_params.len != 0) allocator.free(function_generic_params);
-                if (function_where_predicates.len != 0) allocator.free(function_where_predicates);
-                if (function_parameter_types) |value| allocator.free(value);
-                if (function_parameter_type_names) |value| allocator.free(value);
-                if (function_parameter_modes) |value| allocator.free(value);
-                if (struct_fields) |fields| allocator.free(fields);
-                if (enum_variants) |variants| {
-                    for (variants) |*variant| variant.deinit(allocator);
-                    allocator.free(variants);
-                }
-                if (trait_methods) |methods| {
-                    for (methods) |*method| method.deinit(allocator);
-                    allocator.free(methods);
-                }
+                deinitGlobalItemMetadata(allocator, &metadata);
                 continue;
             }
-            entry.value_ptr.* = .{
-                .source_module_index = module_index,
-                .category = item.category,
-                .target_name = item.name,
-                .target_symbol = item.symbol_name,
-                .const_type = const_type,
-                .function_return_type = function_return_type,
-                .function_generic_params = function_generic_params,
-                .function_where_predicates = function_where_predicates,
-                .function_is_suspend = function_is_suspend,
-                .function_parameter_types = function_parameter_types,
-                .function_parameter_type_names = function_parameter_type_names,
-                .function_parameter_modes = function_parameter_modes,
-                .function_unsafe_required = item.is_unsafe,
-                .struct_fields = struct_fields,
-                .enum_variants = enum_variants,
-                .trait_methods = trait_methods,
-            };
+            entry.value_ptr.* = metadata;
         }
     }
 
@@ -659,6 +717,10 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         .enum_variants = if (target.enum_variants) |variants| try duplicateEnumVariants(allocator, variants) else null,
                         .trait_methods = if (target.trait_methods) |methods| try duplicateTraitMethods(allocator, methods) else null,
                     };
+                    try module_pipeline.import_binding_sites.append(.{
+                        .local_name = symbol.name,
+                        .span = symbol.span,
+                    });
                     try typed.addImportedBinding(allocator, &module_pipeline.typed, imported);
                 if (imported.function_parameter_types) |values| {
                     try module_pipeline.prototypes.append(.{
@@ -676,13 +738,6 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                     });
                 }
                     if (target.category == .type_decl) {
-                        try appendImportedMethodsForType(
-                            allocator,
-                            &module_pipeline.typed,
-                            &pipeline.modules.items[target.source_module_index].typed,
-                            target.target_name,
-                            imported.local_name,
-                        );
                     }
                     continue;
                 }
@@ -708,6 +763,10 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         .enum_variants = if (resolved_target.enum_variants) |variants| try duplicateEnumVariants(allocator, variants) else null,
                         .trait_methods = if (resolved_target.trait_methods) |methods| try duplicateTraitMethods(allocator, methods) else null,
                     };
+                    try module_pipeline.import_binding_sites.append(.{
+                        .local_name = symbol.name,
+                        .span = symbol.span,
+                    });
                     try typed.addImportedBinding(allocator, &module_pipeline.typed, imported);
                     if (imported.function_parameter_types) |values| {
                         try module_pipeline.prototypes.append(.{
@@ -725,13 +784,6 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         });
                     }
                     if (resolved_target.category == .type_decl) {
-                        try appendImportedMethodsForType(
-                            allocator,
-                            &module_pipeline.typed,
-                            &pipeline.modules.items[resolved_target.source_module_index].typed,
-                            resolved_target.target_name,
-                            imported.local_name,
-                        );
                     }
                     continue;
                 }
@@ -789,6 +841,32 @@ fn duplicateStructFields(allocator: Allocator, fields: []const typed.StructField
 }
 
 fn resolveStructFieldsForImport(allocator: Allocator, module: *const typed.Module, fields: []const typed.StructField) ![]typed.StructField {
+    const duplicated = try duplicateStructFields(allocator, fields);
+    resolveStructFieldsInPlace(module, duplicated);
+    return duplicated;
+}
+
+fn resolveStructFieldsInPlace(module: *const typed.Module, fields: []typed.StructField) void {
+    for (fields) |*field| {
+        field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+    }
+}
+
+fn resolveEnumVariantsInPlace(module: *const typed.Module, variants: []typed.EnumVariant) void {
+    for (variants) |*variant| {
+        switch (variant.payload) {
+            .none => {},
+            .tuple_fields => |tuple_fields| {
+                for (tuple_fields) |*field| {
+                    field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+                }
+            },
+            .named_fields => |named_fields| resolveStructFieldsInPlace(module, named_fields),
+        }
+    }
+}
+
+fn resolveStructFieldsForImportOld(allocator: Allocator, module: *const typed.Module, fields: []const typed.StructField) ![]typed.StructField {
     const duplicated = try duplicateStructFields(allocator, fields);
     for (duplicated) |*field| {
         field.ty = resolveModuleValueType(module, field.ty, field.type_name);
@@ -859,112 +937,6 @@ fn resolveEnumVariantsForImport(allocator: Allocator, module: *const typed.Modul
         }
     }
     return duplicated;
-}
-
-fn appendImportedMethodsForType(
-    allocator: Allocator,
-    destination_module: *typed.Module,
-    source_module: *const typed.Module,
-    source_type_name: []const u8,
-    local_type_name: []const u8,
-) !void {
-    for (source_module.methods.items) |method| {
-        if (!std.mem.eql(u8, method.target_type, source_type_name)) continue;
-        const imported = try resolveMethodPrototypeForImport(
-            allocator,
-            source_module,
-            method,
-            source_type_name,
-            local_type_name,
-        );
-        try typed.addImportedMethodPrototype(allocator, destination_module, imported);
-    }
-}
-
-fn resolveMethodPrototypeForImport(
-    allocator: Allocator,
-    source_module: *const typed.Module,
-    method: typed.MethodPrototype,
-    source_type_name: []const u8,
-    local_type_name: []const u8,
-) !typed.MethodPrototype {
-    const source_function = findFunctionBySymbol(source_module, method.function_symbol);
-
-    const resolved_return_type = if (source_function) |function|
-        remapImportedMethodType(resolveModuleValueType(source_module, function.return_type, function.return_type_name), source_type_name, local_type_name)
-    else
-        remapImportedMethodType(method.return_type, source_type_name, local_type_name);
-
-    const parameter_types = if (source_function) |function| blk: {
-        const resolved = try allocator.alloc(types.TypeRef, function.parameters.items.len);
-        for (function.parameters.items, 0..) |parameter, index| {
-            resolved[index] = remapImportedMethodType(
-                resolveModuleValueType(source_module, parameter.ty, parameter.type_name),
-                source_type_name,
-                local_type_name,
-            );
-        }
-        break :blk resolved;
-    } else blk: {
-        const duplicated = try allocator.alloc(types.TypeRef, method.parameter_types.len);
-        for (method.parameter_types, 0..) |parameter, index| {
-            duplicated[index] = remapImportedMethodType(parameter, source_type_name, local_type_name);
-        }
-        break :blk duplicated;
-    };
-
-    const parameter_type_names = if (source_function) |function| blk: {
-        const duplicated = try allocator.alloc([]const u8, function.parameters.items.len);
-        for (function.parameters.items, 0..) |parameter, index| {
-            duplicated[index] = if (std.mem.eql(u8, parameter.type_name, source_type_name)) local_type_name else parameter.type_name;
-        }
-        break :blk duplicated;
-    } else try allocator.dupe([]const u8, method.parameter_type_names);
-
-    const parameter_modes = if (source_function) |function| blk: {
-        const duplicated = try allocator.alloc(typed.ParameterMode, function.parameters.items.len);
-        for (function.parameters.items, 0..) |parameter, index| {
-            duplicated[index] = parameter.mode;
-        }
-        break :blk duplicated;
-    } else try allocator.dupe(typed.ParameterMode, method.parameter_modes);
-
-    return .{
-        .target_type = local_type_name,
-        .method_name = method.method_name,
-        .function_name = method.function_name,
-        .function_symbol = method.function_symbol,
-        .receiver_mode = method.receiver_mode,
-        .return_type = resolved_return_type,
-        .generic_params = if (source_function) |function| blk: {
-            break :blk if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{};
-        } else if (method.generic_params.len != 0) try allocator.dupe(typed.GenericParam, method.generic_params) else &.{},
-        .where_predicates = if (source_function) |function| blk: {
-            break :blk if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{};
-        } else if (method.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, method.where_predicates) else &.{},
-        .is_suspend = method.is_suspend,
-        .parameter_types = parameter_types,
-        .parameter_type_names = parameter_type_names,
-        .parameter_modes = parameter_modes,
-    };
-}
-
-fn remapImportedMethodType(ty: types.TypeRef, source_type_name: []const u8, local_type_name: []const u8) types.TypeRef {
-    return switch (ty) {
-        .named => |name| if (std.mem.eql(u8, name, source_type_name)) .{ .named = local_type_name } else ty,
-        else => ty,
-    };
-}
-
-fn findFunctionBySymbol(module: *const typed.Module, symbol_name: []const u8) ?*const typed.FunctionData {
-    for (module.items.items) |*item| {
-        if (!std.mem.eql(u8, item.symbol_name, symbol_name)) continue;
-        return switch (item.payload) {
-            .function => |*function| function,
-            else => null,
-        };
-    }
-    return null;
 }
 
 fn resolveModuleValueType(module: *const typed.Module, current: types.TypeRef, type_name: []const u8) types.TypeRef {
