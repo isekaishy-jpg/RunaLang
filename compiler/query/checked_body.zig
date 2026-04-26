@@ -276,6 +276,14 @@ pub const ReturnValueSite = struct {
     value_type: types.TypeRef,
 };
 
+pub const AssignmentWriteSite = struct {
+    statement_index: usize,
+    target_name: []const u8,
+    target_type: types.TypeRef,
+    target_base_type: ?types.TypeRef = null,
+    value_type: types.TypeRef,
+};
+
 pub const ExpressionId = struct { index: usize };
 
 pub const ExpressionKind = enum {
@@ -336,6 +344,7 @@ pub const Facts = struct {
     call_argument_sites: []const CallArgumentSite,
     constructor_argument_sites: []const ConstructorArgumentSite,
     return_value_sites: []const ReturnValueSite,
+    assignment_write_sites: []const AssignmentWriteSite,
     expression_sites: []const ExpressionSite,
 
     pub fn deinit(self: Facts, allocator: Allocator) void {
@@ -368,6 +377,7 @@ pub const Facts = struct {
         allocator.free(self.call_argument_sites);
         allocator.free(self.constructor_argument_sites);
         allocator.free(self.return_value_sites);
+        allocator.free(self.assignment_write_sites);
         allocator.free(self.expression_sites);
     }
 };
@@ -430,6 +440,7 @@ pub fn buildFacts(
         .call_argument_sites = try builder.call_argument_sites.toOwnedSlice(),
         .constructor_argument_sites = try builder.constructor_argument_sites.toOwnedSlice(),
         .return_value_sites = try builder.return_value_sites.toOwnedSlice(),
+        .assignment_write_sites = try builder.assignment_write_sites.toOwnedSlice(),
         .expression_sites = try builder.expression_sites.toOwnedSlice(),
     };
 }
@@ -456,6 +467,7 @@ const Builder = struct {
     call_argument_sites: std.array_list.Managed(CallArgumentSite),
     constructor_argument_sites: std.array_list.Managed(ConstructorArgumentSite),
     return_value_sites: std.array_list.Managed(ReturnValueSite),
+    assignment_write_sites: std.array_list.Managed(AssignmentWriteSite),
     expression_sites: std.array_list.Managed(ExpressionSite),
     scope_stack: std.array_list.Managed(usize),
     loop_stack: std.array_list.Managed(usize),
@@ -484,6 +496,7 @@ const Builder = struct {
             .call_argument_sites = std.array_list.Managed(CallArgumentSite).init(allocator),
             .constructor_argument_sites = std.array_list.Managed(ConstructorArgumentSite).init(allocator),
             .return_value_sites = std.array_list.Managed(ReturnValueSite).init(allocator),
+            .assignment_write_sites = std.array_list.Managed(AssignmentWriteSite).init(allocator),
             .expression_sites = std.array_list.Managed(ExpressionSite).init(allocator),
             .scope_stack = std.array_list.Managed(usize).init(allocator),
             .loop_stack = std.array_list.Managed(usize).init(allocator),
@@ -517,6 +530,7 @@ const Builder = struct {
         self.call_argument_sites.deinit();
         self.constructor_argument_sites.deinit();
         self.return_value_sites.deinit();
+        self.assignment_write_sites.deinit();
         self.expression_sites.deinit();
         self.scope_stack.deinit();
         self.loop_stack.deinit();
@@ -709,6 +723,13 @@ const Builder = struct {
                     .name = assign.name,
                     .ty = assign.ty,
                     .mutable = true,
+                });
+                try self.assignment_write_sites.append(.{
+                    .statement_index = statement_index,
+                    .target_name = assign.name,
+                    .target_type = assign.ty,
+                    .target_base_type = self.assignmentBaseType(assign.name),
+                    .value_type = assign.expr.ty,
                 });
                 try self.visitExpr(callable_resolver, statement_index, null, assign.expr);
             },
@@ -1125,6 +1146,12 @@ const Builder = struct {
         };
         try self.expression_sites.append(site);
         self.summary.expression_count += 1;
+    }
+
+    fn assignmentBaseType(self: *const Builder, target_name: []const u8) ?types.TypeRef {
+        const dot_index = std.mem.indexOfScalar(u8, target_name, '.') orelse return null;
+        const base_name = std.mem.trim(u8, target_name[0..dot_index], " \t");
+        return self.placeTypeForName(base_name);
     }
 
     fn recordCallableDispatch(self: *Builder, statement_index: usize, call: typed.Expr.Call) !void {

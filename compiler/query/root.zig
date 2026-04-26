@@ -246,6 +246,7 @@ pub fn checkedBody(active: *session.Session, body_id: session.BodyId) !CheckedBo
         .call_argument_sites = facts.call_argument_sites,
         .constructor_argument_sites = facts.constructor_argument_sites,
         .return_value_sites = facts.return_value_sites,
+        .assignment_write_sites = facts.assignment_write_sites,
         .expression_sites = facts.expression_sites,
     };
 
@@ -911,7 +912,7 @@ pub fn statementsByBody(active: *session.Session, body_id: session.BodyId) !Stat
     }
 
     const body = try checkedBody(active, body_id);
-    const statement_summary = try statement_checks.analyzeBody(body, &active.pipeline.diagnostics);
+    const statement_summary = try statement_checks.analyzeBody(active.allocator, body, &active.pipeline.diagnostics);
     const value = StatementResult{
         .body_id = body_id,
         .summary = .{
@@ -945,7 +946,7 @@ pub fn expressionsByBody(active: *session.Session, body_id: session.BodyId) !Exp
     }
 
     const body = try checkedBody(active, body_id);
-    const expression_result = try expression_checks.analyzeBody(active.allocator, body, &active.pipeline.diagnostics);
+    const expression_result = try expression_checks.analyzeBody(active, active.allocator, body, &active.pipeline.diagnostics);
     const value = ExpressionResult{
         .body_id = body_id,
         .summary = .{

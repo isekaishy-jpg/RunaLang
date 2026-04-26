@@ -926,7 +926,7 @@ fn findOrCreateImplLookup(active: *session.Session, key: query_types.ImplLookupK
     return active.caches.impl_lookups.items.len - 1;
 }
 
-fn canonicalTraitHead(
+pub fn canonicalTraitHead(
     active: *session.Session,
     module_id: session.ModuleId,
     raw_trait_name: []const u8,
@@ -937,7 +937,7 @@ fn canonicalTraitHead(
     return .{ .opaque_name = try active.internName(name) };
 }
 
-fn canonicalTypeHead(
+pub fn canonicalTypeHead(
     active: *session.Session,
     module_id: session.ModuleId,
     raw_type_name: []const u8,
@@ -1111,7 +1111,7 @@ fn cachedSignatureResolver(active: *session.Session, item_id: session.ItemId) an
     return error.MissingCheckedSignature;
 }
 
-fn traitHeadsEqual(lhs: query_types.CanonicalTraitHead, rhs: query_types.CanonicalTraitHead) bool {
+pub fn traitHeadsEqual(lhs: query_types.CanonicalTraitHead, rhs: query_types.CanonicalTraitHead) bool {
     if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
     return switch (lhs) {
         .builtin_send => true,
@@ -1120,7 +1120,7 @@ fn traitHeadsEqual(lhs: query_types.CanonicalTraitHead, rhs: query_types.Canonic
     };
 }
 
-fn typeHeadsEqual(lhs: query_types.CanonicalTypeHead, rhs: query_types.CanonicalTypeHead) bool {
+pub fn typeHeadsEqual(lhs: query_types.CanonicalTypeHead, rhs: query_types.CanonicalTypeHead) bool {
     if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
     return switch (lhs) {
         .builtin => |builtin| builtin == rhs.builtin,

@@ -2674,6 +2674,52 @@ test "domain-state body analysis rejects root storage in ordinary aggregates" {
     try std.testing.expectEqual(@as(usize, 1), domain_result.summary.rejected_storage);
 }
 
+test "domain-state body analysis rejects root storage through field assignment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#domain_root
+        \\struct AppState:
+        \\    counter: Index
+        \\
+        \\struct Holder:
+        \\    app: AppState
+        \\
+        \\fn store(take app: AppState) -> Unit:
+        \\    let initial: AppState = AppState :: 0 :: call
+        \\    let holder: Holder = Holder :: initial :: call
+        \\    holder.app = app
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const store_item_id = compiler.query.testing.findItemIdByName(&active, "store").?;
+    const store_body_id = active.semantic_index.itemEntry(store_item_id).body_id.?;
+    const domain_result = try compiler.query.domainStateByBody(&active, store_body_id);
+    try std.testing.expectEqual(@as(usize, 2), domain_result.summary.rejected_storage);
+
+    var saw_storage = false;
+    for (active.pipeline.diagnostics.items.items) |item| {
+        if (std.mem.eql(u8, item.code, "type.domain_state.storage")) {
+            saw_storage = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_storage);
+}
+
 test "checked signatures classify concrete boundary kinds" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6663,6 +6709,57 @@ test "semantic rejects generic impl overlap with concrete application" {
     try std.testing.expect(found_overlap);
 }
 
+test "semantic rejects overlapping impls through imported aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    const defs_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "defs" });
+    defer std.testing.allocator.free(defs_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, defs_dir, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\mod defs
+        \\use defs.{Marker, Marker as AliasMarker, Counter, Counter as AliasCounter}
+        \\
+        \\impl Marker for Counter:
+        \\
+        \\impl AliasMarker for AliasCounter:
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "defs/mod.rna",
+        .data =
+        \\pub(package) trait Marker:
+        \\
+        \\pub(package) struct Counter:
+        \\    value: I32
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_overlap = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.impl.overlap")) {
+            found_overlap = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_overlap);
+}
+
 test "semantic rejects user-written Send impls" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6759,6 +6856,79 @@ test "semantic rejects orphan impls for imported trait and type" {
         \\
         \\pub struct Counter:
         \\    value: I32
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    var found_orphan = false;
+    for (result.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.impl.orphan")) {
+            found_orphan = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_orphan);
+}
+
+test "semantic rejects orphan impls for imported trait and generic self" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    const deps_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "deps" });
+    defer std.testing.allocator.free(deps_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, deps_dir, .default_dir);
+
+    const core_dir = try std.fs.path.join(std.testing.allocator, &.{ deps_dir, "core" });
+    defer std.testing.allocator.free(core_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, core_dir, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[dependencies]
+        \\core = { path = "deps/core", version = "1.2.3" }
+        \\
+        \\[[products]]
+        \\kind = "bin"
+        \\root = "main.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\use core.Marker
+        \\
+        \\impl [T] Marker for T:
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "deps/core/runa.toml",
+        .data =
+        \\[package]
+        \\name = "core"
+        \\version = "1.2.3"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "deps/core/lib.rna",
+        .data =
+        \\pub trait Marker:
         ,
     });
 

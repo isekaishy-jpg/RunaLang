@@ -34,6 +34,7 @@ pub fn analyzeBody(
     try analyzeReturnSites(active, body, diagnostics, &summary);
     try analyzeCallArgumentSites(active, body, diagnostics, &summary);
     try analyzeConstructorArgumentSites(active, body, diagnostics, &summary);
+    try analyzeAssignmentWriteSites(active, body, diagnostics, &summary);
     return summary;
 }
 
@@ -182,6 +183,49 @@ fn analyzeConstructorArgumentSites(
                 kindLabel(domain_ref.kind),
                 active.item(domain_ref.item_id).name,
                 site.target_type_name,
+            },
+        );
+    }
+}
+
+fn analyzeAssignmentWriteSites(
+    active: *session.Session,
+    body: query_types.CheckedBody,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) !void {
+    for (body.assignment_write_sites) |site| {
+        const domain_ref = domain_state_checks.classifyTypeRef(active, body.module_id, site.value_type) orelse continue;
+        if (site.target_base_type) |base_type| {
+            if (domain_state_checks.classifyTypeRef(active, body.module_id, base_type) != null) continue;
+            summary.rejected_storage += 1;
+            try diagnostics.add(
+                .@"error",
+                "type.domain_state.storage",
+                body.item.span,
+                "function '{s}' may not store {s} value '{s}' inside non-domain value '{s}'",
+                .{
+                    body.item.name,
+                    kindLabel(domain_ref.kind),
+                    active.item(domain_ref.item_id).name,
+                    base_type.displayName(),
+                },
+            );
+            continue;
+        }
+
+        if (domain_state_checks.classifyTypeRef(active, body.module_id, site.target_type) != null) continue;
+        summary.rejected_storage += 1;
+        try diagnostics.add(
+            .@"error",
+            "type.domain_state.storage",
+            body.item.span,
+            "function '{s}' may not store {s} value '{s}' inside non-domain value '{s}'",
+            .{
+                body.item.name,
+                kindLabel(domain_ref.kind),
+                active.item(domain_ref.item_id).name,
+                site.target_type.displayName(),
             },
         );
     }

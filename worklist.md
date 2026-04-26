@@ -101,9 +101,10 @@ The goal is to implement all specs, not a partial showcase subset.
 - [x] Boundary classification/contracts and repeat `Iterable` capability resolved from checked/query facts
 - [x] Driver, CLI, docs, LSP, and MIR cut over to query-backed semantic finalization
 - [x] Old eager reflection scan, module-wide body-analysis path, and direct `typed.Expr` CTFE path removed
-- [ ] Replace raw-name/string-pattern coherence validation with canonical trait/type-head coherence over session-owned indexes
-- [ ] Replace remaining `prepared_body_issues` replay with explicit checked-body/query-owned statement and expression diagnostic facts
-- [ ] Expand domain-state storage escape analysis beyond constructor writes to assignment and other non-domain storage paths
+- [x] Replace raw-name/string-pattern coherence validation with canonical trait/type-head coherence over session-owned indexes
+- [x] Route typed-produced body diagnostics through checked-body statement/expression diagnostic facts
+- [x] Replace typed-produced body diagnostics with fully query-originated statement and expression diagnostic facts
+- [x] Expand domain-state storage escape analysis beyond constructor writes to assignment and other non-domain storage paths
 
 ## Async And Runtime
 - [x] Structured child-task teardown semantics

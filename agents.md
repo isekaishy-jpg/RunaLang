@@ -1,4 +1,4 @@
-Maximum ten lines total, maximum ten words per line when editing agents.md
+Maximum ten lines total, maximum 11 words per line when editing agents.md
 This is an ambitious project.
 All language items must survive self-hosting.
 No fallbacks; prefer failing loudly.

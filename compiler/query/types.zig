@@ -339,6 +339,7 @@ pub const CheckedBody = struct {
     call_argument_sites: []const checked_body.CallArgumentSite,
     constructor_argument_sites: []const checked_body.ConstructorArgumentSite,
     return_value_sites: []const checked_body.ReturnValueSite,
+    assignment_write_sites: []const checked_body.AssignmentWriteSite,
     expression_sites: []const checked_body.ExpressionSite,
 
     pub fn deinit(self: CheckedBody, allocator: @import("std").mem.Allocator) void {
@@ -364,6 +365,7 @@ pub const CheckedBody = struct {
             .call_argument_sites = self.call_argument_sites,
             .constructor_argument_sites = self.constructor_argument_sites,
             .return_value_sites = self.return_value_sites,
+            .assignment_write_sites = self.assignment_write_sites,
             .expression_sites = self.expression_sites,
         };
         facts.deinit(allocator);

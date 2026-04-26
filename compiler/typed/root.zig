@@ -183,7 +183,6 @@ pub const Item = struct {
     is_domain_context: bool,
     const_required_exprs: []ConstRequiredExpr = &.{},
     prepared_signature_issues: []diag.Diagnostic = &.{},
-    prepared_body_issues: []diag.Diagnostic = &.{},
     payload: Payload = .none,
 
     fn deinit(self: *Item, allocator: Allocator) void {
@@ -193,7 +192,6 @@ pub const Item = struct {
         for (self.const_required_exprs) |*expr| expr.deinit(allocator);
         if (self.const_required_exprs.len != 0) allocator.free(self.const_required_exprs);
         deinitDiagnosticSlice(allocator, self.prepared_signature_issues);
-        deinitDiagnosticSlice(allocator, self.prepared_body_issues);
         self.payload.deinit(allocator);
     }
 };
@@ -533,7 +531,7 @@ pub fn finalizePreparedModule(
         const drained = try drainDiagnostics(&prepared_issues);
         diagnostics_drained = true;
         switch (item.payload) {
-            .function => try appendDiagnostics(allocator, &item.prepared_body_issues, drained),
+            .function => deinitDiagnosticSlice(allocator, drained),
             else => try appendDiagnostics(allocator, &item.prepared_signature_issues, drained),
         }
     }
