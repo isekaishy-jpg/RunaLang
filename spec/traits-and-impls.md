@@ -19,7 +19,7 @@ Runa uses traits and impls for static behavior attachment.
 - Trait declarations may use `where` constraints.
 - Trait methods may be declarations or may supply default bodies in v1.
 - A default trait method body is part of the trait contract and may be inherited by impls that omit that method.
-- Associated consts are not part of v1.
+- Traits may declare associated consts in v1.
 
 Examples:
 
@@ -35,6 +35,12 @@ trait Iterator:
 ```
 
 ```runa
+trait Blocked:
+    const BLOCK_SIZE: Index
+    fn read_block(edit self, at: Index) -> Bytes
+```
+
+```runa
 trait Reset:
     fn reset(edit self) -> Unit:
         ...
@@ -43,6 +49,7 @@ trait Reset:
 ## Inherent Impls
 
 - `impl Type` declares inherent ordinary or suspend methods owned directly by the type.
+- `impl Type` may also declare inherent associated consts owned directly by the type.
 - Inherent methods are part of the receiver type's own method set.
 - Inherent impls do not satisfy a trait by themselves.
 
@@ -54,13 +61,19 @@ impl Window:
         ...
 ```
 
+```runa
+impl TokenKind:
+    const COUNT: Index = 12
+```
+
 ## Trait Impls
 
 - `impl Trait for Type` declares one trait implementation for one concrete type.
 - Trait impls may use `where` constraints.
-- Trait impls provide the methods and associated-type definitions required by the trait.
+- Trait impls provide the methods, associated-type definitions, and associated-const definitions required by the trait.
 - A trait impl may omit any trait method whose declaration supplies a default body.
 - A trait impl may not omit required associated-type definitions in v1.
+- A trait impl may not omit required associated-const definitions in v1.
 
 Example:
 
@@ -75,6 +88,14 @@ impl Iterator for LineCursor:
     type Item = Str
 
     fn next(edit self) -> Option[Self.Item]:
+        ...
+```
+
+```runa
+impl Blocked for File:
+    const BLOCK_SIZE: Index = 4096
+
+    fn read_block(edit self, at: Index) -> Bytes:
         ...
 ```
 
@@ -96,6 +117,22 @@ impl Iterator for LineCursor:
 - Trait impls must bind each required associated type.
 - Projection equality uses associated types through `where` law.
 - Associated-type projection is part of static type checking, not dynamic lookup.
+
+## Associated Consts
+
+- Traits may declare associated consts.
+- Inherent impls may declare associated consts.
+- Trait impls must bind each required associated const.
+- Associated const declarations require explicit declared types.
+- Trait associated const declarations are declaration-only in v1.
+- Trait impl and inherent associated const definitions require explicit const initializers.
+- Associated consts are compile-time items, not runtime fields.
+- Associated const lookup is static, not dynamic.
+- `Self.NAME` is valid inside the owning trait or impl body.
+- `Type.NAME` may name an inherent associated const or one unambiguous trait-associated const implemented for that type.
+- Ambiguous associated-const lookup is invalid.
+- Associated const defaults are not part of v1.
+- Associated const equality predicates and generic const projection solving are not part of v1.
 
 ## Default Method Bodies
 
@@ -184,7 +221,7 @@ The compiler must reject:
 
 - missing required trait methods in an impl when no default body exists
 - missing required associated-type definitions in a trait impl
-- associated consts treated as part of v1
+- missing required associated-const definitions in a trait impl
 - receiver forms outside the accepted v1 `self` forms
 - dynamic dispatch or trait-object use
 - extension-method lookup
@@ -192,5 +229,7 @@ The compiler must reject:
 - specialization
 - negative impls
 - ambiguous method resolution
+- associated const defaults
+- ambiguous associated-const lookup
 - impls that violate the orphan-style coherence rule
 - user-written impls of a built-in reserved marker trait when its owning spec forbids them

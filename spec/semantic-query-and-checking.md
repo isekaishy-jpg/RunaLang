@@ -5,8 +5,9 @@
 This spec defines the permanent semantic architecture for Runa.
 It is authoritative for session ownership, query boundaries, type-checking
 integration, trait solving, const evaluation, reflection metadata construction,
-and semantic analysis caching. Language behavior remains defined by the owning
-specs such as `spec/traits-and-impls.md`, `spec/consts.md`,
+conversion-aware checked-expression facts, and semantic analysis caching.
+Language behavior remains defined by the owning specs such as
+`spec/traits-and-impls.md`, `spec/consts.md`, `spec/conversions.md`,
 `spec/reflection.md`, `spec/ownership-model.md`, and
 `spec/lifetimes-and-regions.md`.
 
@@ -76,6 +77,7 @@ The permanent architecture includes stable identities for at least:
 - trait
 - impl
 - associated type
+- associated const
 - const item
 - reflection subject
 
@@ -128,7 +130,7 @@ The semantic architecture uses medium-granularity queries.
 - Item signatures are queryable by item identity.
 - Checked bodies are queryable by body identity.
 - Trait obligations are queryable by canonical goal.
-- Const values are queryable by const identity.
+- Const values are queryable by module-const or associated-const identity.
 - Reflection metadata is queryable by declaration identity.
 
 Local expression typing, local borrow flow, and local region propagation inside
@@ -142,7 +144,8 @@ This is the permanent quality target for speed and durability in v1.
 Type checking remains an explicit semantic stage with query-backed boundaries.
 
 - Resolution facts feed signature checking.
-- Signature checking establishes item-level type and generic facts.
+- Signature checking establishes item-level type, generic, and associated-const facts.
+- Type aliases resolve as items, but canonical semantic type facts use the underlying aliased type.
 - Body checking consumes resolved signatures, active `where` environment,
   and trait-solver services.
 - Checked body output is the semantic substrate for ownership, borrow,
@@ -175,6 +178,7 @@ The first-wave solver must support:
 
 - trait satisfaction
 - associated-type binding and projection equality
+- associated-const declaration and binding lookup from checked signature facts
 - trait and impl `where` obligations
 - built-in marker-trait rules owned by their specs
 - default-method inheritance decisions
@@ -199,6 +203,12 @@ Coherence uses an explicit validation pass plus cached impl lookup indexes for
 trait/type heads. Ad hoc trait lookup smeared through typed logic is not part
 of the end-state architecture.
 
+Associated consts do not add full const-equality goal solving in v1.
+
+- Associated const lookup resolves from checked signature facts.
+- Associated const values evaluate through ordinary const queries.
+- Generic const projection solving is not part of the first-wave solver.
+
 ## Const Evaluation Architecture
 
 Runa uses narrow deterministic CTFE.
@@ -207,6 +217,8 @@ Runa uses narrow deterministic CTFE.
 - CTFE operates on a dedicated const-evaluable representation derived from
   checked semantic expressions.
 - CTFE evaluates only the const surface permitted by `spec/consts.md`.
+- CTFE reuses ordinary conversion law from `spec/conversions.md`; it does not
+  invent const-only conversion semantics.
 - CTFE never executes arbitrary user functions in v1.
 
 The permanent CTFE algorithm is:
@@ -214,9 +226,16 @@ The permanent CTFE algorithm is:
 - lower one checked const-safe expression into dedicated const IR
 - evaluate it with a deterministic big-step evaluator over immutable const
   values
-- query named const dependencies by const identity
+- support first-wave const-safe aggregates, nested static tables, projection,
+  const indexing, and constant-pattern values through that same IR
+- evaluate explicit infallible conversions and checked `may[T]` conversions
+  through ordinary conversion law
+- query named const dependencies by module-const or associated-const identity
 - cache both successful values and explicit failures
 - detect and diagnose const dependency cycles through shared query-cycle logic
+
+Associated const values participate through this same CTFE architecture as
+module consts. There is no separate associated-const evaluator.
 
 Direct permanent evaluation over arbitrary `typed.Expr` is not the target
 architecture.
@@ -343,6 +362,7 @@ bootstrap-quality shortcuts as permanent design.
 
 - Trait behavior is defined in `spec/traits-and-impls.md`.
 - Const behavior is defined in `spec/consts.md`.
+- Conversion behavior is defined in `spec/conversions.md`.
 - Reflection behavior is defined in `spec/reflection.md`.
 - Ownership law is defined in `spec/ownership-model.md`.
 - Lifetime and region law is defined in `spec/lifetimes-and-regions.md`.

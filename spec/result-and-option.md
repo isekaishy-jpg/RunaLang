@@ -9,6 +9,7 @@ Runa standardizes `Option[T]` and `Result[T, E]` as foundational generic enum fa
 - Both are ordinary language-facing generic enum families.
 - Both follow ordinary enum, pattern, and ownership law unless this spec narrows them further.
 - Neither implies hidden exception semantics, hidden unwinding, or fallback control flow.
+- Neither implies a default ABI contract, transport envelope, or runtime-owned error channel.
 
 ## `Option[T]`
 
@@ -100,6 +101,7 @@ impl[T, E] Result[T, E]:
 - Pattern law is defined in `spec/patterns.md`.
 - Value semantics are defined in `spec/value-semantics.md`.
 - Generic bounds and associated outputs are defined in `spec/where.md`.
+- Layout and repr consequences remain defined in `spec/layout-and-repr.md`.
 - C ABI exclusions are defined in `spec/c-abi.md`.
 
 ## Diagnostics
@@ -109,3 +111,4 @@ The compiler or runtime must reject:
 - treating `Option[...]` or `Result[...]` as C ABI-safe by default
 - hidden exception or unwinding semantics attached to `Result[...]`
 - sentinel-based absence treated as equivalent to `Option.None`
+- treating `Option[...]` or `Result[...]` as runtime-owned transport wrappers by default

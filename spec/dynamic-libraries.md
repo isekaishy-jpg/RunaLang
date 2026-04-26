@@ -1,10 +1,11 @@
 # Dynamic Libraries
 
-Runa v1 includes explicit runtime dynamic-library loading and typed symbol lookup.
+Runa v1 includes an explicit std/runtime dynamic-library surface for loading and typed symbol lookup.
 
 ## Core Model
 
 - Runtime dynamic-library loading is separate from link-time foreign imports.
+- This public surface may use compiler-private runtime leaf hooks underneath, but it is not itself the compiler-private runtime leaf.
 - Dynamic libraries are handle families.
 - Symbol lookup is explicit and typed.
 - Symbol lookup returns detached typed values, not library-tied wrapper objects.
@@ -12,7 +13,7 @@ Runa v1 includes explicit runtime dynamic-library loading and typed symbol looku
 
 ## Handle Families
 
-The first-wave runtime dynamic-library handle family is:
+The first-wave dynamic-library handle family is:
 
 - `DynamicLibrary`
 
@@ -26,7 +27,7 @@ opaque type DynamicLibrary
 
 ## Standard First-Wave Surface
 
-The standard first-wave runtime dynamic-library surface includes:
+The standard first-wave std/runtime dynamic-library surface includes:
 
 - `open_library`
 - `lookup_symbol`
@@ -74,6 +75,7 @@ fn close_library(take library: DynamicLibrary) -> Result[Unit, DynamicLibraryErr
 - Raw pointer types come from `spec/raw-pointers.md`.
 - `#unsafe` law comes from `spec/unsafe.md`.
 - Dynamic-library loading is runtime use of foreign artifacts, not package dependency resolution.
+- Compiler-private runtime leaf ownership is defined in `spec/runtime-leaf-and-observability.md`.
 
 ## Boundaries
 
@@ -91,3 +93,4 @@ The compiler or runtime must reject:
 - library close outside `#unsafe`
 - use of a symbol after library close when the invalidation is known
 - silent fallback loading behavior hidden behind `open_library`
+- treating the public dynamic-library API as if it were the compiler-private runtime leaf

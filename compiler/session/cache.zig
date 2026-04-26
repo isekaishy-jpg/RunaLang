@@ -45,11 +45,14 @@ pub const CacheStore = struct {
     expressions: []Entry(query_types.ExpressionResult),
     module_signatures: []Entry(query_types.ModuleSignatureResult),
     consts: []Entry(query_types.ConstResult),
+    associated_consts: []Entry(query_types.AssociatedConstResult),
     reflections: []Entry(query_types.ReflectionMetadata),
     runtime_reflections: Entry(query_types.RuntimeReflectionResult),
     module_reflections: []Entry(query_types.ModuleReflectionResult),
     package_reflections: []Entry(query_types.PackageReflectionResult),
+    module_boundary_apis: []Entry(query_types.ModuleBoundaryApiResult),
     trait_goals: array_list.Managed(TraitGoalEntry),
+    impl_index: Entry(query_types.ImplIndexResult),
     impl_lookups: array_list.Managed(ImplLookupEntry),
     local_consts: []Entry(query_types.LocalConstResult),
     callables: []Entry(query_types.CallableResult),
@@ -70,11 +73,14 @@ pub const CacheStore = struct {
             .expressions = try allocateEntries(query_types.ExpressionResult, allocator, index.bodies.items.len),
             .module_signatures = try allocateEntries(query_types.ModuleSignatureResult, allocator, index.modules.items.len),
             .consts = try allocateEntries(query_types.ConstResult, allocator, index.consts.items.len),
+            .associated_consts = try allocateEntries(query_types.AssociatedConstResult, allocator, index.associated_consts.items.len),
             .reflections = try allocateEntries(query_types.ReflectionMetadata, allocator, index.reflections.items.len),
             .runtime_reflections = .{},
             .module_reflections = try allocateEntries(query_types.ModuleReflectionResult, allocator, index.modules.items.len),
             .package_reflections = try allocateEntries(query_types.PackageReflectionResult, allocator, index.packages.items.len),
+            .module_boundary_apis = try allocateEntries(query_types.ModuleBoundaryApiResult, allocator, index.modules.items.len),
             .trait_goals = array_list.Managed(TraitGoalEntry).init(allocator),
+            .impl_index = .{},
             .impl_lookups = array_list.Managed(ImplLookupEntry).init(allocator),
             .local_consts = try allocateEntries(query_types.LocalConstResult, allocator, index.bodies.items.len),
             .callables = try allocateEntries(query_types.CallableResult, allocator, index.bodies.items.len),
@@ -99,9 +105,25 @@ pub const CacheStore = struct {
         }
         allocator.free(self.bodies);
         allocator.free(self.statements);
+        for (self.expressions) |entry| {
+            if (entry.value) |value| value.deinit(allocator);
+        }
         allocator.free(self.expressions);
         allocator.free(self.module_signatures);
+        for (self.consts) |entry| {
+            if (entry.value) |value| {
+                var owned = value.value;
+                @import("../query/const_ir.zig").deinitValue(allocator, &owned);
+            }
+        }
         allocator.free(self.consts);
+        for (self.associated_consts) |entry| {
+            if (entry.value) |value| {
+                var owned = value.value;
+                @import("../query/const_ir.zig").deinitValue(allocator, &owned);
+            }
+        }
+        allocator.free(self.associated_consts);
         for (self.reflections) |entry| {
             if (entry.value) |value| value.metadata.deinit(allocator);
         }
@@ -115,7 +137,12 @@ pub const CacheStore = struct {
             if (entry.value) |value| allocator.free(value.metadata);
         }
         allocator.free(self.package_reflections);
+        for (self.module_boundary_apis) |entry| {
+            if (entry.value) |value| allocator.free(value.apis);
+        }
+        allocator.free(self.module_boundary_apis);
         self.trait_goals.deinit();
+        if (self.impl_index.value) |value| allocator.free(value.entries);
         for (self.impl_lookups.items) |entry| {
             if (entry.value) |value| allocator.free(value.impl_ids);
         }

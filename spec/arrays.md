@@ -10,6 +10,7 @@ Runa v1 includes a minimal fixed-size array feature through `[T; N]`.
 - Arrays are fixed-size, ordered, contiguous value aggregates.
 - Arrays are not dynamic collections and do not require backing strategies.
 - Compile-time const law for `N` is defined in `spec/consts.md`.
+- Contiguous storage does not by itself make an array a foreign-stable layout contract.
 
 ## Sequence Role
 
@@ -80,6 +81,7 @@ Law:
 - Ownership law is defined in `spec/ownership-model.md`.
 - Const law is defined in `spec/consts.md`.
 - Value semantics are defined in `spec/value-semantics.md`.
+- Layout and repr law are defined in `spec/layout-and-repr.md`.
 - C ABI array boundary law is defined in `spec/c-abi.md`.
 
 ## Diagnostics
@@ -93,4 +95,5 @@ The compiler or runtime must reject:
 - out-of-bounds strict array access
 - treating array subrange access as implicit copy
 - treating arrays as backing-dependent dynamic collections
+- treating contiguous array storage alone as an implied foreign-layout promise
 - direct foreign parameter or return use of arrays outside the C ABI rules

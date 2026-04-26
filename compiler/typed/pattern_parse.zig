@@ -164,7 +164,9 @@ fn parseSubjectPatternSyntaxRecursive(
             .irrefutable = true,
         },
         .binding => |binding| {
-            if (std.mem.eql(u8, binding.text, "true") or std.mem.eql(u8, binding.text, "false")) {
+            if (std.mem.eql(u8, binding.text, "true") or std.mem.eql(u8, binding.text, "false") or
+                (@hasDecl(@TypeOf(scope.*), "isConst") and scope.isConst(binding.text)))
+            {
                 return parseLiteralPatternSyntax(
                     parseExpressionSyntaxFn,
                     allocator,

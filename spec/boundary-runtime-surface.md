@@ -8,6 +8,7 @@ Runa uses explicit toolchain-generated boundary surfaces and typed bindings for 
 - Boundary-contract legality remains defined in `spec/boundary-contracts.md`.
 - Boundary-transport categories remain defined in `spec/boundary-transports.md`.
 - Non-C boundary invocation uses generated typed stubs or typed adapters, not runtime invoke-by-name.
+- This boundary surface may use compiler-private runtime leaf hooks underneath, but packaged metadata, binding, and adapter shape are not runtime-owned.
 - No erased universal boundary call object is part of v1.
 - Boundary operational metadata is separate from reflection metadata.
 
@@ -45,10 +46,12 @@ Runa uses explicit toolchain-generated boundary surfaces and typed bindings for 
 
 ## Capability Carriers
 
-- `#boundary[capability]` families cross through explicit runtime-owned carrier mechanisms.
+- `#boundary[capability]` families cross through explicit transport-owned carrier mechanisms.
 - Capability carriers preserve declared family identity and opacity.
 - Capability carriers do not silently degrade into strings, generic ids, or fabricated sentinels.
 - A transport may internally maintain routing tables, but source-visible law continues to see the declared capability family.
+- A transport may use minimal compiler-runtime leaf hooks internally, but the
+  carrier model itself is not runtime-owned.
 
 ## Packaging And Managed Entries
 
@@ -63,6 +66,7 @@ Runa uses explicit toolchain-generated boundary surfaces and typed bindings for 
 - Boundary contracts are defined in `spec/boundary-contracts.md`.
 - Boundary transports are defined in `spec/boundary-transports.md`.
 - Reflection law is defined in `spec/reflection.md`.
+- Compiler-private runtime leaf ownership is defined in `spec/runtime-leaf-and-observability.md`.
 - Manifest and product law is defined in `spec/manifest-and-products.md`.
 - Managed package and publication law are defined in `spec/package-management.md`, `spec/registry-model.md`, `spec/lockfile.md`, and `spec/publication.md`.
 
@@ -76,3 +80,4 @@ The toolchain or runtime must reject:
 - erased untyped binding or invocation carriers treated as the standard path
 - binding against a missing or incompatible packaged boundary surface
 - capability carriers that lose declared family identity or opacity
+- treating packaged boundary metadata or binding as compiler-runtime-owned

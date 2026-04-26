@@ -10,6 +10,7 @@ Runa gives text and byte families a small explicit first-wave API surface.
 - Literal syntax for `Str` and `Bytes` is defined in `spec/literals.md`.
 - Conversions between text and byte families are explicit.
 - Text APIs must preserve encoding validity and fail loudly on invalid boundaries or invalid decoding.
+- These families do not by themselves imply C ABI safety, boundary safety, or compiler-runtime ownership.
 
 ## Family Roles
 
@@ -287,9 +288,11 @@ impl Utf16:
 
 - Family validity and view semantics remain defined in `spec/memory-core.md`.
 - Scalar-family identity remains defined in `spec/scalars.md`.
+- General conversion forms are defined in `spec/conversions.md`.
 - `Char` family meaning is defined in `spec/char-family.md`.
 - Literal syntax remains defined in `spec/literals.md`.
 - Collection access and subrange semantics remain defined in `spec/collections.md`.
+- C ABI and layout/repr consequences remain defined in `spec/c-abi.md` and `spec/layout-and-repr.md`.
 - This spec defines the standard first-wave API surface, not every later convenience helper.
 
 ## Diagnostics
@@ -304,3 +307,4 @@ The compiler or runtime must reject:
 - treating `Str` as raw byte-indexable by default
 - treating `Utf16` as raw code-unit-indexable by default
 - unrestricted mutable UTF-16 raw-unit editing treated as part of v1
+- treating text or byte families as implicitly C ABI-safe or general boundary-safe

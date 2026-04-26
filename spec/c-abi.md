@@ -5,6 +5,7 @@ Runa v1 includes a complete explicit C ABI boundary with imports, exports, callb
 ## Core Model
 
 - The C ABI is a narrow explicit boundary layer.
+- The C ABI is one explicit ABI-family surface under the general layout and ABI architecture.
 - Ordinary Runa declaration, layout, and ownership law do not become C ABI law implicitly.
 - C ABI participation is opt-in.
 - C ABI surfaces use explicit calling conventions, explicit layout attributes, explicit symbol attributes, and `#unsafe` where required.
@@ -144,6 +145,7 @@ Law:
 - `#repr[c, IntType] enum` is restricted to unit variants only.
 - Explicit discriminant values follow compile-time const law from `spec/consts.md`.
 - Plain `struct` and plain `enum` do not imply C ABI stability.
+- General repr ownership, eligibility, and default-layout law remain defined in `spec/layout-and-repr.md`.
 
 ## Boundary-Only `union`
 
@@ -292,6 +294,7 @@ Law:
 ## Relationship To Other Specs
 
 - Attribute law is defined in `spec/attributes.md`.
+- Layout and repr law is defined in `spec/layout-and-repr.md`.
 - `#unsafe` law is defined in `spec/unsafe.md`.
 - `Option[...]` and `Result[...]` family law is defined in `spec/result-and-option.md`.
 - Ordinary function declaration shape is defined in `spec/functions.md`.
@@ -311,6 +314,7 @@ The compiler or runtime must reject:
 - `Unit` in foreign signatures
 - ordinary `struct` or `enum` treated as C-layout by default
 - `union` declarations without `#repr[c]`
+- treating `#repr[c]` as a best-effort hint instead of an explicit contract
 - C-layout enums without explicit integer representation
 - payload variants in C-layout enums
 - fixed-size arrays used as direct foreign parameter or return types

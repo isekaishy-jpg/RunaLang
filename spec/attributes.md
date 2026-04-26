@@ -93,7 +93,8 @@ Their detailed semantics remain in the specs that own them:
 - `#reflect` in `spec/reflection.md`
 - `#domain_root` and `#domain_context` in `spec/domain-state-surface.md`
 - `#boundary[...]` in `spec/boundary-contracts.md`
-- `#repr[...]`, `#link[...]`, and `#export[...]` in `spec/c-abi.md`
+- `#repr[...]` in `spec/layout-and-repr.md`
+- `#link[...]` and `#export[...]` in `spec/c-abi.md`
 
 ## Attachment Law
 

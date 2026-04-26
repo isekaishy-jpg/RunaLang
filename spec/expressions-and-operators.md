@@ -96,7 +96,8 @@ Runa v1 does not include:
 - `<<` and `>>` apply to integer scalar left operands and `Index` shift counts.
 - `&`, `^`, and `|` apply to integer scalar families.
 - `&&` and `||` require `Bool`.
-- No builtin arithmetic or bitwise operator implies mixed-width or mixed-family conversion.
+- Builtin arithmetic and bitwise operators may use ordinary same-ladder scalar widening where scalar law permits it.
+- No builtin arithmetic or bitwise operator implies mixed-family conversion.
 - No builtin boolean operator accepts numeric operands.
 - No builtin concatenation operator is implied for text or byte families.
 
@@ -197,7 +198,8 @@ The compiler must reject:
 - non-numeric operands to builtin arithmetic operators
 - non-integer operands to builtin bitwise operators
 - invalid shift operands
-- mixed-width or mixed-family builtin arithmetic without explicit conversion
+- mixed-family builtin arithmetic without explicit conversion
+- mixed-width builtin arithmetic outside the ordinary scalar widening law without explicit conversion
 - unsupported ordering on `Bool`, `Unit`, or non-builtin comparable families
 - comparison chaining without explicit grouping
 - invalid assignment targets

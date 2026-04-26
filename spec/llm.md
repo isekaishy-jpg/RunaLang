@@ -25,12 +25,19 @@ Publication law is defined in `spec/publication.md`.
 Invocation law is defined in `spec/invocation.md`.
 Function-declaration law is defined in `spec/functions.md`.
 Const law is defined in `spec/consts.md`.
+Conversion law is defined in `spec/conversions.md`.
 Type-declaration law is defined in `spec/types.md`.
+Type-alias law is defined in `spec/type-aliases.md`.
 Trait and impl law is defined in `spec/traits-and-impls.md`.
 Reflection law is defined in `spec/reflection.md`.
 Domain-state root law is defined in `spec/domain-state-roots.md`.
 Domain-state surface law is defined in `spec/domain-state-surface.md`.
 Semantic query and checking architecture is defined in `spec/semantic-query-and-checking.md`.
+Type, layout, ABI, and runtime architecture is defined in `spec/type-layout-abi-and-runtime.md`.
+Layout and repr law is defined in `spec/layout-and-repr.md`.
+Toolchain C translation and discovery law is defined in `spec/c-translation-and-discovery.md`.
+Backend lowering contract law is defined in `spec/backend-lowering-contract.md`.
+Runtime leaf and observability law is defined in `spec/runtime-leaf-and-observability.md`.
 Async and concurrency law is defined in `spec/async-and-concurrency.md`.
 Async runtime-surface law is defined in `spec/async-runtime-surface.md`.
 Incremental frontend law is defined in `spec/incremental-frontend.md`.

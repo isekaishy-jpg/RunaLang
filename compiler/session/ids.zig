@@ -9,6 +9,7 @@ pub const BodyId = struct { index: usize };
 pub const TraitId = struct { index: usize };
 pub const ImplId = struct { index: usize };
 pub const AssociatedTypeId = struct { index: usize };
+pub const AssociatedConstId = struct { index: usize };
 pub const ConstId = struct { index: usize };
 pub const ReflectionId = struct { index: usize };
 
@@ -50,6 +51,11 @@ pub const AssociatedTypeEntry = struct {
     associated_index: usize,
 };
 
+pub const AssociatedConstEntry = struct {
+    item_id: ItemId,
+    associated_index: usize,
+};
+
 pub const ConstEntry = struct {
     item_id: ItemId,
 };
@@ -66,6 +72,7 @@ pub const SemanticIndex = struct {
     traits: array_list.Managed(TraitEntry),
     impls: array_list.Managed(ImplEntry),
     associated_types: array_list.Managed(AssociatedTypeEntry),
+    associated_consts: array_list.Managed(AssociatedConstEntry),
     consts: array_list.Managed(ConstEntry),
     reflections: array_list.Managed(ReflectionEntry),
 
@@ -78,6 +85,7 @@ pub const SemanticIndex = struct {
             .traits = array_list.Managed(TraitEntry).init(allocator),
             .impls = array_list.Managed(ImplEntry).init(allocator),
             .associated_types = array_list.Managed(AssociatedTypeEntry).init(allocator),
+            .associated_consts = array_list.Managed(AssociatedConstEntry).init(allocator),
             .consts = array_list.Managed(ConstEntry).init(allocator),
             .reflections = array_list.Managed(ReflectionEntry).init(allocator),
         };
@@ -91,6 +99,7 @@ pub const SemanticIndex = struct {
         self.traits.deinit();
         self.impls.deinit();
         self.associated_types.deinit();
+        self.associated_consts.deinit();
         self.consts.deinit();
         self.reflections.deinit();
     }
@@ -132,10 +141,22 @@ pub const SemanticIndex = struct {
                                 .associated_index = associated_index,
                             });
                         }
+                        for (trait_type.associated_consts, 0..) |_, associated_index| {
+                            try index.associated_consts.append(.{
+                                .item_id = item_id,
+                                .associated_index = associated_index,
+                            });
+                        }
                     },
-                    .impl_block => {
+                    .impl_block => |impl_block| {
                         entry.impl_id = ImplId{ .index = index.impls.items.len };
                         try index.impls.append(.{ .item_id = item_id });
+                        for (impl_block.associated_consts, 0..) |_, associated_index| {
+                            try index.associated_consts.append(.{
+                                .item_id = item_id,
+                                .associated_index = associated_index,
+                            });
+                        }
                     },
                     .const_item => {
                         entry.const_id = ConstId{ .index = index.consts.items.len };
@@ -191,6 +212,10 @@ pub const SemanticIndex = struct {
 
     pub fn associatedTypeEntry(self: *const SemanticIndex, id: AssociatedTypeId) AssociatedTypeEntry {
         return self.associated_types.items[id.index];
+    }
+
+    pub fn associatedConstEntry(self: *const SemanticIndex, id: AssociatedConstId) AssociatedConstEntry {
+        return self.associated_consts.items[id.index];
     }
 
     pub fn constEntry(self: *const SemanticIndex, id: ConstId) ConstEntry {

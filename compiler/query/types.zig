@@ -20,11 +20,14 @@ pub const QueryFamily = enum {
     expressions,
     module_signature,
     const_eval,
+    associated_const_eval,
     reflection,
     runtime_reflections,
     module_reflections,
     package_reflections,
+    module_boundary_apis,
     trait_goal,
+    impl_index,
     impl_lookup,
     local_const,
     callables,
@@ -65,6 +68,17 @@ pub const ImplLookupKey = struct {
     module_id: session_ids.ModuleId,
     trait_head: CanonicalTraitHead,
     self_head: CanonicalTypeHead,
+};
+
+pub const ImplIndexEntry = struct {
+    module_id: session_ids.ModuleId,
+    trait_head: CanonicalTraitHead,
+    self_head: CanonicalTypeHead,
+    impl_id: session_ids.ImplId,
+};
+
+pub const ImplIndexResult = struct {
+    entries: []const ImplIndexEntry,
 };
 
 pub const ImplLookupResult = struct {
@@ -111,7 +125,10 @@ pub const PatternSummary = struct {
     checked_subject_pattern_count: usize = 0,
     irrefutable_subject_pattern_count: usize = 0,
     rejected_unreachable_pattern_count: usize = 0,
+    rejected_non_exhaustive_pattern_count: usize = 0,
     rejected_structural_pattern_count: usize = 0,
+    checked_constant_pattern_count: usize = 0,
+    rejected_constant_pattern_count: usize = 0,
     checked_repeat_iteration_count: usize = 0,
     rejected_repeat_iterable_count: usize = 0,
 };
@@ -123,7 +140,7 @@ pub const PatternResult = struct {
 
 pub const StatementSummary = struct {
     checked_statement_count: usize = 0,
-    replayed_diagnostic_count: usize = 0,
+    prepared_issue_count: usize = 0,
 };
 
 pub const StatementResult = struct {
@@ -133,16 +150,44 @@ pub const StatementResult = struct {
 
 pub const ExpressionSummary = struct {
     checked_expression_count: usize = 0,
-    replayed_diagnostic_count: usize = 0,
+    prepared_issue_count: usize = 0,
+    checked_conversion_count: usize = 0,
+    rejected_conversion_count: usize = 0,
 };
 
 pub const ExpressionResult = struct {
     body_id: session_ids.BodyId,
     summary: ExpressionSummary,
+    conversion_facts: []const CheckedConversionFact = &.{},
+
+    pub fn deinit(self: ExpressionResult, allocator: @import("std").mem.Allocator) void {
+        if (self.conversion_facts.len != 0) allocator.free(self.conversion_facts);
+    }
+};
+
+pub const ConversionMode = enum {
+    implicit,
+    explicit_infallible,
+    explicit_checked,
+};
+
+pub const ConversionStatus = enum {
+    accepted,
+    rejected,
+};
+
+pub const CheckedConversionFact = struct {
+    expression_id: checked_body.ExpressionId,
+    mode: ConversionMode,
+    source_type: types.TypeRef,
+    target_type: types.TypeRef,
+    result_type: types.TypeRef,
+    status: ConversionStatus,
+    diagnostic_code: ?[]const u8 = null,
 };
 
 pub const ModuleSignatureSummary = struct {
-    replayed_diagnostic_count: usize = 0,
+    prepared_issue_count: usize = 0,
 };
 
 pub const ModuleSignatureResult = struct {
@@ -176,6 +221,7 @@ pub const FunctionSignature = struct {
 pub const ConstSignature = struct {
     type_name: []const u8,
     ty: types.Builtin,
+    type_ref: types.TypeRef,
     initializer_source: []const u8,
     expr: ?*const const_ir.Expr,
     lower_error: ?anyerror = null,
@@ -207,6 +253,12 @@ pub const TraitSignature = struct {
     where_predicates: []const typed.WherePredicate,
     methods: []const typed.TraitMethod,
     associated_types: []const typed.TraitAssociatedType,
+    associated_consts: []const typed.TraitAssociatedConst,
+};
+
+pub const AssociatedConstBindingSignature = struct {
+    name: []const u8,
+    const_item: ConstSignature,
 };
 
 pub const ImplSignature = struct {
@@ -215,6 +267,7 @@ pub const ImplSignature = struct {
     target_type: []const u8,
     trait_name: ?[]const u8,
     associated_types: []const typed.TraitAssociatedTypeBinding,
+    associated_consts: []const AssociatedConstBindingSignature,
     methods: []const typed.TraitMethod,
 };
 
@@ -245,6 +298,12 @@ pub const CheckedSignature = struct {
         switch (self.facts) {
             .const_item => |const_item| {
                 if (const_item.expr) |expr| const_ir.destroyExpr(allocator, expr);
+            },
+            .impl_block => |impl_block| {
+                for (impl_block.associated_consts) |binding| {
+                    if (binding.const_item.expr) |expr| const_ir.destroyExpr(allocator, expr);
+                }
+                if (impl_block.associated_consts.len != 0) allocator.free(impl_block.associated_consts);
             },
             else => {},
         }
@@ -281,7 +340,6 @@ pub const CheckedBody = struct {
     constructor_argument_sites: []const checked_body.ConstructorArgumentSite,
     return_value_sites: []const checked_body.ReturnValueSite,
     expression_sites: []const checked_body.ExpressionSite,
-    diagnostic_sites: []const checked_body.DiagnosticSite,
 
     pub fn deinit(self: CheckedBody, allocator: @import("std").mem.Allocator) void {
         const facts = checked_body.Facts{
@@ -307,7 +365,6 @@ pub const CheckedBody = struct {
             .constructor_argument_sites = self.constructor_argument_sites,
             .return_value_sites = self.return_value_sites,
             .expression_sites = self.expression_sites,
-            .diagnostic_sites = self.diagnostic_sites,
         };
         facts.deinit(allocator);
     }
@@ -331,6 +388,20 @@ pub const ModuleReflectionResult = struct {
 pub const PackageReflectionResult = struct {
     package_id: session_ids.PackageId,
     metadata: []const reflect.ItemMetadata,
+};
+
+pub const BoundaryApiMetadata = struct {
+    item_id: session_ids.ItemId,
+    name: []const u8,
+    is_suspend: bool,
+    parameters: []const typed.Parameter,
+    return_type: types.TypeRef,
+    export_name: ?[]const u8,
+};
+
+pub const ModuleBoundaryApiResult = struct {
+    module_id: session_ids.ModuleId,
+    apis: []const BoundaryApiMetadata,
 };
 
 pub const OwnershipResult = struct {
@@ -366,5 +437,10 @@ pub const DomainStateBodyResult = struct {
 
 pub const ConstResult = struct {
     const_id: session_ids.ConstId,
+    value: const_ir.Value,
+};
+
+pub const AssociatedConstResult = struct {
+    associated_const_id: session_ids.AssociatedConstId,
     value: const_ir.Value,
 };

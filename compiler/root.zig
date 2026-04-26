@@ -20,7 +20,6 @@ pub const borrow = @import("borrow/root.zig");
 pub const lifetimes = @import("lifetimes/root.zig");
 pub const regions = @import("regions/root.zig");
 pub const reflect = @import("reflect/root.zig");
-pub const ctfe = @import("ctfe/root.zig");
 pub const mir = @import("mir/root.zig");
 pub const ir = @import("ir/root.zig");
 pub const codegen = @import("codegen/root.zig");

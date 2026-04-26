@@ -660,6 +660,13 @@ fn inferExprOrigins(
                 try origins.add(projectBoundary(base_origin, typeRefRawName(expr.ty)));
             }
         },
+        .index => |index| {
+            var base_origins = try inferExprOrigins(allocator, state, index.base);
+            defer base_origins.deinit();
+            for (base_origins.values.items) |base_origin| {
+                try origins.add(projectBoundary(base_origin, typeRefRawName(expr.ty)));
+            }
+        },
         .integer,
         .bool_lit,
         .string,
@@ -669,7 +676,9 @@ fn inferExprOrigins(
         .enum_construct,
         .call,
         .constructor,
+        .array,
         .array_repeat,
+        .conversion,
         .unary,
         .binary,
         => try origins.add(.{}),

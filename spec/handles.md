@@ -8,12 +8,14 @@ Runa supports source-declared opaque handle families as real language types.
 - Handle families are created in the language, not hidden in the runtime.
 - Handle values are created only by explicit API producers.
 - Handle values obey ordinary ownership law.
+- Handle families are not the default foreign-wrapping answer for opaque foreign types.
 - Boundary transport is defined in explicit boundary specs.
 
 ## Handle Declarations
 
 - Runa supports source-declared opaque handle families.
 - A handle family is a real source-level type declaration.
+- A handle family is one explicit use of `opaque type`, not the meaning of `opaque type` in general.
 - A handle family may appear in signatures, generic bounds, fields, results, and impls.
 - Handle families are non-constructible by ordinary expressions.
 - Handle families do not expose their representation through source.
@@ -119,10 +121,12 @@ select stream_open_read :: path :: call:
 - The exact ABI or runtime representation of a handle is not part of the source contract.
 - The source contract freezes the typed family boundary, ownership rules, validity rules, and diagnostics.
 - Runtime and backend work must not replace typed handle families with an erased generic handle carrier.
+- Layout compatibility or foreign origin does not by itself turn another opaque family into a handle family.
 
 ## Relationship To Other Specs
 
 - Opaque handle families are language-level type families.
+- General opaque-type and foreign-wrapping law is defined in `spec/types.md` and `spec/layout-and-repr.md`.
 - Collection law is separate from handle law; collection law is defined in `spec/collections.md`.
 - Ownership law is defined in `spec/ownership-model.md`.
 - Control-flow and `defer` law are defined in `spec/control-flow.md`.
@@ -141,3 +145,4 @@ The compiler or runtime must reject:
 - implicit copy or implicit duplication of move-only handle families
 - null-like sentinel-handle absence as language-level handle law
 - erased generic handle fallback in place of typed handle families
+- automatic foreign-to-handle lowering treated as core language behavior

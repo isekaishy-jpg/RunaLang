@@ -127,7 +127,7 @@ fn validateDomainDeclaration(
         try validateRootDeclaration(active, checked, struct_type.generic_params, struct_type.fields, diagnostics);
     }
     if (item.is_domain_context) {
-        try validateContextDeclaration(active, checked, struct_type.fields, diagnostics);
+        try validateContextDeclaration(active, checked, struct_type.generic_params, struct_type.fields, diagnostics);
     }
 }
 
@@ -163,6 +163,11 @@ fn validateRootDeclaration(
             try diagnostics.add(.@"error", "type.domain_root.parent_anchor_target", checked.item.span, "#domain_root '{s}' retained parent-anchor field '{s}' must target a different #domain_root type", .{ checked.item.name, field.name });
             continue;
         }
+        if (!lifetimeIsVisible(generic_params, boundary.lifetime_name)) {
+            invalid_anchor_count += 1;
+            try diagnostics.add(.@"error", "type.domain_root.parent_anchor_lifetime", checked.item.span, "#domain_root '{s}' retained parent-anchor field '{s}' must use a declared lifetime parameter", .{ checked.item.name, field.name });
+            continue;
+        }
 
         valid_anchor_count += 1;
     }
@@ -185,9 +190,19 @@ fn hasLifetimeParam(generic_params: []const typed.GenericParam) bool {
     return false;
 }
 
+fn lifetimeIsVisible(generic_params: []const typed.GenericParam, maybe_lifetime_name: ?[]const u8) bool {
+    const lifetime_name = maybe_lifetime_name orelse return false;
+    if (std.mem.eql(u8, lifetime_name, "'static")) return true;
+    for (generic_params) |param| {
+        if (param.kind == .lifetime_param and std.mem.eql(u8, param.name, lifetime_name)) return true;
+    }
+    return false;
+}
+
 fn validateContextDeclaration(
     active: *session.Session,
     checked: query_types.CheckedSignature,
+    generic_params: []const typed.GenericParam,
     fields: []const typed.StructField,
     diagnostics: *diag.Bag,
 ) !void {
@@ -211,6 +226,17 @@ fn validateContextDeclaration(
                 "type.domain_context.anchor_target",
                 checked.item.span,
                 "#domain_context '{s}' retained root-anchor field '{s}' must target a #domain_root type",
+                .{ checked.item.name, field.name },
+            );
+            continue;
+        }
+        if (!lifetimeIsVisible(generic_params, boundary.lifetime_name)) {
+            invalid_anchor_count += 1;
+            try diagnostics.add(
+                .@"error",
+                "type.domain_context.anchor_lifetime",
+                checked.item.span,
+                "#domain_context '{s}' retained root-anchor field '{s}' must use a declared lifetime parameter",
                 .{ checked.item.name, field.name },
             );
             continue;

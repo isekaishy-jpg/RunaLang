@@ -1,10 +1,10 @@
 const std = @import("std");
 const const_ir = @import("const_ir.zig");
-const const_parse = @import("const_parse.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
+const typed = @import("../typed/root.zig");
 const typed_text = @import("../typed/text.zig");
 const types = @import("../types/root.zig");
 
@@ -20,51 +20,61 @@ pub const Summary = struct {
 };
 
 pub const Resolver = *const fn (active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!const_ir.Value;
+pub const AssociatedResolver = *const fn (active: *session.Session, module_id: session.ModuleId, owner_name: []const u8, const_name: []const u8) anyerror!const_ir.Value;
 
 pub fn validateSignature(
     active: *session.Session,
     checked: query_types.CheckedSignature,
     diagnostics: *diag.Bag,
     resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
 ) !Summary {
     var summary = Summary{};
 
     switch (checked.facts) {
         .function => |function| {
             for (function.parameters) |parameter| {
-                try validateTypeName(active, checked.module_id, parameter.type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+                try validateTypeName(active, checked.module_id, parameter.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
-            try validateTypeName(active, checked.module_id, function.return_type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+            try validateTypeName(active, checked.module_id, function.return_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
-        .const_item => |const_item| try validateTypeName(active, checked.module_id, const_item.type_name, checked.item.span, diagnostics, resolve_identifier, &summary),
+        .const_item => |const_item| try validateTypeName(active, checked.module_id, const_item.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary),
         .struct_type => |struct_type| for (struct_type.fields) |field| {
-            try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+            try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .union_type => |union_type| for (union_type.fields) |field| {
-            try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+            try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .enum_type => |enum_type| {
             for (enum_type.variants) |variant| {
                 switch (variant.payload) {
                     .none => {},
                     .tuple_fields => |fields| for (fields) |field| {
-                        try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+                        try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
                     },
                     .named_fields => |fields| for (fields) |field| {
-                        try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+                        try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
                     },
                 }
             }
-            try validateEnumDiscriminants(active, checked, enum_type.variants, diagnostics, resolve_identifier, &summary);
+            try validateEnumDiscriminants(active, checked, enum_type.variants, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .impl_block => |impl_block| {
-            try validateTypeName(active, checked.module_id, impl_block.target_type, checked.item.span, diagnostics, resolve_identifier, &summary);
+            try validateTypeName(active, checked.module_id, impl_block.target_type, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             for (impl_block.associated_types) |binding| {
-                try validateTypeName(active, checked.module_id, binding.value_type_name, checked.item.span, diagnostics, resolve_identifier, &summary);
+                try validateTypeName(active, checked.module_id, binding.value_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            }
+            for (impl_block.associated_consts) |binding| {
+                try validateTypeName(active, checked.module_id, binding.const_item.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
         },
-        .opaque_type, .trait_type, .none => {},
+        .trait_type => |trait_type| for (trait_type.associated_consts) |associated_const| {
+            try validateTypeName(active, checked.module_id, associated_const.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+        },
+        .opaque_type, .none => {},
     }
+
+    try validateArrayLengthSites(active, checked, diagnostics, resolve_identifier, resolve_associated_const, &summary);
 
     return summary;
 }
@@ -80,6 +90,7 @@ fn validateEnumDiscriminants(
     variants: []const @import("../typed/root.zig").EnumVariant,
     diagnostics: *diag.Bag,
     resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
     summary: *Summary,
 ) !void {
     const repr = try reprEnumInfo(active, checked.item.attributes);
@@ -139,7 +150,12 @@ fn validateEnumDiscriminants(
         };
 
         summary.checked_enum_discriminants += 1;
-        const value = evalEnumDiscriminant(active, checked.module_id, discriminant, repr.int_type, checked.item.span, diagnostics, resolve_identifier) catch |err| {
+        const site = findConstRequiredExpr(checked.item.const_required_exprs, .enum_discriminant, variant.name, discriminant) orelse {
+            summary.rejected_enum_discriminants += 1;
+            try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, error.UnsupportedConstExpr);
+            continue;
+        };
+        const value = evalEnumDiscriminant(active, checked.module_id, site, repr.int_type, resolve_identifier, resolve_associated_const) catch |err| {
             summary.rejected_enum_discriminants += 1;
             try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, err);
             continue;
@@ -195,23 +211,29 @@ fn reprEnumInfo(active: *session.Session, attributes: []const @import("../ast/ro
 fn evalEnumDiscriminant(
     active: *session.Session,
     module_id: session.ModuleId,
-    discriminant_expr: []const u8,
+    site: typed.ConstRequiredExpr,
     result_type: types.Builtin,
-    span: source.Span,
-    diagnostics: *diag.Bag,
     resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
 ) !const_ir.Value {
-    _ = diagnostics;
-    _ = span;
-    const lowered = try const_parse.parseExpr(active.allocator, discriminant_expr, result_type);
-    defer const_ir.destroyExpr(active.allocator, lowered);
-
-    const value = try const_ir.evalExpr(EvalContext{
-        .active = active,
-        .module_id = module_id,
-        .resolve_identifier = resolve_identifier,
-    }, lowered, resolveIdentifier);
+    var value = try evalConstRequiredExpr(active, module_id, site, resolve_identifier, resolve_associated_const);
+    defer const_ir.deinitValue(active.allocator, &value);
     return coerceIntegerValue(value, result_type);
+}
+
+fn findConstRequiredExpr(
+    sites: []const typed.ConstRequiredExpr,
+    kind: typed.ConstRequiredExprKind,
+    owner_name: []const u8,
+    source_text: []const u8,
+) ?typed.ConstRequiredExpr {
+    for (sites) |site| {
+        if (site.kind != kind) continue;
+        if (!std.mem.eql(u8, site.owner_name, owner_name)) continue;
+        if (!std.mem.eql(u8, site.source, source_text)) continue;
+        return site;
+    }
+    return null;
 }
 
 fn validateTypeName(
@@ -221,6 +243,7 @@ fn validateTypeName(
     span: source.Span,
     diagnostics: *diag.Bag,
     resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
     summary: *Summary,
 ) anyerror!void {
     const trimmed = std.mem.trim(u8, raw_type_name, " \t");
@@ -229,13 +252,13 @@ fn validateTypeName(
     if (std.mem.startsWith(u8, trimmed, "hold[")) {
         const close_index = findMatchingDelimiter(trimmed, "hold[".len - 1, '[', ']') orelse return;
         const rest = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t");
-        if (std.mem.startsWith(u8, rest, "read ")) return validateTypeName(active, module_id, rest["read ".len..], span, diagnostics, resolve_identifier, summary);
-        if (std.mem.startsWith(u8, rest, "edit ")) return validateTypeName(active, module_id, rest["edit ".len..], span, diagnostics, resolve_identifier, summary);
+        if (std.mem.startsWith(u8, rest, "read ")) return validateTypeName(active, module_id, rest["read ".len..], span, diagnostics, resolve_identifier, resolve_associated_const, summary);
+        if (std.mem.startsWith(u8, rest, "edit ")) return validateTypeName(active, module_id, rest["edit ".len..], span, diagnostics, resolve_identifier, resolve_associated_const, summary);
         return;
     }
 
-    if (std.mem.startsWith(u8, trimmed, "read ")) return validateTypeName(active, module_id, trimmed["read ".len..], span, diagnostics, resolve_identifier, summary);
-    if (std.mem.startsWith(u8, trimmed, "edit ")) return validateTypeName(active, module_id, trimmed["edit ".len..], span, diagnostics, resolve_identifier, summary);
+    if (std.mem.startsWith(u8, trimmed, "read ")) return validateTypeName(active, module_id, trimmed["read ".len..], span, diagnostics, resolve_identifier, resolve_associated_const, summary);
+    if (std.mem.startsWith(u8, trimmed, "edit ")) return validateTypeName(active, module_id, trimmed["edit ".len..], span, diagnostics, resolve_identifier, resolve_associated_const, summary);
 
     if (std.mem.startsWith(u8, trimmed, "[")) {
         const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse return;
@@ -243,16 +266,8 @@ fn validateTypeName(
         const inner = trimmed[1..close_index];
         const separator = findTopLevelHeaderScalar(inner, ';') orelse return;
         const element_type = std.mem.trim(u8, inner[0..separator], " \t");
-        const length_expr = std.mem.trim(u8, inner[separator + 1 ..], " \t");
         if (element_type.len != 0) {
-            try validateTypeName(active, module_id, element_type, span, diagnostics, resolve_identifier, summary);
-        }
-        if (length_expr.len != 0) {
-            summary.checked_array_lengths += 1;
-            _ = evalArrayLength(active, module_id, length_expr, span, diagnostics, resolve_identifier) catch |err| {
-                summary.rejected_array_lengths += 1;
-                try reportArrayLengthError(diagnostics, span, length_expr, err);
-            };
+            try validateTypeName(active, module_id, element_type, span, diagnostics, resolve_identifier, resolve_associated_const, summary);
         }
         return;
     }
@@ -262,35 +277,69 @@ fn validateTypeName(
         if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t").len != 0) return;
         const args = try splitTopLevelCommaParts(active.allocator, trimmed[open_index + 1 .. close_index]);
         defer active.allocator.free(args);
-        for (args) |arg| try validateTypeName(active, module_id, arg, span, diagnostics, resolve_identifier, summary);
+        for (args) |arg| try validateTypeName(active, module_id, arg, span, diagnostics, resolve_identifier, resolve_associated_const, summary);
+    }
+}
+
+fn validateArrayLengthSites(
+    active: *session.Session,
+    checked: query_types.CheckedSignature,
+    diagnostics: *diag.Bag,
+    resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
+    summary: *Summary,
+) !void {
+    for (checked.item.const_required_exprs) |site| {
+        if (site.kind != .array_length) continue;
+        summary.checked_array_lengths += 1;
+        _ = evalArrayLength(active, checked.module_id, site, resolve_identifier, resolve_associated_const) catch |err| {
+            summary.rejected_array_lengths += 1;
+            try reportArrayLengthError(diagnostics, checked.item.span, site.source, err);
+        };
     }
 }
 
 fn evalArrayLength(
     active: *session.Session,
     module_id: session.ModuleId,
-    length_expr: []const u8,
-    span: source.Span,
-    diagnostics: *diag.Bag,
+    site: typed.ConstRequiredExpr,
     resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
 ) !usize {
-    _ = diagnostics;
-    _ = span;
-    const lowered = try const_parse.parseExpr(active.allocator, length_expr, .index);
+    var value = try evalConstRequiredExpr(active, module_id, site, resolve_identifier, resolve_associated_const);
+    defer const_ir.deinitValue(active.allocator, &value);
+    return lengthValue(value);
+}
+
+fn evalConstRequiredExpr(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    site: typed.ConstRequiredExpr,
+    resolve_identifier: Resolver,
+    resolve_associated_const: AssociatedResolver,
+) !const_ir.Value {
+    const typed_expr = site.expr orelse return site.parse_error orelse error.UnsupportedConstExpr;
+    const lowered = try const_ir.lowerExpr(active.allocator, typed_expr);
     defer const_ir.destroyExpr(active.allocator, lowered);
 
-    const value = try const_ir.evalExpr(EvalContext{
+    return const_ir.evalExpr(active.allocator, EvalContext{
         .active = active,
         .module_id = module_id,
         .resolve_identifier = resolve_identifier,
+        .resolve_associated_const = resolve_associated_const,
     }, lowered, resolveIdentifier);
-    return lengthValue(value);
 }
 
 const EvalContext = struct {
     active: *session.Session,
     module_id: session.ModuleId,
     resolve_identifier: Resolver,
+
+    resolve_associated_const: AssociatedResolver,
+
+    pub fn resolveAssociatedConst(self: EvalContext, owner_name: []const u8, const_name: []const u8) anyerror!const_ir.Value {
+        return self.resolve_associated_const(self.active, self.module_id, owner_name, const_name);
+    }
 };
 
 fn resolveIdentifier(context: EvalContext, name: []const u8) anyerror!const_ir.Value {
@@ -374,6 +423,7 @@ fn constValueEql(lhs: const_ir.Value, rhs: const_ir.Value) bool {
             .unit => true,
             else => false,
         },
+        .array, .aggregate, .enum_value => false,
         .unsupported => switch (rhs) {
             .unsupported => true,
             else => false,
@@ -423,6 +473,20 @@ fn reportArrayLengthError(diagnostics: *diag.Bag, span: source.Span, length_expr
             "type.const.cycle",
             span,
             "array length const expression '{s}' participates in cyclic const evaluation",
+            .{length_expr},
+        ),
+        error.AmbiguousAssociatedConst => try diagnostics.add(
+            .@"error",
+            "type.const.associated_ambiguous",
+            span,
+            "array length const expression '{s}' references an ambiguous associated const",
+            .{length_expr},
+        ),
+        error.InvalidConversion => try diagnostics.add(
+            .@"error",
+            "type.const.conversion",
+            span,
+            "array length const expression '{s}' uses an invalid compile-time conversion",
             .{length_expr},
         ),
         else => try diagnostics.add(
@@ -476,6 +540,20 @@ fn reportEnumDiscriminantError(
             "type.const.cycle",
             span,
             "enum variant '{s}' discriminant '{s}' participates in cyclic const evaluation",
+            .{ variant_name, discriminant_expr },
+        ),
+        error.AmbiguousAssociatedConst => try diagnostics.add(
+            .@"error",
+            "type.const.associated_ambiguous",
+            span,
+            "enum variant '{s}' discriminant '{s}' references an ambiguous associated const",
+            .{ variant_name, discriminant_expr },
+        ),
+        error.InvalidConversion => try diagnostics.add(
+            .@"error",
+            "type.const.conversion",
+            span,
+            "enum variant '{s}' discriminant '{s}' uses an invalid compile-time conversion",
             .{ variant_name, discriminant_expr },
         ),
         else => try diagnostics.add(

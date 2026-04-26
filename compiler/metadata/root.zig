@@ -93,28 +93,19 @@ pub fn collectPackagedMetadataFromSession(
         });
     }
 
-    for (active.semantic_index.items.items, 0..) |entry, item_index| {
-        if (entry.module_id.index != root_module_id.index) continue;
-        const signature = query.checkedSignature(active, .{ .index = item_index }) catch |err| switch (err) {
-            error.CachedFailure => continue,
-            else => return err,
-        };
-        if (!signature.exported or signature.boundary_kind != .api) continue;
-        const function = switch (signature.facts) {
-            .function => |function| function,
-            else => continue,
-        };
-
+    const boundary_api_metadata = try query.collectModuleBoundaryApiMetadata(allocator, active, root_module_id);
+    defer allocator.free(boundary_api_metadata);
+    for (boundary_api_metadata) |api| {
         try boundary_apis.append(.{
             .canonical_identity = try std.fmt.allocPrint(allocator, "{s}::{s}::{s}", .{
                 package_name,
                 product_name,
-                signature.item.name,
+                api.name,
             }),
-            .callable_kind = if (function.is_suspend) .@"suspend" else .ordinary,
-            .input_type = try renderPackedInputType(allocator, function.parameters),
-            .output_type = try allocator.dupe(u8, typeName(function.return_type)),
-            .export_name = if (function.export_name) |value| try allocator.dupe(u8, value) else null,
+            .callable_kind = if (api.is_suspend) .@"suspend" else .ordinary,
+            .input_type = try renderPackedInputType(allocator, api.parameters),
+            .output_type = try allocator.dupe(u8, typeName(api.return_type)),
+            .export_name = if (api.export_name) |value| try allocator.dupe(u8, value) else null,
             .referenced_capability_families = try allocator.alloc([]const u8, 0),
         });
     }

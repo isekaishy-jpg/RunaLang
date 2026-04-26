@@ -21,6 +21,7 @@ pub const BodyId = ids.BodyId;
 pub const TraitId = ids.TraitId;
 pub const ImplId = ids.ImplId;
 pub const AssociatedTypeId = ids.AssociatedTypeId;
+pub const AssociatedConstId = ids.AssociatedConstId;
 pub const ConstId = ids.ConstId;
 pub const ReflectionId = ids.ReflectionId;
 
@@ -76,6 +77,10 @@ pub const Session = struct {
         return self.semantic_index.associated_types.items.len;
     }
 
+    pub fn associatedConstCount(self: *const Session) usize {
+        return self.semantic_index.associated_consts.items.len;
+    }
+
     pub fn item(self: *const Session, id: ItemId) *const @import("../typed/root.zig").Item {
         const entry = self.semantic_index.itemEntry(id);
         return &self.pipeline.modules.items[entry.pipeline_module_index].typed.items.items[entry.item_index];
@@ -118,6 +123,19 @@ pub const Session = struct {
     pub fn popActiveQuery(self: *Session) void {
         _ = self.active_queries.pop();
     }
+
+    pub fn ensureTypedModuleFinalized(self: *Session, module_id: ModuleId) !void {
+        const module_entry = self.semantic_index.moduleEntry(module_id);
+        var module_pipeline = &self.pipeline.modules.items[module_entry.pipeline_index];
+        if (module_pipeline.typed_finalized) return;
+        try typed.finalizePreparedModule(
+            self.allocator,
+            &module_pipeline.typed,
+            &module_pipeline.prototypes,
+            &self.pipeline.diagnostics,
+        );
+        module_pipeline.typed_finalized = true;
+    }
 };
 
 pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
@@ -133,7 +151,7 @@ pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
     errdefer active.pipeline.deinit();
     errdefer active.interner.deinit();
 
-    try finalizeTypedInputs(&active);
+    try prepareSyntheticSemanticItems(&active);
 
     for (active.pipeline.modules.items) |module| {
         for (module.resolved.symbols.items) |symbol| {
@@ -151,16 +169,13 @@ pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
     return active;
 }
 
-fn finalizeTypedInputs(active: *Session) !void {
+fn prepareSyntheticSemanticItems(active: *Session) !void {
     for (active.pipeline.modules.items) |*module_pipeline| {
-        if (module_pipeline.typed_finalized) continue;
-        try typed.finalizePreparedModule(
+        try typed.prepareImportedDefaultMethods(
             active.allocator,
             &module_pipeline.typed,
             &module_pipeline.prototypes,
-            &active.pipeline.diagnostics,
         );
-        module_pipeline.typed_finalized = true;
     }
 }
 

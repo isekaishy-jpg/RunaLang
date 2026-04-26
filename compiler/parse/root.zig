@@ -202,7 +202,7 @@ test "parse file lowers structured declaration body syntax" {
 
     const file_id = try table.addVirtualFile(
         "parse-bodies.rna",
-        "struct Box[T]:\n    pub value: T\nenum Choice:\n    Some(T)\n    None:\n        code: I32\ntrait Buffer:\n    type Item\n    fn read(read self: Buffer) -> Item\nimpl[T] Buffer for Box[T]:\n    fn read(read self: Box[T]) -> T:\n        return self.value\n",
+        "struct Box[T]:\n    pub value: T\nenum Choice:\n    Some(T)\n    None:\n        code: I32\ntrait Buffer:\n    type Item\n    const LIMIT: Index\n    fn read(read self: Buffer) -> Item\nimpl[T] Buffer for Box[T]:\n    const LIMIT: Index = 4\n    fn read(read self: Box[T]) -> T:\n        return self.value\n",
     );
     const file = table.get(file_id);
 
@@ -240,8 +240,11 @@ test "parse file lowers structured declaration body syntax" {
     switch (parsed.module.itemAt(2).body_syntax) {
         .trait_body => |body| {
             try std.testing.expectEqual(@as(usize, 1), body.associated_types.len);
+            try std.testing.expectEqual(@as(usize, 1), body.associated_consts.len);
             try std.testing.expectEqual(@as(usize, 1), body.methods.len);
             try std.testing.expectEqualStrings("Item", body.associated_types[0].name.?.text);
+            try std.testing.expectEqualStrings("LIMIT", body.associated_consts[0].name.?.text);
+            try std.testing.expectEqualStrings("Index", body.associated_consts[0].ty.?.text);
             try std.testing.expectEqualStrings("read", body.methods[0].signature.name.?.text);
         },
         else => return error.UnexpectedStructure,
@@ -249,6 +252,9 @@ test "parse file lowers structured declaration body syntax" {
 
     switch (parsed.module.itemAt(3).body_syntax) {
         .impl_body => |body| {
+            try std.testing.expectEqual(@as(usize, 1), body.associated_consts.len);
+            try std.testing.expectEqualStrings("LIMIT", body.associated_consts[0].name.?.text);
+            try std.testing.expectEqualStrings("4", body.associated_consts[0].initializer.?.text);
             try std.testing.expectEqual(@as(usize, 1), body.methods.len);
             try std.testing.expectEqualStrings("read", body.methods[0].signature.name.?.text);
             try std.testing.expect(body.methods[0].block_syntax != null);

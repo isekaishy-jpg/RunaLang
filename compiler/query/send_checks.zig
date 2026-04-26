@@ -65,14 +65,18 @@ pub fn analyzeBody(
 }
 
 fn typeIsSend(active: *session.Session, body: query_types.CheckedBody, ty: types.TypeRef) bool {
+    return trait_solver.typeNameIsSendInEnvironment(
+        active,
+        body.module_id,
+        typeRefName(ty),
+        body.function.where_predicates,
+    );
+}
+
+fn typeRefName(ty: types.TypeRef) []const u8 {
     return switch (ty) {
-        .builtin => |builtin| builtin != .unsupported,
-        .named => |raw_type_name| trait_solver.typeNameIsSendInEnvironment(
-            active,
-            body.module_id,
-            raw_type_name,
-            body.function.where_predicates,
-        ),
-        .unsupported => false,
+        .builtin => |builtin| builtin.displayName(),
+        .named => |raw_type_name| raw_type_name,
+        .unsupported => "Unsupported",
     };
 }

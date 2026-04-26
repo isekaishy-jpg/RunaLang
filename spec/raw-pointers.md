@@ -15,6 +15,7 @@ Runa supports explicit raw pointers for foreign and low-level boundary work.
 - Raw pointers do not carry ownership, borrow, lifetime, or alias guarantees.
 - Raw pointers are nullable.
 - `null` is the raw-pointer null literal.
+- Raw pointers do not by themselves promise foreign-stable pointee layout or general boundary safety.
 
 ## Qualifier Law
 
@@ -101,11 +102,14 @@ This means raw `load` and `store` are not part of v1 for:
 - Raw pointers are part of the C ABI-safe type set under `spec/c-abi.md`.
 - `CVoid` is valid only through raw pointers, foreign signatures, and related ABI surfaces.
 - Raw-pointer loads and stores used for C ABI work must respect the C ABI-safe pointee set.
+- Raw pointers do not make an otherwise ordinary pointee type C-layout-compatible by default.
 
 ## Boundaries
 
 - Raw pointers are a low-level boundary family, not a replacement for ordinary references or retained borrows.
+- Raw pointers do not become general non-C boundary-safe values merely because they are low-level.
 - `Option[...]` and `Result[...]` family law is defined in `spec/result-and-option.md`.
+- Layout and repr law for pointee types is defined in `spec/layout-and-repr.md`.
 - Safe collection, text, and view APIs should continue to prefer ordinary ownership and memory-core rules.
 - Higher-level libraries may wrap raw pointers in safer abstractions later.
 
@@ -119,4 +123,5 @@ The compiler must reject:
 - raw-pointer load or store outside `#unsafe`
 - raw-pointer load or store of non-raw-memory-safe pointee types
 - treating raw pointers as ordinary borrows or retained borrows
+- treating raw pointers as an implied foreign-layout or general boundary-safety promise
 - using `null` as a non-pointer literal

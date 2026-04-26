@@ -71,7 +71,11 @@ Relationships:
 
 ## Conversion Law
 
-- No implicit numeric widening exists between distinct scalar types.
+- Implicit scalar widening exists only within one exact scalar ladder when the destination is strictly wider and preserves every value:
+  - `I8 -> I16 -> I32 -> I64 -> I128`
+  - `U8 -> U16 -> U32 -> U64 -> U128`
+  - `F32 -> F64`
+- No implicit widening exists to or from `ISize` or `USize`.
 - No implicit numeric narrowing exists between distinct scalar types.
 - No implicit conversion exists between signed and unsigned integer families.
 - No implicit conversion exists between integer and floating-point families.
@@ -80,13 +84,16 @@ Relationships:
 - No implicit conversion exists between `Char` and text families.
 - No implicit conversion exists between text or byte payload families and numeric families.
 - Explicit conversion is required whenever the source and destination types differ.
+- Ordinary checked conversion forms may return `Result[T, ConvertError]` where the conversion contract defines one.
 
 ## Operator Domains
 
 - Arithmetic operators apply to numeric scalar families.
 - Bitwise and shift operators apply to integer scalar families.
 - Comparison operators require semantically compatible operands.
-- Mixed-width or mixed-family numeric operations require explicit conversion.
+- Same-ladder mixed-width numeric operations may use the ordinary implicit widening law above.
+- Mixed-family numeric operations require explicit conversion.
+- Mixed-width numeric operations outside the ordinary implicit widening law require explicit conversion.
 - Exact operator tables belong to `spec/expressions-and-operators.md`; this spec fixes the scalar domains those operators may target.
 
 ## Native And Host Boundaries
@@ -99,6 +106,7 @@ Relationships:
 ## Boundaries
 
 - This spec defines scalar and adjacent payload families, not every library conversion API.
+- General conversion forms are defined in `spec/conversions.md`.
 - Higher-level numeric helpers belong to library surface unless later promoted explicitly.
 - Collection access, iteration, and ranges use the structural domains defined here rather than a vague signed-integer default.
 - `Char` family law is defined in `spec/char-family.md`.
@@ -108,7 +116,7 @@ Relationships:
 The compiler must reject:
 
 - out-of-range literals for the target scalar family
-- implicit mixed-width arithmetic
+- implicit mixed-width arithmetic outside the ordinary widening law
 - implicit mixed-family arithmetic
 - implicit `Bool` to numeric conversion
 - implicit numeric to `Bool` conversion

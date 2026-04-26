@@ -1,4 +1,4 @@
 # Driver Notes
 - `prepareFiles` and `prepareGraph` stop before semantic passes.
-- `checkFiles` and `checkGraph` keep the legacy eager path.
-- New semantic cutovers should prefer `session/query` above prepare.
+- Semantic checking is owned by `semantic/session/query`.
+- Do not reintroduce driver-owned semantic truth.

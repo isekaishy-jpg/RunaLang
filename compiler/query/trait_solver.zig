@@ -17,6 +17,12 @@ const parseCallableTypeName = callable_types.parseCallableTypeName;
 
 pub const SignatureResolver = *const fn (active: *session.Session, item_id: session.ItemId) anyerror!query_types.CheckedSignature;
 
+fn markCycleFailure(entry: anytype) void {
+    entry.value = null;
+    entry.failed = true;
+    entry.state = .complete;
+}
+
 fn satisfiesTrait(
     active: *session.Session,
     module_id: session.ModuleId,
@@ -66,6 +72,7 @@ pub fn satisfiesTraitKeyWithResolver(
     var entry = &active.caches.trait_goals.items[goal_index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
     if (entry.state == .in_progress) {
+        markCycleFailure(entry);
         try reportTraitCycle(active, key);
         return error.QueryCycle;
     }
@@ -204,6 +211,17 @@ pub fn validateImplContractsWithResolver(
                 );
             }
         }
+        for (impl_signature.associated_consts) |binding| {
+            if (!traitHasAssociatedConst(trait_signature, binding.name)) {
+                try diagnostics.add(
+                    .@"error",
+                    "type.impl.associated_const_unknown",
+                    checked.item.span,
+                    "trait '{s}' has no associated const '{s}'",
+                    .{ baseTypeName(trait_name), binding.name },
+                );
+            }
+        }
         for (trait_signature.associated_types) |required| {
             if (!implBindsAssociatedType(impl_signature.associated_types, required.name)) {
                 try diagnostics.add(
@@ -211,6 +229,17 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_missing",
                     checked.item.span,
                     "trait impl for '{s}' is missing associated type '{s}'",
+                    .{ impl_signature.target_type, required.name },
+                );
+            }
+        }
+        for (trait_signature.associated_consts) |required| {
+            if (!implBindsAssociatedConst(impl_signature.associated_consts, required.name)) {
+                try diagnostics.add(
+                    .@"error",
+                    "type.impl.associated_const_missing",
+                    checked.item.span,
+                    "trait impl for '{s}' is missing associated const '{s}'",
                     .{ impl_signature.target_type, required.name },
                 );
             }
@@ -282,6 +311,59 @@ fn findSelectedImplSignature(
     return null;
 }
 
+fn implIndex(
+    active: *session.Session,
+    signature_resolver: SignatureResolver,
+) !query_types.ImplIndexResult {
+    var entry = &active.caches.impl_index;
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.impl_index, 0)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    var entries = std.array_list.Managed(query_types.ImplIndexEntry).init(active.allocator);
+    defer entries.deinit();
+
+    for (active.semantic_index.impls.items, 0..) |impl_entry, index| {
+        const checked = signature_resolver(active, impl_entry.item_id) catch |err| switch (err) {
+            error.CachedFailure, error.QueryCycle => continue,
+            else => return err,
+        };
+        const impl_signature = switch (checked.facts) {
+            .impl_block => |impl_signature| impl_signature,
+            else => continue,
+        };
+        const impl_trait_name = impl_signature.trait_name orelse continue;
+        try entries.append(.{
+            .module_id = checked.module_id,
+            .trait_head = try canonicalTraitHead(active, checked.module_id, impl_trait_name),
+            .self_head = try canonicalTypeHead(active, checked.module_id, impl_signature.target_type, impl_signature.where_predicates),
+            .impl_id = .{ .index = index },
+        });
+    }
+
+    const value = query_types.ImplIndexResult{
+        .entries = try entries.toOwnedSlice(),
+    };
+    entry = &active.caches.impl_index;
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
 fn implCandidates(
     active: *session.Session,
     goal_key: query_types.TraitGoalKey,
@@ -295,7 +377,10 @@ fn implCandidates(
     const lookup_index = try findOrCreateImplLookup(active, key);
     var entry = &active.caches.impl_lookups.items[lookup_index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?.impl_ids;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.impl_lookup, lookup_index)) {
@@ -312,7 +397,12 @@ fn implCandidates(
     var candidates = std.array_list.Managed(session.ImplId).init(active.allocator);
     defer candidates.deinit();
 
-    for (active.semantic_index.impls.items, 0..) |impl_entry, impl_index| {
+    const indexed = try implIndex(active, signature_resolver);
+    for (indexed.entries) |candidate| {
+        if (!traitHeadsEqual(candidate.trait_head, key.trait_head)) continue;
+        if (!implIndexSelfHeadCouldMatch(candidate.self_head, key.self_head)) continue;
+
+        const impl_entry = active.semantic_index.implEntry(candidate.impl_id);
         const checked = signature_resolver(active, impl_entry.item_id) catch |err| switch (err) {
             error.CachedFailure, error.QueryCycle => continue,
             else => return err,
@@ -321,10 +411,8 @@ fn implCandidates(
             .impl_block => |impl_signature| impl_signature,
             else => continue,
         };
-        const impl_trait_name = impl_signature.trait_name orelse continue;
-        if (!traitHeadsEqual(try canonicalTraitHead(active, checked.module_id, impl_trait_name), key.trait_head)) continue;
         if (!try implTargetMatchesGoal(active, checked.module_id, impl_signature, goal_key)) continue;
-        try candidates.append(.{ .index = impl_index });
+        try candidates.append(candidate.impl_id);
     }
 
     const value = query_types.ImplLookupResult{
@@ -356,6 +444,20 @@ fn findSelectedImplSignatureAt(
     if (!try implTargetMatchesGoal(active, checked.module_id, impl_signature, key)) return null;
     if (!implWherePredicatesSatisfied(active, checked.module_id, impl_signature, key, signature_resolver)) return null;
     return impl_signature;
+}
+
+fn implIndexSelfHeadCouldMatch(
+    candidate: query_types.CanonicalTypeHead,
+    goal: query_types.CanonicalTypeHead,
+) bool {
+    if (typeHeadsEqual(candidate, goal)) return true;
+    return switch (candidate) {
+        .generic_param, .opaque_name => true,
+        .builtin, .item => switch (goal) {
+            .opaque_name => true,
+            .builtin, .item, .generic_param => false,
+        },
+    };
 }
 
 fn implTargetMatchesGoal(
@@ -929,7 +1031,21 @@ fn traitHasAssociatedType(signature: query_types.TraitSignature, name: []const u
     return false;
 }
 
+fn traitHasAssociatedConst(signature: query_types.TraitSignature, name: []const u8) bool {
+    for (signature.associated_consts) |associated_const| {
+        if (std.mem.eql(u8, associated_const.name, name)) return true;
+    }
+    return false;
+}
+
 fn implBindsAssociatedType(bindings: []const typed.TraitAssociatedTypeBinding, name: []const u8) bool {
+    for (bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return true;
+    }
+    return false;
+}
+
+fn implBindsAssociatedConst(bindings: []const query_types.AssociatedConstBindingSignature, name: []const u8) bool {
     for (bindings) |binding| {
         if (std.mem.eql(u8, binding.name, name)) return true;
     }

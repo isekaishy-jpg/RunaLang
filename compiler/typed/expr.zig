@@ -29,6 +29,11 @@ pub const UnaryOp = enum {
     bit_not,
 };
 
+pub const ConversionMode = enum {
+    explicit_infallible,
+    explicit_checked,
+};
+
 pub const Expr = struct {
     ty: types.TypeRef,
     owned_type_name: ?[]u8 = null,
@@ -47,7 +52,10 @@ pub const Expr = struct {
         constructor: Constructor,
         method_target: MethodTarget,
         field: Field,
+        array: Array,
         array_repeat: ArrayRepeat,
+        index: Index,
+        conversion: Conversion,
         unary: Unary,
         binary: Binary,
     };
@@ -87,9 +95,25 @@ pub const Expr = struct {
         field_name: []const u8,
     };
 
+    pub const Array = struct {
+        items: []*Expr,
+    };
+
     pub const ArrayRepeat = struct {
         value: *Expr,
         length: *Expr,
+    };
+
+    pub const Index = struct {
+        base: *Expr,
+        index: *Expr,
+    };
+
+    pub const Conversion = struct {
+        operand: *Expr,
+        mode: ConversionMode,
+        target_type: types.TypeRef,
+        target_type_name: []const u8,
     };
 
     pub const Binary = struct {
@@ -135,11 +159,28 @@ pub const Expr = struct {
                 field.base.deinit(allocator);
                 allocator.destroy(field.base);
             },
+            .array => |array| {
+                for (array.items) |item| {
+                    item.deinit(allocator);
+                    allocator.destroy(item);
+                }
+                allocator.free(array.items);
+            },
             .array_repeat => |array_repeat| {
                 array_repeat.value.deinit(allocator);
                 allocator.destroy(array_repeat.value);
                 array_repeat.length.deinit(allocator);
                 allocator.destroy(array_repeat.length);
+            },
+            .index => |index| {
+                index.base.deinit(allocator);
+                allocator.destroy(index.base);
+                index.index.deinit(allocator);
+                allocator.destroy(index.index);
+            },
+            .conversion => |conversion| {
+                conversion.operand.deinit(allocator);
+                allocator.destroy(conversion.operand);
             },
             .unary => |unary| {
                 unary.operand.deinit(allocator);
@@ -222,9 +263,27 @@ pub fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
             .base = try cloneExpr(allocator, field.base),
             .field_name = field.field_name,
         } },
+        .array => |array| blk: {
+            const items = try allocator.alloc(*Expr, array.items.len);
+            errdefer allocator.free(items);
+            for (array.items, 0..) |item, item_index| {
+                items[item_index] = try cloneExpr(allocator, item);
+            }
+            break :blk .{ .array = .{ .items = items } };
+        },
         .array_repeat => |array_repeat| .{ .array_repeat = .{
             .value = try cloneExpr(allocator, array_repeat.value),
             .length = try cloneExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneExpr(allocator, index.base),
+            .index = try cloneExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = conversion.target_type,
+            .target_type_name = conversion.target_type_name,
         } },
         .binary => |binary| .{ .binary = .{
             .op = binary.op,

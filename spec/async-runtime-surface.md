@@ -6,6 +6,7 @@ Runa standardizes a small first-wave std/runtime surface for suspend entry, task
 
 - Async runtime helpers are std/runtime surface, not new language keywords.
 - The async runtime surface realizes the semantics from `spec/async-and-concurrency.md`.
+- This public std/runtime surface may use compiler-private runtime leaf hooks underneath, but it does not expand compiler-runtime ownership.
 - `Task[T]` is the standard runtime task-handle family.
 - `Send` is the standard first-wave concurrency marker trait.
 - Detailed `Send` satisfaction law is defined in `spec/send.md`.
@@ -259,6 +260,7 @@ Law:
 - Ownership law is defined in `spec/ownership-model.md`.
 - Task movement and copyability constraints are defined in `spec/value-semantics.md`.
 - `defer` and task teardown cleanup are defined in `spec/defer.md`.
+- Compiler-private runtime leaf ownership is defined in `spec/runtime-leaf-and-observability.md`.
 
 ## Diagnostics
 
@@ -271,3 +273,4 @@ The compiler or runtime must reject:
 - detached spawn with callable or input state that is not `'static`
 - hidden detached creation outside the explicit detached runtime helpers
 - treating `Task[T]` as implicitly copyable or boundary-transfer-safe
+- treating this public async surface as if it were the compiler-private runtime leaf

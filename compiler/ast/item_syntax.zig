@@ -207,17 +207,20 @@ pub const MethodDecl = struct {
 pub const TraitBody = struct {
     methods: []MethodDecl = &.{},
     associated_types: []AssociatedTypeDecl = &.{},
+    associated_consts: []ConstSignature = &.{},
 
     pub fn clone(self: TraitBody, allocator: Allocator) !TraitBody {
         return .{
             .methods = try cloneComplexSlice(allocator, MethodDecl, self.methods),
             .associated_types = try cloneSlice(allocator, AssociatedTypeDecl, self.associated_types),
+            .associated_consts = try cloneComplexSlice(allocator, ConstSignature, self.associated_consts),
         };
     }
 
     pub fn deinit(self: *TraitBody, allocator: Allocator) void {
         freeComplexSlice(allocator, MethodDecl, self.methods);
         freeSlice(allocator, self.associated_types);
+        freeComplexSlice(allocator, ConstSignature, self.associated_consts);
         self.* = .{};
     }
 };
@@ -225,17 +228,20 @@ pub const TraitBody = struct {
 pub const ImplBody = struct {
     methods: []MethodDecl = &.{},
     associated_types: []AssociatedTypeDecl = &.{},
+    associated_consts: []ConstSignature = &.{},
 
     pub fn clone(self: ImplBody, allocator: Allocator) !ImplBody {
         return .{
             .methods = try cloneComplexSlice(allocator, MethodDecl, self.methods),
             .associated_types = try cloneSlice(allocator, AssociatedTypeDecl, self.associated_types),
+            .associated_consts = try cloneComplexSlice(allocator, ConstSignature, self.associated_consts),
         };
     }
 
     pub fn deinit(self: *ImplBody, allocator: Allocator) void {
         freeComplexSlice(allocator, MethodDecl, self.methods);
         freeSlice(allocator, self.associated_types);
+        freeComplexSlice(allocator, ConstSignature, self.associated_consts);
         self.* = .{};
     }
 };

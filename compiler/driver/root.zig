@@ -303,7 +303,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
                         function_parameter_modes.?[parameter_index] = parameter.mode;
                     }
                 },
-                .const_item => |const_item| const_type = types.TypeRef.fromBuiltin(const_item.ty),
+                .const_item => |const_item| const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, const_item.type_name),
                 .struct_type => |struct_type| struct_fields = try resolveStructFieldsForImport(allocator, &module_pipeline.typed, struct_type.fields),
                 .enum_type => |enum_type| enum_variants = try resolveEnumVariantsForImport(allocator, &module_pipeline.typed, enum_type.variants),
                 .opaque_type => {},
@@ -567,7 +567,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         function_parameter_modes.?[parameter_index] = parameter.mode;
                     }
                 },
-                .const_item => |const_item| const_type = types.TypeRef.fromBuiltin(const_item.ty),
+                .const_item => |const_item| const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, const_item.type_name),
                 .struct_type => |struct_type| struct_fields = try resolveStructFieldsForImport(allocator, &module_pipeline.typed, struct_type.fields),
                 .enum_type => |enum_type| enum_variants = try resolveEnumVariantsForImport(allocator, &module_pipeline.typed, enum_type.variants),
                 .opaque_type => {},

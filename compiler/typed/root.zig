@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const cloneExprForTyped = typed_expr.cloneExpr;
 const baseTypeName = typed_text.baseTypeName;
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;
+const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const findTopLevelScalar = typed_text.findTopLevelScalar;
 const genericParamExists = signatures.genericParamExists;
 const hasAttribute = typed_attributes.hasAttribute;
@@ -114,6 +115,7 @@ pub const MethodReceiverMode = declaration_parse.MethodReceiverMode;
 
 pub const BinaryOp = typed_expr.BinaryOp;
 pub const UnaryOp = typed_expr.UnaryOp;
+pub const ConversionMode = typed_expr.ConversionMode;
 pub const Expr = typed_expr.Expr;
 pub const Statement = typed_statement.Statement;
 pub const Block = typed_statement.Block;
@@ -130,8 +132,12 @@ pub const OpaqueTypeData = typed_decls.OpaqueTypeData;
 pub const TraitMethod = typed_decls.TraitMethod;
 pub const TraitAssociatedType = typed_decls.TraitAssociatedType;
 pub const TraitAssociatedTypeBinding = typed_decls.TraitAssociatedTypeBinding;
+pub const TraitAssociatedConst = typed_decls.TraitAssociatedConst;
+pub const TraitAssociatedConstBinding = typed_decls.TraitAssociatedConstBinding;
 pub const TraitData = typed_decls.TraitData;
 pub const ImplData = typed_decls.ImplData;
+pub const ConstRequiredExpr = typed_decls.ConstRequiredExpr;
+pub const ConstRequiredExprKind = typed_decls.ConstRequiredExprKind;
 
 pub const Payload = union(enum) {
     none,
@@ -175,16 +181,19 @@ pub const Item = struct {
     is_unsafe: bool,
     is_domain_root: bool,
     is_domain_context: bool,
-    signature_diagnostics: []diag.Diagnostic = &.{},
-    body_diagnostics: []diag.Diagnostic = &.{},
+    const_required_exprs: []ConstRequiredExpr = &.{},
+    prepared_signature_issues: []diag.Diagnostic = &.{},
+    prepared_body_issues: []diag.Diagnostic = &.{},
     payload: Payload = .none,
 
     fn deinit(self: *Item, allocator: Allocator) void {
         if (self.owns_name) allocator.free(self.name);
         allocator.free(self.attributes);
         allocator.free(self.symbol_name);
-        deinitDiagnosticSlice(allocator, self.signature_diagnostics);
-        deinitDiagnosticSlice(allocator, self.body_diagnostics);
+        for (self.const_required_exprs) |*expr| expr.deinit(allocator);
+        if (self.const_required_exprs.len != 0) allocator.free(self.const_required_exprs);
+        deinitDiagnosticSlice(allocator, self.prepared_signature_issues);
+        deinitDiagnosticSlice(allocator, self.prepared_body_issues);
         self.payload.deinit(allocator);
     }
 };
@@ -196,7 +205,7 @@ pub const Module = struct {
     items: array_list.Managed(Item),
     imports: array_list.Managed(ImportedBinding),
     methods: array_list.Managed(MethodPrototype),
-    signature_diagnostics: []diag.Diagnostic = &.{},
+    prepared_signature_issues: []diag.Diagnostic = &.{},
 
     pub fn init(allocator: Allocator, file_id: source.FileId, module_path: []const u8, symbol_prefix: []const u8) Module {
         return .{
@@ -216,7 +225,7 @@ pub const Module = struct {
         self.imports.deinit();
         for (self.methods.items) |method| method.deinit(allocator);
         self.methods.deinit();
-        deinitDiagnosticSlice(allocator, self.signature_diagnostics);
+        deinitDiagnosticSlice(allocator, self.prepared_signature_issues);
         allocator.free(self.module_path);
         allocator.free(self.symbol_prefix);
     }
@@ -343,21 +352,21 @@ pub fn prepareModule(
     errdefer typed_module.deinit(allocator);
 
     for (module.items.items) |item| {
-        var semantic_diagnostics = diag.Bag.init(allocator);
+        var prepared_issues = diag.Bag.init(allocator);
         var diagnostics_drained = false;
-        errdefer if (!diagnostics_drained) semantic_diagnostics.deinit();
+        errdefer if (!diagnostics_drained) prepared_issues.deinit();
 
-        var typed_item = try createTypedItem(allocator, item, module_path, symbol_prefix, &semantic_diagnostics, prototypes);
-        typed_item.signature_diagnostics = try drainDiagnostics(&semantic_diagnostics);
+        var typed_item = try createTypedItem(allocator, item, module_path, symbol_prefix, &prepared_issues, prototypes);
+        typed_item.prepared_signature_issues = try drainDiagnostics(&prepared_issues);
         diagnostics_drained = true;
         try typed_module.items.append(typed_item);
     }
 
     for (module.items.items, 0..) |item, item_index| {
         if (item.kind != .impl_block) continue;
-        var semantic_diagnostics = diag.Bag.init(allocator);
+        var prepared_issues = diag.Bag.init(allocator);
         var diagnostics_drained = false;
-        errdefer if (!diagnostics_drained) semantic_diagnostics.deinit();
+        errdefer if (!diagnostics_drained) prepared_issues.deinit();
 
         try impl_methods.appendImplMethodItems(
             allocator,
@@ -366,16 +375,31 @@ pub fn prepareModule(
             item_index,
             symbol_prefix,
             module_path,
-            &semantic_diagnostics,
+            &prepared_issues,
             prototypes,
         );
-        const drained = try drainDiagnostics(&semantic_diagnostics);
+        const drained = try drainDiagnostics(&prepared_issues);
         diagnostics_drained = true;
-        try appendDiagnostics(allocator, &typed_module.items.items[item_index].signature_diagnostics, drained);
+        try appendDiagnostics(allocator, &typed_module.items.items[item_index].prepared_signature_issues, drained);
     }
 
     _ = diagnostics;
     return typed_module;
+}
+
+pub fn prepareImportedDefaultMethods(
+    allocator: Allocator,
+    typed_module: *Module,
+    prototypes: *array_list.Managed(FunctionPrototype),
+) !void {
+    var prepared_issues = diag.Bag.init(allocator);
+    var diagnostics_drained = false;
+    errdefer if (!diagnostics_drained) prepared_issues.deinit();
+
+    try impl_methods.synthesizeImportedTraitDefaultMethods(allocator, typed_module, &prepared_issues, prototypes);
+    const drained = try drainDiagnostics(&prepared_issues);
+    diagnostics_drained = true;
+    try appendDiagnostics(allocator, &typed_module.prepared_signature_issues, drained);
 }
 
 pub fn finalizePreparedModule(
@@ -396,7 +420,7 @@ pub fn finalizePreparedModule(
     for (typed_module.items.items) |item| {
         switch (item.payload) {
             .const_item => |const_item| {
-                if (item.name.len != 0) try global_scope.put(item.name, types.TypeRef.fromBuiltin(const_item.ty), false);
+                if (item.name.len != 0) try global_scope.putConst(item.name, const_item.type_ref);
             },
             else => {},
         }
@@ -426,40 +450,32 @@ pub fn finalizePreparedModule(
         }
     }
 
-    var imported_default_diagnostics = diag.Bag.init(allocator);
-    var imported_default_diagnostics_drained = false;
-    errdefer if (!imported_default_diagnostics_drained) imported_default_diagnostics.deinit();
-    try impl_methods.synthesizeImportedTraitDefaultMethods(allocator, typed_module, &imported_default_diagnostics, prototypes);
-    const imported_default_drained = try drainDiagnostics(&imported_default_diagnostics);
-    imported_default_diagnostics_drained = true;
-    try appendDiagnostics(allocator, &typed_module.signature_diagnostics, imported_default_drained);
-
     for (typed_module.items.items) |*item| {
         switch (item.payload) {
             .function => |*function| {
-                var semantic_diagnostics = diag.Bag.init(allocator);
+                var prepared_issues = diag.Bag.init(allocator);
                 var diagnostics_drained = false;
-                errdefer if (!diagnostics_drained) semantic_diagnostics.deinit();
-                try resolveFunctionSignature(typed_module, item, function, &type_scope, prototypes.items, typed_module.methods.items, &semantic_diagnostics);
-                const drained = try drainDiagnostics(&semantic_diagnostics);
+                errdefer if (!diagnostics_drained) prepared_issues.deinit();
+                try resolveFunctionSignature(typed_module, item, function, &type_scope, prototypes.items, typed_module.methods.items, &prepared_issues);
+                const drained = try drainDiagnostics(&prepared_issues);
                 diagnostics_drained = true;
-                try appendDiagnostics(allocator, &item.signature_diagnostics, drained);
+                try appendDiagnostics(allocator, &item.prepared_signature_issues, drained);
             },
             else => {},
         }
     }
 
     for (typed_module.items.items) |*item| {
-        var semantic_diagnostics = diag.Bag.init(allocator);
+        var prepared_issues = diag.Bag.init(allocator);
         var diagnostics_drained = false;
-        errdefer if (!diagnostics_drained) semantic_diagnostics.deinit();
+        errdefer if (!diagnostics_drained) prepared_issues.deinit();
 
         switch (item.payload) {
             .struct_type => |*struct_type| {
                 try declaration_parse.resolveStructFieldsWithContext(struct_type.fields, .{
                     .type_scope = &type_scope,
                     .generic_params = struct_type.generic_params,
-                }, item.span, &semantic_diagnostics);
+                }, item.span, &prepared_issues);
                 try struct_prototypes.append(.{
                     .name = item.name,
                     .symbol_name = item.symbol_name,
@@ -468,12 +484,12 @@ pub fn finalizePreparedModule(
             },
             .union_type => |*union_type| try declaration_parse.resolveStructFieldsWithContext(union_type.fields, .{
                 .type_scope = &type_scope,
-            }, item.span, &semantic_diagnostics),
+            }, item.span, &prepared_issues),
             .enum_type => |*enum_type| {
                 try declaration_parse.resolveEnumVariantsWithContext(enum_type.variants, .{
                     .type_scope = &type_scope,
                     .generic_params = enum_type.generic_params,
-                }, item.span, &semantic_diagnostics);
+                }, item.span, &prepared_issues);
                 try enum_prototypes.append(.{
                     .name = item.name,
                     .symbol_name = item.symbol_name,
@@ -483,21 +499,42 @@ pub fn finalizePreparedModule(
             else => {},
         }
 
-        const drained = try drainDiagnostics(&semantic_diagnostics);
+        const drained = try drainDiagnostics(&prepared_issues);
         diagnostics_drained = true;
-        try appendDiagnostics(allocator, &item.signature_diagnostics, drained);
+        try appendDiagnostics(allocator, &item.prepared_signature_issues, drained);
     }
 
     for (typed_module.items.items) |*item| {
-        var semantic_diagnostics = diag.Bag.init(allocator);
+        var prepared_issues = diag.Bag.init(allocator);
         var diagnostics_drained = false;
-        errdefer if (!diagnostics_drained) semantic_diagnostics.deinit();
-        try finalizeItem(allocator, typed_module, item, prototypes.items, typed_module.methods.items, &global_scope, &type_scope, struct_prototypes.items, enum_prototypes.items, &semantic_diagnostics);
-        const drained = try drainDiagnostics(&semantic_diagnostics);
+        errdefer if (!diagnostics_drained) prepared_issues.deinit();
+
+        try collectConstRequiredExprsForItem(
+            allocator,
+            item,
+            &global_scope,
+            prototypes.items,
+            typed_module.methods.items,
+            struct_prototypes.items,
+            enum_prototypes.items,
+            &prepared_issues,
+        );
+
+        const drained = try drainDiagnostics(&prepared_issues);
+        diagnostics_drained = true;
+        try appendDiagnostics(allocator, &item.prepared_signature_issues, drained);
+    }
+
+    for (typed_module.items.items) |*item| {
+        var prepared_issues = diag.Bag.init(allocator);
+        var diagnostics_drained = false;
+        errdefer if (!diagnostics_drained) prepared_issues.deinit();
+        try finalizeItem(allocator, typed_module, item, prototypes.items, typed_module.methods.items, &global_scope, &type_scope, struct_prototypes.items, enum_prototypes.items, &prepared_issues);
+        const drained = try drainDiagnostics(&prepared_issues);
         diagnostics_drained = true;
         switch (item.payload) {
-            .function => try appendDiagnostics(allocator, &item.body_diagnostics, drained),
-            else => try appendDiagnostics(allocator, &item.signature_diagnostics, drained),
+            .function => try appendDiagnostics(allocator, &item.prepared_body_issues, drained),
+            else => try appendDiagnostics(allocator, &item.prepared_signature_issues, drained),
         }
     }
 
@@ -572,12 +609,212 @@ fn resolveFunctionSignature(
     }
 }
 
+fn collectConstRequiredExprsForItem(
+    allocator: Allocator,
+    item: *Item,
+    global_scope: *const Scope,
+    prototypes: []const FunctionPrototype,
+    method_prototypes: []const MethodPrototype,
+    struct_prototypes: []const StructPrototype,
+    enum_prototypes: []const EnumPrototype,
+    diagnostics: *diag.Bag,
+) !void {
+    for (item.const_required_exprs) |*expr| expr.deinit(allocator);
+    if (item.const_required_exprs.len != 0) allocator.free(item.const_required_exprs);
+    item.const_required_exprs = &.{};
+
+    var sites = array_list.Managed(ConstRequiredExpr).init(allocator);
+    errdefer {
+        for (sites.items) |*expr| expr.deinit(allocator);
+        sites.deinit();
+    }
+
+    switch (item.payload) {
+        .function => |function| {
+            for (function.parameters.items) |parameter| {
+                try collectTypeConstRequiredExprs(allocator, &sites, parameter.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+            }
+            try collectTypeConstRequiredExprs(allocator, &sites, function.return_type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+        },
+        .const_item => |const_item| try collectTypeConstRequiredExprs(allocator, &sites, const_item.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics),
+        .struct_type => |struct_type| for (struct_type.fields) |field| {
+            try collectTypeConstRequiredExprs(allocator, &sites, field.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+        },
+        .union_type => |union_type| for (union_type.fields) |field| {
+            try collectTypeConstRequiredExprs(allocator, &sites, field.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+        },
+        .enum_type => |enum_type| {
+            for (enum_type.variants) |variant| {
+                switch (variant.payload) {
+                    .none => {},
+                    .tuple_fields => |fields| for (fields) |field| {
+                        try collectTypeConstRequiredExprs(allocator, &sites, field.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+                    },
+                    .named_fields => |fields| for (fields) |field| {
+                        try collectTypeConstRequiredExprs(allocator, &sites, field.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+                    },
+                }
+            }
+
+            const discriminant_type = enumDiscriminantExpectedType(item.attributes);
+            for (enum_type.variants) |variant| {
+                const discriminant = variant.discriminant orelse continue;
+                if (std.mem.trim(u8, discriminant, " \t").len == 0) continue;
+                try appendConstRequiredExpr(allocator, &sites, .enum_discriminant, discriminant, variant.name, discriminant_type, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+            }
+        },
+        .impl_block => |impl_block| {
+            try collectTypeConstRequiredExprs(allocator, &sites, impl_block.target_type, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+            for (impl_block.associated_types) |binding| {
+                try collectTypeConstRequiredExprs(allocator, &sites, binding.value_type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+            }
+            for (impl_block.associated_consts) |binding| {
+                try collectTypeConstRequiredExprs(allocator, &sites, binding.const_data.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+            }
+        },
+        .trait_type => |trait_type| {
+            for (trait_type.associated_consts) |associated_const| {
+                try collectTypeConstRequiredExprs(allocator, &sites, associated_const.type_name, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+            }
+            for (trait_type.methods) |method| {
+                const syntax = method.syntax orelse continue;
+                for (syntax.signature.parameters) |parameter| {
+                    if (parameter.ty) |ty| {
+                        try collectTypeConstRequiredExprs(allocator, &sites, ty.text, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+                    }
+                }
+                if (syntax.signature.return_type) |return_type| {
+                    try collectTypeConstRequiredExprs(allocator, &sites, return_type.text, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, item.span, diagnostics);
+                }
+            }
+        },
+        .opaque_type, .none => {},
+    }
+
+    item.const_required_exprs = try sites.toOwnedSlice();
+}
+
+fn collectTypeConstRequiredExprs(
+    allocator: Allocator,
+    sites: *array_list.Managed(ConstRequiredExpr),
+    raw_type_name: []const u8,
+    global_scope: *const Scope,
+    prototypes: []const FunctionPrototype,
+    method_prototypes: []const MethodPrototype,
+    struct_prototypes: []const StructPrototype,
+    enum_prototypes: []const EnumPrototype,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) anyerror!void {
+    const trimmed = std.mem.trim(u8, raw_type_name, " \t");
+    if (trimmed.len == 0) return;
+
+    if (std.mem.startsWith(u8, trimmed, "hold[")) {
+        const close_index = findMatchingDelimiter(trimmed, "hold[".len - 1, '[', ']') orelse return;
+        const rest = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t");
+        if (std.mem.startsWith(u8, rest, "read ")) return collectTypeConstRequiredExprs(allocator, sites, rest["read ".len..], global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+        if (std.mem.startsWith(u8, rest, "edit ")) return collectTypeConstRequiredExprs(allocator, sites, rest["edit ".len..], global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+        return;
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "read ")) return collectTypeConstRequiredExprs(allocator, sites, trimmed["read ".len..], global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+    if (std.mem.startsWith(u8, trimmed, "edit ")) return collectTypeConstRequiredExprs(allocator, sites, trimmed["edit ".len..], global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+
+    if (std.mem.startsWith(u8, trimmed, "[")) {
+        const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse return;
+        if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t").len != 0) return;
+        const inner = trimmed[1..close_index];
+        const separator = findTopLevelHeaderScalar(inner, ';') orelse return;
+        const element_type = std.mem.trim(u8, inner[0..separator], " \t");
+        const length_expr = std.mem.trim(u8, inner[separator + 1 ..], " \t");
+        if (element_type.len != 0) {
+            try collectTypeConstRequiredExprs(allocator, sites, element_type, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+        }
+        if (length_expr.len != 0) {
+            try appendConstRequiredExpr(allocator, sites, .array_length, length_expr, "", types.TypeRef.fromBuiltin(.index), global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+        }
+        return;
+    }
+
+    if (std.mem.indexOfScalar(u8, trimmed, '[')) |open_index| {
+        const close_index = findMatchingDelimiter(trimmed, open_index, '[', ']') orelse return;
+        if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t").len != 0) return;
+        const args = try splitTopLevelCommaParts(allocator, trimmed[open_index + 1 .. close_index]);
+        defer allocator.free(args);
+        for (args) |arg| try collectTypeConstRequiredExprs(allocator, sites, arg, global_scope, prototypes, method_prototypes, struct_prototypes, enum_prototypes, span, diagnostics);
+    }
+}
+
+fn appendConstRequiredExpr(
+    allocator: Allocator,
+    sites: *array_list.Managed(ConstRequiredExpr),
+    kind: ConstRequiredExprKind,
+    source_text: []const u8,
+    owner_name: []const u8,
+    expected_type: types.TypeRef,
+    global_scope: *const Scope,
+    prototypes: []const FunctionPrototype,
+    method_prototypes: []const MethodPrototype,
+    struct_prototypes: []const StructPrototype,
+    enum_prototypes: []const EnumPrototype,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) !void {
+    var site = ConstRequiredExpr{
+        .kind = kind,
+        .source = source_text,
+        .owner_name = owner_name,
+    };
+    errdefer site.deinit(allocator);
+
+    site.expr = expression_parse.parseExpressionText(
+        allocator,
+        source_text,
+        expected_type,
+        global_scope,
+        &.{},
+        prototypes,
+        method_prototypes,
+        struct_prototypes,
+        enum_prototypes,
+        diagnostics,
+        span,
+        false,
+        false,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => blk: {
+            site.parse_error = err;
+            break :blk null;
+        },
+    };
+
+    try sites.append(site);
+}
+
+fn enumDiscriminantExpectedType(attributes: []const ast.Attribute) types.TypeRef {
+    for (attributes) |attribute| {
+        if (!std.mem.eql(u8, attribute.name, "repr")) continue;
+        const open_index = std.mem.indexOfScalar(u8, attribute.raw, '[') orelse return types.TypeRef.fromBuiltin(.index);
+        const close_index = std.mem.lastIndexOfScalar(u8, attribute.raw, ']') orelse return types.TypeRef.fromBuiltin(.index);
+        if (close_index <= open_index) return types.TypeRef.fromBuiltin(.index);
+
+        var parts = std.mem.splitScalar(u8, attribute.raw[open_index + 1 .. close_index], ',');
+        while (parts.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
+            const builtin = types.Builtin.fromName(trimmed);
+            if (builtin.isInteger()) return types.TypeRef.fromBuiltin(builtin);
+        }
+    }
+    return types.TypeRef.fromBuiltin(.index);
+}
+
 pub fn addImportedBinding(allocator: Allocator, module: *Module, binding: ImportedBinding) !void {
     for (module.imports.items) |existing| {
         if (std.mem.eql(u8, existing.local_name, binding.local_name)) {
             try appendDiagnostic(
                 allocator,
-                &module.signature_diagnostics,
+                &module.prepared_signature_issues,
                 .@"error",
                 "type.import.duplicate",
                 null,
@@ -601,7 +838,7 @@ pub fn addImportedMethodPrototype(allocator: Allocator, module: *Module, method:
             }
             try appendDiagnostic(
                 allocator,
-                &module.signature_diagnostics,
+                &module.prepared_signature_issues,
                 .@"error",
                 "type.method.duplicate",
                 null,
@@ -752,7 +989,7 @@ fn finalizeItem(
             }
         },
         .const_item => |*const_item| {
-            try parseConstInitializer(allocator, item, const_item, prototypes, method_prototypes, global_scope, struct_prototypes, enum_prototypes, diagnostics);
+            try parseConstInitializer(allocator, item, const_item, prototypes, method_prototypes, global_scope, type_scope, struct_prototypes, enum_prototypes, diagnostics);
         },
         .struct_type => |*struct_type| {
             const context: TypeResolutionContext = .{
@@ -783,11 +1020,38 @@ fn finalizeItem(
                 .generic_params = trait_type.generic_params,
                 .allow_self = true,
             }, item.span, diagnostics);
+            for (trait_type.associated_consts) |associated_const| {
+                try declaration_parse.validateTypeExpression(associated_const.type_name, .{
+                    .type_scope = type_scope,
+                    .generic_params = trait_type.generic_params,
+                    .allow_self = true,
+                    .self_type_name = "Self",
+                }, item.span, diagnostics);
+            }
             for (trait_type.methods) |*method| {
                 try declaration_parse.validateTraitMethodSignature(allocator, module, method, trait_type.generic_params, trait_type.associated_types, type_scope, item.span, diagnostics);
             }
         },
-        .impl_block => |*impl_block| try declaration_parse.validateImplBlock(module, impl_block, type_scope, item.span, diagnostics),
+        .impl_block => |*impl_block| {
+            for (impl_block.associated_consts) |*binding| {
+                try parseConstInitializerWithContext(
+                    allocator,
+                    item.span,
+                    binding.name,
+                    &binding.const_data,
+                    impl_block.generic_params,
+                    &.{},
+                    prototypes,
+                    method_prototypes,
+                    global_scope,
+                    type_scope,
+                    struct_prototypes,
+                    enum_prototypes,
+                    diagnostics,
+                );
+            }
+            try declaration_parse.validateImplBlock(module, impl_block, type_scope, item.span, diagnostics);
+        },
         else => {},
     }
 }
@@ -807,6 +1071,39 @@ fn parseConstInitializer(
     prototypes: []const FunctionPrototype,
     method_prototypes: []const MethodPrototype,
     global_scope: *const Scope,
+    type_scope: *const NameSet,
+    struct_prototypes: []const StructPrototype,
+    enum_prototypes: []const EnumPrototype,
+    diagnostics: *diag.Bag,
+) !void {
+    try parseConstInitializerWithContext(
+        allocator,
+        item.span,
+        item.name,
+        const_item,
+        &.{},
+        &.{},
+        prototypes,
+        method_prototypes,
+        global_scope,
+        type_scope,
+        struct_prototypes,
+        enum_prototypes,
+        diagnostics,
+    );
+}
+
+fn parseConstInitializerWithContext(
+    allocator: Allocator,
+    span: source.Span,
+    const_name: []const u8,
+    const_item: *ConstData,
+    generic_params: []const GenericParam,
+    associated_types: []const TraitAssociatedType,
+    prototypes: []const FunctionPrototype,
+    method_prototypes: []const MethodPrototype,
+    global_scope: *const Scope,
+    type_scope: *const NameSet,
     struct_prototypes: []const StructPrototype,
     enum_prototypes: []const EnumPrototype,
     diagnostics: *diag.Bag,
@@ -815,10 +1112,21 @@ fn parseConstInitializer(
     defer scope.deinit();
     try scope.extendFrom(global_scope);
 
+    const context: TypeResolutionContext = .{
+        .type_scope = type_scope,
+        .generic_params = generic_params,
+        .associated_types = associated_types,
+    };
+    const_item.type_ref = try declaration_parse.resolveValueTypeWithContext(const_item.type_name, context, span, diagnostics);
+    const_item.ty = switch (const_item.type_ref) {
+        .builtin => |builtin| builtin,
+        else => .unsupported,
+    };
+
     const initializer_syntax = const_item.initializer_syntax orelse return error.InvalidParse;
-    const expr = try parseExpressionSyntax(allocator, initializer_syntax, types.TypeRef.fromBuiltin(const_item.ty), &scope, &.{}, prototypes, method_prototypes, struct_prototypes, enum_prototypes, diagnostics, item.span, false, false);
-    if (const_item.ty != .unsupported and !expr.ty.isUnsupported() and !expr.ty.eql(types.TypeRef.fromBuiltin(const_item.ty))) {
-        try diagnostics.add(.@"error", "type.const.mismatch", item.span, "const '{s}' initializer type does not match declared type", .{item.name});
+    const expr = try parseExpressionSyntax(allocator, initializer_syntax, const_item.type_ref, &scope, &.{}, prototypes, method_prototypes, struct_prototypes, enum_prototypes, diagnostics, span, false, false);
+    if (!const_item.type_ref.isUnsupported() and !expr.ty.isUnsupported() and !expr.ty.eql(const_item.type_ref)) {
+        try diagnostics.add(.@"error", "type.const.mismatch", span, "const '{s}' initializer type does not match declared type", .{const_name});
     }
     const_item.expr = expr;
 }
@@ -926,15 +1234,6 @@ fn appendStructuredBlockStatements(
     suspend_context: bool,
     unsafe_context: bool,
 ) anyerror!void {
-    try predeclareStructuredBlockConstBindings(
-        block_syntax,
-        scope,
-        struct_prototypes,
-        enum_prototypes,
-        diagnostics,
-        item.span,
-    );
-
     for (block_syntax.statements) |statement_syntax| {
         try body.statements.append(try parseStructuredStatement(
             allocator,
@@ -1489,7 +1788,6 @@ fn parseStructuredRepeat(
                     try diagnostics.add(.@"error", "type.repeat.pattern", item.span, "repeat iteration requires an irrefutable binding pattern", .{});
                 },
             }
-
         },
         .invalid => |invalid| {
             reject_iteration = true;
@@ -1584,7 +1882,7 @@ fn parseBindingStatementSyntax(
         try diagnostics.add(.@"error", "type.binding.mismatch", span, "local binding '{s}' initializer type does not match declared type", .{name});
     }
 
-    try scope.putWithOrigin(name, binding_type, !is_const, inferExprBoundaryTypeInScope(scope, expr));
+    try scope.putFull(name, binding_type, !is_const, is_const, inferExprBoundaryTypeInScope(scope, expr));
 
     const lowered = Statement.BindingDecl{
         .name = name,
@@ -1855,6 +2153,7 @@ fn resolveDeclaredValueType(
 ) !types.TypeRef {
     const builtin = types.Builtin.fromName(type_name);
     if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+    if (std.mem.startsWith(u8, std.mem.trim(u8, type_name, " \t"), "[")) return .{ .named = type_name };
     if (findStructPrototype(struct_prototypes, type_name) != null) return .{ .named = type_name };
     if (findEnumPrototype(enum_prototypes, type_name) != null) return .{ .named = type_name };
     try diagnostics.add(.@"error", "type.binding.declared", span, "unsupported stage0 local binding type '{s}'", .{type_name});
@@ -1894,6 +2193,7 @@ const Scope = struct {
     names: array_list.Managed([]const u8),
     types_list: array_list.Managed(types.TypeRef),
     mutable_list: array_list.Managed(bool),
+    const_list: array_list.Managed(bool),
     origins: array_list.Managed(BoundaryType),
 
     fn init(allocator: Allocator) Scope {
@@ -1902,6 +2202,7 @@ const Scope = struct {
             .names = array_list.Managed([]const u8).init(allocator),
             .types_list = array_list.Managed(types.TypeRef).init(allocator),
             .mutable_list = array_list.Managed(bool).init(allocator),
+            .const_list = array_list.Managed(bool).init(allocator),
             .origins = array_list.Managed(BoundaryType).init(allocator),
         };
     }
@@ -1910,23 +2211,33 @@ const Scope = struct {
         self.names.deinit();
         self.types_list.deinit();
         self.mutable_list.deinit();
+        self.const_list.deinit();
         self.origins.deinit();
     }
 
     fn extendFrom(self: *Scope, other: *const Scope) !void {
-        for (other.names.items, other.types_list.items, other.mutable_list.items, other.origins.items) |name, ty, mutable, origin| {
-            try self.putWithOrigin(name, ty, mutable, origin);
+        for (other.names.items, other.types_list.items, other.mutable_list.items, other.const_list.items, other.origins.items) |name, ty, mutable, is_const, origin| {
+            try self.putFull(name, ty, mutable, is_const, origin);
         }
     }
 
     fn put(self: *Scope, name: []const u8, ty: types.TypeRef, mutable: bool) !void {
-        try self.putWithOrigin(name, ty, mutable, boundaryFromTypeRef(ty));
+        try self.putFull(name, ty, mutable, false, boundaryFromTypeRef(ty));
+    }
+
+    fn putConst(self: *Scope, name: []const u8, ty: types.TypeRef) !void {
+        try self.putFull(name, ty, false, true, boundaryFromTypeRef(ty));
     }
 
     fn putWithOrigin(self: *Scope, name: []const u8, ty: types.TypeRef, mutable: bool, origin: BoundaryType) !void {
+        try self.putFull(name, ty, mutable, false, origin);
+    }
+
+    fn putFull(self: *Scope, name: []const u8, ty: types.TypeRef, mutable: bool, is_const: bool, origin: BoundaryType) !void {
         try self.names.append(name);
         try self.types_list.append(ty);
         try self.mutable_list.append(mutable);
+        try self.const_list.append(is_const);
         try self.origins.append(origin);
     }
 
@@ -1944,6 +2255,15 @@ const Scope = struct {
         while (index > 0) {
             index -= 1;
             if (std.mem.eql(u8, self.names.items[index], name)) return self.mutable_list.items[index];
+        }
+        return false;
+    }
+
+    pub fn isConst(self: *const Scope, name: []const u8) bool {
+        var index = self.names.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (std.mem.eql(u8, self.names.items[index], name)) return self.const_list.items[index];
         }
         return false;
     }
@@ -2040,4 +2360,3 @@ test "function body parsing uses structured block syntax when available" {
         else => return error.UnexpectedStructure,
     }
 }
-

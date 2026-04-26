@@ -11,11 +11,13 @@ The core nominal declaration families are:
 - `opaque type`
 
 These are the language-level named type forms in the current model.
+Pure type aliases are separate and are defined in `spec/type-aliases.md`.
 
 ## Nominal Law
 
 - Declared `struct`, `enum`, and `opaque type` families are nominal.
 - A declared type is distinct because it was declared by that name, not because another type has the same shape.
+- These declaration families define semantic type identity, not layout or ABI promises by themselves.
 - Tuple law remains separate; tuples are structural and are defined in `spec/tuples.md`.
 - Behavior attachment such as traits, impls, and methods is separate from declaration law.
 
@@ -65,6 +67,7 @@ enum Event:
 
 - `opaque type` is a nominal declaration family with hidden representation.
 - `opaque type` is a general language facility, not a handle-only special case.
+- `opaque type` does not by itself choose handle semantics or foreign-wrapper policy.
 - `opaque type` does not expose its representation through ordinary source use.
 - `opaque type` may appear in signatures, fields, results, impls, and generic bounds.
 - `opaque type` does not imply an ordinary public constructor target.
@@ -157,6 +160,8 @@ let event = Event.Resize :: :: call
 ## Boundaries
 
 - This spec defines declaration families and constructor law, not behavior attachment.
+- Pure type-alias law is defined in `spec/type-aliases.md`.
+- Layout, repr, and foreign-wrapping law are defined in `spec/layout-and-repr.md`.
 - Traits, impls, and methods are defined in `spec/traits-and-impls.md`.
 - Handle-specific lifecycle rules are defined in `spec/handles.md`.
 - Control-flow pattern use is defined in `spec/control-flow.md`.
@@ -174,3 +179,4 @@ The compiler must reject:
 - positional construction with wrong arity
 - projection or exact named-field matching that uses an inaccessible field
 - `opaque type` ordinary construction when no explicit creator exists
+- treating nominal declaration shape alone as an implied layout or ABI promise

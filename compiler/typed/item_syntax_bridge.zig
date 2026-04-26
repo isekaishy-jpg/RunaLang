@@ -103,13 +103,13 @@ pub fn parseConstDataFromSyntax(
     const expr_raw = if (signature.initializer) |initializer| std.mem.trim(u8, initializer.text, " \t") else "";
 
     const ty = types.Builtin.fromName(type_raw);
-    if (ty == .unsupported) {
-        try diagnostics.add(.@"error", "type.const.type", span, "unsupported const type '{s}'", .{type_raw});
-    }
+    _ = diagnostics;
+    _ = span;
 
     return .{
         .type_name = type_raw,
         .ty = ty,
+        .type_ref = if (ty == .unsupported) .{ .named = type_raw } else types.TypeRef.fromBuiltin(ty),
         .initializer_source = expr_raw,
         .initializer_syntax = if (signature.initializer_expr) |expr| try expr.clone(allocator) else null,
         .expr = null,

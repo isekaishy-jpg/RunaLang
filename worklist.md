@@ -89,78 +89,21 @@ The goal is to implement all specs, not a partial showcase subset.
 - [x] Parser benchmark harness for cold parse, incremental reparse, and `runa check`
 
 ## Static Semantics
-- [x] Authoritative semantic query/checking architecture spec in `spec/semantic-query-and-checking.md`
-- [x] Authoritative domain-state-root spec in `spec/domain-state-roots.md`
-- [x] Authoritative domain-state surface spec in `spec/domain-state-surface.md`
-- [x] Session-owned semantic ids, caches, and cycle tracking
-- [x] Query-backed checked-signature and checked-body substrate
-- [x] MIR lowering depends on checked-body queries
-- [x] First-wave query entrypoints for traits, CTFE, reflection, body analyses, `Send`, domain-state, and boundary
-- [x] Cache query failures and repeated diagnostics by family keys
-- [x] Add tests for stable ids, failure caching, cycle caching, and repeated diagnostics
-- [x] Store lowered const IR in const facts instead of raw `typed.Expr` pointers
-- [x] Delete the permanent direct `typed.Expr` CTFE evaluation path
-- [x] Route array lengths through checked const IR without raw expression reparsing
-- [x] Add CTFE for array repetition lengths from `spec/arrays.md`
-- [x] Add CTFE for explicit `#repr[...]` enum discriminants
-- [x] Add local const dependency and cycle tracking inside checked bodies
-- [x] Add CTFE tests for overflow, divide-by-zero, shifts, discriminants, and cycles
-- [x] Build cached impl lookup indexes by canonical trait and type head
-- [x] Make impl lookup demand checked signatures instead of prefilled cache scans
-- [x] Complete generic impl target substitution beyond whole-name `Self`
-- [x] Complete where-predicate substitution for impl obligations
-- [x] Complete associated-type projection equality and substitution
-- [x] Tighten generic overlap and orphan-rule coherence checks
-- [x] Materialize default-method inheritance facts from checked trait and impl facts
-- [x] Add trait tests for overlap, orphan rules, projections, defaults, and `Send`
-- [x] Resolve worker-spawn callable obligations from checked callable facts
-- [x] Resolve task output `Send` checks from checked callable output facts
-- [x] Treat worker-spawn `Send` obligations as solver goals end-to-end
-- [x] Rebuild ownership analysis to consume checked CFG and place facts
-- [x] Rebuild borrow analysis to consume checked CFG and place facts
-- [x] Rebuild lifetime analysis to consume checked CFG and effect facts
-- [x] Rebuild region analysis to consume checked CFG and effect facts
-- [x] Add CFG facts for `break`, `continue`, `return`, and `defer` exits
-- [x] Add checked effect facts for suspension and spawn control-flow boundaries
-- [x] Remove analyzer dependence on typed AST re-walks where checked facts exist
-- [x] Add analyzer tests for `select`, `repeat`, `unsafe`, `defer`, suspension, and spawn
-- [x] Build reflection metadata directly from checked declaration facts
-- [x] Retain const-safe reflection const values, not only retention booleans
-- [x] Emit spec-correct public field metadata instead of public-prefix only
-- [x] Enforce nominal-only opaque and handle reflection metadata
-- [x] Enforce ownership-plus-reflection rules from checked semantic facts
-- [x] Move domain-state declaration validation fully into query facts
-- [x] Enforce child-root parent-anchor presence, uniqueness, and target validity
-- [x] Validate imported domain roots and contexts in anchor checks
-- [x] Diagnose retained parent anchors targeting non-root types
-- [x] Drive domain escape checks from checked CFG, lifetime, and effect facts
-- [x] Fail loudly for unsupported detached domain-state transfer surfaces
-- [x] Add domain-state tests for anchors, imports, escapes, boundary, task, and suspension
-- [x] Make boundary classification consume checked type and domain facts only
-- [x] Make boundary contract validation consume checked signatures only
-- [x] Keep domain roots and contexts local-only in boundary facts
-- [x] Move callable formation diagnostics onto checked callable facts
-- [x] Move callable-value dispatch diagnostics onto checked callable facts
-- [x] Remove tuple-packed function-value stage0 fallback diagnostics
-- [x] Move pattern completeness and irrefutability checks onto checked bodies
-- [x] Move pattern visibility and unreachable-arm diagnostics onto checked bodies
-- [x] Remove complex-pattern and repeat-binding stage0 fallback diagnostics
-- [x] Resolve repeat `Iterable` capability through trait/query facts
-- [x] Move remaining declaration/signature semantic diagnostics out of typed finalization into checked-signature query facts
-- [x] Remove duplicate eager domain-state declaration diagnostics from `compiler/typed/domain_state.zig`
-- [x] Move return, break/continue, select/repeat condition, malformed-statement, and block-shape diagnostics onto checked statement facts
-- [x] Move local const, binding, assignment target/type, mutability, and field-assignment diagnostics onto checked place/statement facts
-- [x] Finish remaining static statement diagnostics on the checked-body substrate
-- [x] Add stable checked-expression ids/facts for operators, calls, projections, constructors, arrays, and expected/actual type evidence
-- [x] Move direct call, method call, constructor, enum-constructor, field/projection, array, operator, unsafe, suspend, and retained lifetime diagnostics onto checked expression facts
-- [x] Finish remaining static expression diagnostics on checked expression facts
-- [x] Add cache and deterministic repeated-diagnostic tests for callables, patterns, repeat iteration, and checked-expression diagnostics
-- [x] Add cached exported reflection aggregation queries for runtime, module, and package metadata
-- [x] Replace non-testing name-based query entrypoints with id/canonical-key entrypoints
-- [x] Split frontend recovery diagnostics from semantic diagnostics before driver query cutover
-- [x] Cut driver orchestration to query entrypoints only for semantic truth
-- [x] Make `runa check`, build, docs, LSP, and MIR lowering consume query finalization results only after frontend prepare
-- [x] Delete old module-wide body-analysis and reflection scan paths after cutover
+- [x] Authoritative query/checking, domain-state, and follow-on architecture specs
+- [x] Session-owned semantic ids, per-family caches, shared cycle tracking, and deterministic failure caching
+- [x] Query-backed checked signatures, checked bodies, and MIR inputs
+- [x] Coherence indexes, trait solving, associated-type projection, associated-const lookup, and built-in `Send` integration
+- [x] Query-owned const IR and CTFE for module consts, associated consts, local consts, const-required sites, constant patterns, aggregates, tables, and conversions
+- [x] Checked callable, pattern, and conversion facts over query-backed checked bodies
+- [x] Query-owned ownership, borrow, lifetime, and region analysis over checked CFG/effect facts
+- [x] Query-owned reflection metadata and exported reflection aggregation
+- [x] Query-owned domain-state declaration validation, boundary integration, and first-wave return/task/suspension checks
+- [x] Boundary classification/contracts and repeat `Iterable` capability resolved from checked/query facts
+- [x] Driver, CLI, docs, LSP, and MIR cut over to query-backed semantic finalization
+- [x] Old eager reflection scan, module-wide body-analysis path, and direct `typed.Expr` CTFE path removed
+- [ ] Replace raw-name/string-pattern coherence validation with canonical trait/type-head coherence over session-owned indexes
+- [ ] Replace remaining `prepared_body_issues` replay with explicit checked-body/query-owned statement and expression diagnostic facts
+- [ ] Expand domain-state storage escape analysis beyond constructor writes to assignment and other non-domain storage paths
 
 ## Async And Runtime
 - [x] Structured child-task teardown semantics
@@ -177,6 +120,9 @@ The goal is to implement all specs, not a partial showcase subset.
 - [ ] Export/import attribute behavior from `spec/attributes.md`
 
 ## Types And Data
+- [x] Authoritative conversion law in `spec/conversions.md`
+- [x] Authoritative type-alias law in `spec/type-aliases.md`
+- [ ] Type aliases from `spec/type-aliases.md`
 - [ ] Tuples from `spec/tuples.md`
 - [ ] Arrays from `spec/arrays.md`
 - [ ] Handles from `spec/handles.md`

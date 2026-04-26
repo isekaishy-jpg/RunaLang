@@ -17,7 +17,7 @@ Runa uses suspension and structured concurrency, not implicit future-valued call
 - `suspend` may apply to ordinary functions, inherent methods, trait methods, and trait impl methods.
 - A suspend callable returns its declared result type when resumed to completion.
 - `suspend fn` does not imply a hidden `Future[T]` wrapper in the source model.
-- A suspend callable may be invoked only from another suspend context or through an explicit runtime adapter API.
+- A suspend callable may be invoked only from another suspend context or through an explicit std/runtime adapter API.
 
 Examples:
 
@@ -53,13 +53,13 @@ let bytes = task.await :: :: method
 - `Task[T]` values obey ordinary ownership law.
 - `Task[T]` does not imply hidden shared ownership, detached lifetime, or hidden scheduler fallback.
 - Awaiting a task consumes the task handle in the first-wave model.
-- Explicit detached creation is runtime-owned and separate from attached `Task[T]` handles in the first-wave model.
+- Explicit detached creation is std/runtime-owned and separate from attached `Task[T]` handles in the first-wave model.
 
 ## Structured Concurrency
 
 - Each suspend callable body is an implicit child-task scope in v1.
 - `spawn` and `spawn_local` create attached child tasks in the current suspend callable scope.
-- Child tasks belong to that scope unless created through one explicit detached runtime helper.
+- Child tasks belong to that scope unless created through one explicit detached std/runtime helper.
 - A suspend callable must not silently abandon live child tasks on exit.
 - When a suspend callable exits with live attached child tasks, the runtime must cancel the remaining children and await their teardown before the parent completes.
 - `defer` handlers in child tasks must run during task teardown.

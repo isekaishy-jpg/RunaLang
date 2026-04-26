@@ -1,6 +1,5 @@
 const callee_helpers = @import("callee_helpers.zig");
 const callable_types = @import("../typed/callable_types.zig");
-const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
 const std = @import("std");
 const typed = @import("../typed/root.zig");
@@ -257,6 +256,7 @@ pub const CallArgumentSite = struct {
     callee_name: []const u8,
     arg_index: usize,
     arg_type: types.TypeRef,
+    arg_expr: *const typed.Expr,
 };
 
 pub const ConstructorArgumentKind = enum {
@@ -276,14 +276,6 @@ pub const ReturnValueSite = struct {
     value_type: types.TypeRef,
 };
 
-pub const DiagnosticSite = struct {
-    severity: diag.Severity,
-    code: []const u8,
-    span: ?@import("../source/root.zig").Span,
-    message: []const u8,
-    expression: bool,
-};
-
 pub const ExpressionId = struct { index: usize };
 
 pub const ExpressionKind = enum {
@@ -299,7 +291,10 @@ pub const ExpressionKind = enum {
     constructor,
     method_target,
     field,
+    array,
     array_repeat,
+    index,
+    conversion,
     unary,
     binary,
 };
@@ -314,6 +309,9 @@ pub const ExpressionSite = struct {
     field_name: ?[]const u8 = null,
     binary_op: ?typed.BinaryOp = null,
     unary_op: ?typed.UnaryOp = null,
+    conversion_mode: ?typed.ConversionMode = null,
+    source_type: types.TypeRef = .unsupported,
+    target_type: types.TypeRef = .unsupported,
 };
 
 pub const Facts = struct {
@@ -339,7 +337,6 @@ pub const Facts = struct {
     constructor_argument_sites: []const ConstructorArgumentSite,
     return_value_sites: []const ReturnValueSite,
     expression_sites: []const ExpressionSite,
-    diagnostic_sites: []const DiagnosticSite,
 
     pub fn deinit(self: Facts, allocator: Allocator) void {
         for (self.block_sites) |block| {
@@ -372,14 +369,12 @@ pub const Facts = struct {
         allocator.free(self.constructor_argument_sites);
         allocator.free(self.return_value_sites);
         allocator.free(self.expression_sites);
-        allocator.free(self.diagnostic_sites);
     }
 };
 
 pub fn buildFacts(
     allocator: Allocator,
     function: *const typed.FunctionData,
-    body_diagnostics: []const diag.Diagnostic,
     callable_resolver: anytype,
 ) !Facts {
     var builder = Builder.init(allocator);
@@ -412,7 +407,6 @@ pub fn buildFacts(
     }
     builder.summary.top_level_statement_count = function.body.statements.items.len;
     const root_range = try builder.visitBlock(callable_resolver, null, .sequence, &function.body);
-    try builder.recordDeferredDiagnostics(body_diagnostics);
 
     return .{
         .summary = builder.summary,
@@ -437,7 +431,6 @@ pub fn buildFacts(
         .constructor_argument_sites = try builder.constructor_argument_sites.toOwnedSlice(),
         .return_value_sites = try builder.return_value_sites.toOwnedSlice(),
         .expression_sites = try builder.expression_sites.toOwnedSlice(),
-        .diagnostic_sites = try builder.diagnostic_sites.toOwnedSlice(),
     };
 }
 
@@ -464,7 +457,6 @@ const Builder = struct {
     constructor_argument_sites: std.array_list.Managed(ConstructorArgumentSite),
     return_value_sites: std.array_list.Managed(ReturnValueSite),
     expression_sites: std.array_list.Managed(ExpressionSite),
-    diagnostic_sites: std.array_list.Managed(DiagnosticSite),
     scope_stack: std.array_list.Managed(usize),
     loop_stack: std.array_list.Managed(usize),
     defer_stack: std.array_list.Managed(usize),
@@ -493,7 +485,6 @@ const Builder = struct {
             .constructor_argument_sites = std.array_list.Managed(ConstructorArgumentSite).init(allocator),
             .return_value_sites = std.array_list.Managed(ReturnValueSite).init(allocator),
             .expression_sites = std.array_list.Managed(ExpressionSite).init(allocator),
-            .diagnostic_sites = std.array_list.Managed(DiagnosticSite).init(allocator),
             .scope_stack = std.array_list.Managed(usize).init(allocator),
             .loop_stack = std.array_list.Managed(usize).init(allocator),
             .defer_stack = std.array_list.Managed(usize).init(allocator),
@@ -527,7 +518,6 @@ const Builder = struct {
         self.constructor_argument_sites.deinit();
         self.return_value_sites.deinit();
         self.expression_sites.deinit();
-        self.diagnostic_sites.deinit();
         self.scope_stack.deinit();
         self.loop_stack.deinit();
         self.defer_stack.deinit();
@@ -912,6 +902,7 @@ const Builder = struct {
                         .callee_name = call.callee,
                         .arg_index = arg_index,
                         .arg_type = arg.ty,
+                        .arg_expr = arg,
                     });
                     try self.visitExpr(callable_resolver, statement_index, span, arg);
                 }
@@ -943,6 +934,9 @@ const Builder = struct {
             },
             .method_target => |target| try self.visitExpr(callable_resolver, statement_index, span, target.base),
             .field => |field| try self.visitExpr(callable_resolver, statement_index, span, field.base),
+            .array => |array| {
+                for (array.items) |item| try self.visitExpr(callable_resolver, statement_index, span, item);
+            },
             .array_repeat => |array_repeat| {
                 try self.array_repetition_length_sites.append(.{
                     .statement_index = statement_index,
@@ -953,6 +947,11 @@ const Builder = struct {
                 try self.visitExpr(callable_resolver, statement_index, span, array_repeat.value);
                 try self.visitExpr(callable_resolver, statement_index, span, array_repeat.length);
             },
+            .index => |index| {
+                try self.visitExpr(callable_resolver, statement_index, span, index.base);
+                try self.visitExpr(callable_resolver, statement_index, span, index.index);
+            },
+            .conversion => |conversion| try self.visitExpr(callable_resolver, statement_index, span, conversion.operand),
             .unary => |unary| try self.visitExpr(callable_resolver, statement_index, span, unary.operand),
             .binary => |binary| {
                 try self.visitExpr(callable_resolver, statement_index, span, binary.lhs);
@@ -975,18 +974,6 @@ const Builder = struct {
                     });
                 }
             },
-        }
-    }
-
-    fn recordDeferredDiagnostics(self: *Builder, diagnostics: []const diag.Diagnostic) !void {
-        for (diagnostics) |diagnostic| {
-            try self.diagnostic_sites.append(.{
-                .severity = diagnostic.severity,
-                .code = diagnostic.code,
-                .span = diagnostic.span,
-                .message = diagnostic.message,
-                .expression = isExpressionDiagnostic(diagnostic.code),
-            });
         }
     }
 
@@ -1094,11 +1081,32 @@ const Builder = struct {
                 .ty = expr.ty,
                 .field_name = field.field_name,
             },
+            .array => ExpressionSite{
+                .id = .{ .index = self.expression_sites.items.len },
+                .statement_index = statement_index,
+                .kind = .array,
+                .ty = expr.ty,
+            },
             .array_repeat => ExpressionSite{
                 .id = .{ .index = self.expression_sites.items.len },
                 .statement_index = statement_index,
                 .kind = .array_repeat,
                 .ty = expr.ty,
+            },
+            .index => ExpressionSite{
+                .id = .{ .index = self.expression_sites.items.len },
+                .statement_index = statement_index,
+                .kind = .index,
+                .ty = expr.ty,
+            },
+            .conversion => |conversion| ExpressionSite{
+                .id = .{ .index = self.expression_sites.items.len },
+                .statement_index = statement_index,
+                .kind = .conversion,
+                .ty = expr.ty,
+                .conversion_mode = conversion.mode,
+                .source_type = conversion.operand.ty,
+                .target_type = conversion.target_type,
             },
             .unary => |unary| ExpressionSite{
                 .id = .{ .index = self.expression_sites.items.len },
@@ -1202,16 +1210,3 @@ const Builder = struct {
         return null;
     }
 };
-
-fn isExpressionDiagnostic(code: []const u8) bool {
-    return std.mem.startsWith(u8, code, "type.expr.") or
-        std.mem.startsWith(u8, code, "parse.expr.") or
-        std.mem.startsWith(u8, code, "type.call.") or
-        std.mem.startsWith(u8, code, "type.method.") or
-        std.mem.startsWith(u8, code, "type.ctor.") or
-        std.mem.startsWith(u8, code, "type.enum.") or
-        std.mem.startsWith(u8, code, "type.field.") or
-        std.mem.startsWith(u8, code, "type.name.") or
-        std.mem.startsWith(u8, code, "lifetime.call.") or
-        std.mem.startsWith(u8, code, "lifetime.store.");
-}

@@ -5,8 +5,8 @@ pub const checked_body = @import("checked_body.zig");
 const callable_checks = @import("callable_checks.zig");
 const coherence_checks = @import("coherence_checks.zig");
 const const_contexts = @import("const_contexts.zig");
-const const_ir = @import("const_ir.zig");
-const const_eval = @import("const_eval.zig");
+pub const const_ir = @import("const_ir.zig");
+pub const const_eval = @import("const_eval.zig");
 const diag = @import("../diag/root.zig");
 const domain_state_body = @import("domain_state_body.zig");
 const domain_state_checks = @import("domain_state_checks.zig");
@@ -16,6 +16,7 @@ const local_const_checks = @import("local_const_checks.zig");
 const mir = @import("../mir/root.zig");
 const ownership = @import("../ownership/root.zig");
 const pattern_checks = @import("pattern_checks.zig");
+const prepared_issues = @import("prepared_issues.zig");
 const reflect = @import("../reflect/root.zig");
 const resolve = @import("../resolve/root.zig");
 const regions = @import("../regions/root.zig");
@@ -24,8 +25,10 @@ const send_checks = @import("send_checks.zig");
 const statement_checks = @import("statement_checks.zig");
 const trait_solver = @import("trait_solver.zig");
 const typed = @import("../typed/root.zig");
+const typed_text = @import("../typed/text.zig");
 const query_types = @import("types.zig");
 const Allocator = std.mem.Allocator;
+const baseTypeName = typed_text.baseTypeName;
 
 pub const summary = "Demand-driven compiler queries with session-owned ids and caches.";
 
@@ -37,6 +40,8 @@ pub const ReflectionMetadata = query_types.ReflectionMetadata;
 pub const RuntimeReflectionResult = query_types.RuntimeReflectionResult;
 pub const ModuleReflectionResult = query_types.ModuleReflectionResult;
 pub const PackageReflectionResult = query_types.PackageReflectionResult;
+pub const BoundaryApiMetadata = query_types.BoundaryApiMetadata;
+pub const ModuleBoundaryApiResult = query_types.ModuleBoundaryApiResult;
 pub const OwnershipResult = query_types.OwnershipResult;
 pub const BorrowResult = query_types.BorrowResult;
 pub const LifetimeResult = query_types.LifetimeResult;
@@ -46,10 +51,14 @@ pub const CallableResult = query_types.CallableResult;
 pub const PatternResult = query_types.PatternResult;
 pub const StatementResult = query_types.StatementResult;
 pub const ExpressionResult = query_types.ExpressionResult;
+pub const CheckedConversionFact = query_types.CheckedConversionFact;
+pub const ConversionMode = query_types.ConversionMode;
+pub const ConversionStatus = query_types.ConversionStatus;
 pub const ModuleSignatureResult = query_types.ModuleSignatureResult;
 pub const DomainStateItemResult = query_types.DomainStateItemResult;
 pub const DomainStateBodyResult = query_types.DomainStateBodyResult;
 pub const ConstResult = query_types.ConstResult;
+pub const AssociatedConstResult = query_types.AssociatedConstResult;
 pub const ConstExpr = query_types.ConstExpr;
 pub const TraitGoalResult = query_types.TraitGoalResult;
 pub const LocalConstResult = query_types.LocalConstResult;
@@ -86,10 +95,19 @@ pub const testing = if (@import("builtin").is_test) struct {
     }
 } else struct {};
 
+fn markCycleFailure(entry: anytype) void {
+    entry.value = null;
+    entry.failed = true;
+    entry.state = .complete;
+}
+
 pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !CheckedSignature {
     var entry = &active.caches.signatures[item_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.signature, item_id.index)) {
@@ -104,6 +122,7 @@ pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !Chec
     }
 
     const item_entry = active.semantic_index.itemEntry(item_id);
+    try active.ensureTypedModuleFinalized(item_entry.module_id);
     const item = active.item(item_id);
     const boundary_kind = boundary_checks.kindForItem(item);
     const facts = try signatureFactsForItem(active.allocator, item);
@@ -120,23 +139,17 @@ pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !Chec
     };
     var value_owned = true;
     errdefer if (value_owned) value.deinit(active.allocator);
-    try replayDeferredDiagnostics(&active.pipeline.diagnostics, item.signature_diagnostics);
+    _ = try prepared_issues.emitAll(&active.pipeline.diagnostics, item.prepared_signature_issues);
     try validateSemanticAttributes(item, &active.pipeline.diagnostics);
     try boundary_checks.validateItem(item, &active.pipeline.diagnostics);
     try boundary_checks.validateSignature(active, value, &active.pipeline.diagnostics, checkedSignature);
     try domain_state_checks.validateSignature(active, value, &active.pipeline.diagnostics);
-    _ = try const_contexts.validateSignature(active, value, &active.pipeline.diagnostics, resolveConstIdentifier);
+    _ = try const_contexts.validateSignature(active, value, &active.pipeline.diagnostics, resolveConstIdentifier, resolveAssociatedConstIdentifier);
 
     entry.value = value;
     value_owned = false;
     entry.state = .complete;
     return value;
-}
-
-fn replayDeferredDiagnostics(diagnostics: *diag.Bag, deferred: []const diag.Diagnostic) !void {
-    for (deferred) |diagnostic| {
-        try diagnostics.add(diagnostic.severity, diagnostic.code, diagnostic.span, "{s}", .{diagnostic.message});
-    }
 }
 
 fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !void {
@@ -179,7 +192,10 @@ fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !
 pub fn checkedBody(active: *session.Session, body_id: session.BodyId) !CheckedBody {
     var entry = &active.caches.bodies[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.body, body_id.index)) {
@@ -193,11 +209,12 @@ pub fn checkedBody(active: *session.Session, body_id: session.BodyId) !CheckedBo
         entry.failed = true;
     }
 
+    const body_entry = active.semantic_index.bodyEntry(body_id);
+    try active.ensureTypedModuleFinalized(body_entry.module_id);
     const body = active.body(body_id);
     const facts = try checked_body.buildFacts(
         active.allocator,
         body.function,
-        body.item.body_diagnostics,
         CheckedCallableResolver{ .active = active, .module_id = body.module_id },
     );
     const value = CheckedBody{
@@ -230,7 +247,6 @@ pub fn checkedBody(active: *session.Session, body_id: session.BodyId) !CheckedBo
         .constructor_argument_sites = facts.constructor_argument_sites,
         .return_value_sites = facts.return_value_sites,
         .expression_sites = facts.expression_sites,
-        .diagnostic_sites = facts.diagnostic_sites,
     };
 
     entry.value = value;
@@ -241,7 +257,10 @@ pub fn checkedBody(active: *session.Session, body_id: session.BodyId) !CheckedBo
 pub fn moduleSignatureDiagnostics(active: *session.Session, module_id: session.ModuleId) !ModuleSignatureResult {
     var entry = &active.caches.module_signatures[module_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.module_signature, module_id.index)) {
@@ -255,16 +274,13 @@ pub fn moduleSignatureDiagnostics(active: *session.Session, module_id: session.M
         entry.failed = true;
     }
 
+    try active.ensureTypedModuleFinalized(module_id);
     const module = active.module(module_id);
-    var replayed: usize = 0;
-    for (module.signature_diagnostics) |diagnostic| {
-        try active.pipeline.diagnostics.add(diagnostic.severity, diagnostic.code, diagnostic.span, "{s}", .{diagnostic.message});
-        replayed += 1;
-    }
+    const emitted = try prepared_issues.emitAll(&active.pipeline.diagnostics, module.prepared_signature_issues);
 
     const value = ModuleSignatureResult{
         .module_id = module_id,
-        .summary = .{ .replayed_diagnostic_count = replayed },
+        .summary = .{ .prepared_issue_count = emitted },
     };
     entry.value = value;
     entry.state = .complete;
@@ -274,7 +290,10 @@ pub fn moduleSignatureDiagnostics(active: *session.Session, module_id: session.M
 pub fn constById(active: *session.Session, const_id: session.ConstId) !ConstResult {
     var entry = &active.caches.consts[const_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.const_eval, const_id.index)) {
@@ -309,7 +328,7 @@ pub fn constById(active: *session.Session, const_id: session.ConstId) !ConstResu
 
     const value = ConstResult{
         .const_id = const_id,
-        .value = const_eval.evalExpr(active, item_entry.module_id, expr, resolveConstIdentifier) catch |err| {
+        .value = const_eval.evalExprWithAssociated(active, item_entry.module_id, expr, resolveConstIdentifier, resolveAssociatedConstIdentifier) catch |err| {
             try reportConstEvalError(active, signature.item, err);
             return err;
         },
@@ -328,10 +347,71 @@ fn evalConstByNameForTesting(active: *session.Session, name: []const u8) !const_
     return error.UnknownConst;
 }
 
+pub fn associatedConstById(active: *session.Session, associated_const_id: session.AssociatedConstId) !AssociatedConstResult {
+    var entry = &active.caches.associated_consts[associated_const_id.index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.associated_const_eval, associated_const_id.index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    const associated_entry = active.semantic_index.associatedConstEntry(associated_const_id);
+    const item_entry = active.semantic_index.itemEntry(associated_entry.item_id);
+    const signature = try checkedSignature(active, associated_entry.item_id);
+    const binding = switch (signature.facts) {
+        .impl_block => |impl_block| if (associated_entry.associated_index < impl_block.associated_consts.len)
+            impl_block.associated_consts[associated_entry.associated_index]
+        else
+            return error.NotAConst,
+        .trait_type => {
+            entry.state = .complete;
+            entry.failed = true;
+            return error.MissingConstExpr;
+        },
+        else => {
+            entry.state = .complete;
+            entry.failed = true;
+            return error.NotAConst;
+        },
+    };
+
+    const expr = binding.const_item.expr orelse {
+        entry.state = .complete;
+        entry.failed = true;
+        const err = binding.const_item.lower_error orelse error.MissingConstExpr;
+        try reportAssociatedConstEvalError(active, signature.item, binding.name, err);
+        return err;
+    };
+
+    const value = AssociatedConstResult{
+        .associated_const_id = associated_const_id,
+        .value = const_eval.evalExprWithAssociated(active, item_entry.module_id, expr, resolveConstIdentifier, resolveAssociatedConstIdentifier) catch |err| {
+            try reportAssociatedConstEvalError(active, signature.item, binding.name, err);
+            return err;
+        },
+    };
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
 pub fn reflectionById(active: *session.Session, reflection_id: session.ReflectionId) !ReflectionMetadata {
     var entry = &active.caches.reflections[reflection_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
     if (entry.state == .in_progress) {
+        markCycleFailure(entry);
         try reportReflectionCycle(active, reflection_id);
         return error.QueryCycle;
     }
@@ -370,7 +450,10 @@ pub fn reflectionById(active: *session.Session, reflection_id: session.Reflectio
 pub fn runtimeReflectionMetadata(active: *session.Session) !RuntimeReflectionResult {
     var entry = &active.caches.runtime_reflections;
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.runtime_reflections, 0)) {
@@ -409,7 +492,10 @@ pub fn moduleReflectionMetadata(
 ) !ModuleReflectionResult {
     var entry = &active.caches.module_reflections[module_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.module_reflections, module_id.index)) {
@@ -451,7 +537,10 @@ pub fn packageReflectionMetadata(
 ) !PackageReflectionResult {
     var entry = &active.caches.package_reflections[package_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.package_reflections, package_id.index)) {
@@ -488,6 +577,62 @@ pub fn packageReflectionMetadata(
     return value;
 }
 
+pub fn moduleBoundaryApiMetadata(
+    active: *session.Session,
+    module_id: session.ModuleId,
+) !ModuleBoundaryApiResult {
+    var entry = &active.caches.module_boundary_apis[module_id.index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.module_boundary_apis, module_id.index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    var all = std.array_list.Managed(BoundaryApiMetadata).init(active.allocator);
+    errdefer all.deinit();
+
+    for (active.semantic_index.items.items, 0..) |item_entry, item_index| {
+        if (item_entry.module_id.index != module_id.index) continue;
+        const signature = checkedSignature(active, .{ .index = item_index }) catch |err| switch (err) {
+            error.CachedFailure => continue,
+            else => return err,
+        };
+        if (!signature.exported or signature.boundary_kind != .api) continue;
+        const function = switch (signature.facts) {
+            .function => |function| function,
+            else => continue,
+        };
+        try all.append(.{
+            .item_id = signature.item_id,
+            .name = signature.item.name,
+            .is_suspend = function.is_suspend,
+            .parameters = function.parameters,
+            .return_type = function.return_type,
+            .export_name = function.export_name,
+        });
+    }
+
+    const value = ModuleBoundaryApiResult{
+        .module_id = module_id,
+        .apis = try all.toOwnedSlice(),
+    };
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
 pub fn collectRuntimeMetadata(allocator: Allocator, active: *session.Session) ![]reflect.ItemMetadata {
     const result = try runtimeReflectionMetadata(active);
     return duplicateMetadataSlice(allocator, result.metadata);
@@ -509,6 +654,15 @@ pub fn collectPackageRuntimeMetadata(
 ) ![]reflect.ItemMetadata {
     const result = try packageReflectionMetadata(active, package_id);
     return duplicateMetadataSlice(allocator, result.metadata);
+}
+
+pub fn collectModuleBoundaryApiMetadata(
+    allocator: Allocator,
+    active: *session.Session,
+    module_id: session.ModuleId,
+) ![]BoundaryApiMetadata {
+    const result = try moduleBoundaryApiMetadata(active, module_id);
+    return allocator.dupe(BoundaryApiMetadata, result.apis);
 }
 
 fn duplicateMetadataSlice(allocator: Allocator, metadata: []const reflect.ItemMetadata) ![]reflect.ItemMetadata {
@@ -544,7 +698,37 @@ pub fn finalizeSemanticChecks(active: *session.Session) !void {
             error.DivideByZero,
             error.InvalidRemainder,
             error.InvalidShiftCount,
+            error.ConstIndexOutOfRange,
+            error.NegativeArrayLength,
+            error.InvalidConversion,
             error.UnknownConst,
+            error.AmbiguousAssociatedConst,
+            error.NotAConst,
+            error.MissingConstExpr,
+            => {},
+            else => return err,
+        };
+    }
+
+    for (active.semantic_index.associated_consts.items, 0..) |associated_entry, index| {
+        const item = active.item(associated_entry.item_id);
+        switch (item.payload) {
+            .impl_block => {},
+            else => continue,
+        }
+        _ = associatedConstById(active, .{ .index = index }) catch |err| switch (err) {
+            error.CachedFailure,
+            error.QueryCycle,
+            error.UnsupportedConstExpr,
+            error.ConstOverflow,
+            error.DivideByZero,
+            error.InvalidRemainder,
+            error.InvalidShiftCount,
+            error.ConstIndexOutOfRange,
+            error.NegativeArrayLength,
+            error.InvalidConversion,
+            error.UnknownConst,
+            error.AmbiguousAssociatedConst,
             error.NotAConst,
             error.MissingConstExpr,
             => {},
@@ -589,13 +773,20 @@ pub fn finalizeSemanticChecks(active: *session.Session) !void {
         if (module_pipeline.mir != null) continue;
 
         const module_id = moduleIdForPipelineIndex(active, pipeline_module_index) orelse return error.MissingSemanticModule;
+        var checked_signatures = std.array_list.Managed(CheckedSignature).init(active.allocator);
+        defer checked_signatures.deinit();
+        for (active.semantic_index.items.items, 0..) |item_entry, item_index| {
+            if (item_entry.module_id.index != module_id.index) continue;
+            try checked_signatures.append(try checkedSignature(active, .{ .index = item_index }));
+        }
+
         var checked_bodies = std.array_list.Managed(CheckedBody).init(active.allocator);
         defer checked_bodies.deinit();
         for (active.semantic_index.bodies.items, 0..) |body_entry, body_index| {
             if (body_entry.module_id.index != module_id.index) continue;
             try checked_bodies.append(try checkedBody(active, .{ .index = body_index }));
         }
-        module_pipeline.mir = try mir.lowerModuleFromCheckedBodies(active.allocator, module_pipeline.typed, checked_bodies.items);
+        module_pipeline.mir = try mir.lowerModuleFromCheckedFacts(active.allocator, module_pipeline.typed, checked_signatures.items, checked_bodies.items);
     }
 }
 
@@ -665,7 +856,10 @@ fn associatedTypeEquals(
 pub fn localConstsByBody(active: *session.Session, body_id: session.BodyId) !LocalConstResult {
     var entry = &active.caches.local_consts[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.local_const, body_id.index)) {
@@ -681,7 +875,7 @@ pub fn localConstsByBody(active: *session.Session, body_id: session.BodyId) !Loc
 
     const body = try checkedBody(active, body_id);
     _ = try expressionsByBody(active, body_id);
-    const local_summary = try local_const_checks.analyzeBody(active, body, &active.pipeline.diagnostics, resolveConstIdentifier);
+    const local_summary = try local_const_checks.analyzeBody(active, body, &active.pipeline.diagnostics, resolveConstIdentifier, resolveAssociatedConstIdentifier);
     const value = LocalConstResult{
         .body_id = body_id,
         .summary = .{
@@ -699,7 +893,10 @@ pub fn localConstsByBody(active: *session.Session, body_id: session.BodyId) !Loc
 pub fn statementsByBody(active: *session.Session, body_id: session.BodyId) !StatementResult {
     var entry = &active.caches.statements[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.statements, body_id.index)) {
@@ -719,7 +916,7 @@ pub fn statementsByBody(active: *session.Session, body_id: session.BodyId) !Stat
         .body_id = body_id,
         .summary = .{
             .checked_statement_count = statement_summary.checked_statement_count,
-            .replayed_diagnostic_count = statement_summary.replayed_diagnostic_count,
+            .prepared_issue_count = statement_summary.prepared_issue_count,
         },
     };
     entry.value = value;
@@ -730,7 +927,10 @@ pub fn statementsByBody(active: *session.Session, body_id: session.BodyId) !Stat
 pub fn expressionsByBody(active: *session.Session, body_id: session.BodyId) !ExpressionResult {
     var entry = &active.caches.expressions[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.expressions, body_id.index)) {
@@ -745,13 +945,16 @@ pub fn expressionsByBody(active: *session.Session, body_id: session.BodyId) !Exp
     }
 
     const body = try checkedBody(active, body_id);
-    const expression_summary = try expression_checks.analyzeBody(body, &active.pipeline.diagnostics);
+    const expression_result = try expression_checks.analyzeBody(active.allocator, body, &active.pipeline.diagnostics);
     const value = ExpressionResult{
         .body_id = body_id,
         .summary = .{
-            .checked_expression_count = expression_summary.checked_expression_count,
-            .replayed_diagnostic_count = expression_summary.replayed_diagnostic_count,
+            .checked_expression_count = expression_result.summary.checked_expression_count,
+            .prepared_issue_count = expression_result.summary.prepared_issue_count,
+            .checked_conversion_count = expression_result.summary.checked_conversion_count,
+            .rejected_conversion_count = expression_result.summary.rejected_conversion_count,
         },
+        .conversion_facts = expression_result.conversion_facts,
     };
     entry.value = value;
     entry.state = .complete;
@@ -761,7 +964,10 @@ pub fn expressionsByBody(active: *session.Session, body_id: session.BodyId) !Exp
 pub fn callablesByBody(active: *session.Session, body_id: session.BodyId) !CallableResult {
     var entry = &active.caches.callables[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.callables, body_id.index)) {
@@ -798,7 +1004,10 @@ pub fn callablesByBody(active: *session.Session, body_id: session.BodyId) !Calla
 pub fn patternsByBody(active: *session.Session, body_id: session.BodyId) !PatternResult {
     var entry = &active.caches.patterns[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.patterns, body_id.index)) {
@@ -813,14 +1022,17 @@ pub fn patternsByBody(active: *session.Session, body_id: session.BodyId) !Patter
     }
 
     const body = try checkedBody(active, body_id);
-    const pattern_summary = try pattern_checks.analyzeBody(active, body, &active.pipeline.diagnostics, satisfiesTrait);
+    const pattern_summary = try pattern_checks.analyzeBody(active, body, &active.pipeline.diagnostics, satisfiesTrait, checkedSignature, constById, resolveAssociatedConstIdentifier);
     const value = PatternResult{
         .body_id = body_id,
         .summary = .{
             .checked_subject_pattern_count = pattern_summary.checked_subject_pattern_count,
             .irrefutable_subject_pattern_count = pattern_summary.irrefutable_subject_pattern_count,
             .rejected_unreachable_pattern_count = pattern_summary.rejected_unreachable_pattern_count,
+            .rejected_non_exhaustive_pattern_count = pattern_summary.rejected_non_exhaustive_pattern_count,
             .rejected_structural_pattern_count = pattern_summary.rejected_structural_pattern_count,
+            .checked_constant_pattern_count = pattern_summary.checked_constant_pattern_count,
+            .rejected_constant_pattern_count = pattern_summary.rejected_constant_pattern_count,
             .checked_repeat_iteration_count = pattern_summary.checked_repeat_iteration_count,
             .rejected_repeat_iterable_count = pattern_summary.rejected_repeat_iterable_count,
         },
@@ -833,7 +1045,10 @@ pub fn patternsByBody(active: *session.Session, body_id: session.BodyId) !Patter
 pub fn sendByBody(active: *session.Session, body_id: session.BodyId) !SendResult {
     var entry = &active.caches.send[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.send, body_id.index)) {
@@ -870,7 +1085,10 @@ pub fn sendByBody(active: *session.Session, body_id: session.BodyId) !SendResult
 pub fn ownershipByBody(active: *session.Session, body_id: session.BodyId) !OwnershipResult {
     var entry = &active.caches.ownership[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.ownership, body_id.index)) {
@@ -955,7 +1173,10 @@ fn usesOwnedPackedCallableInput(parameters: []const typed.Parameter) bool {
 pub fn borrowByBody(active: *session.Session, body_id: session.BodyId) !BorrowResult {
     var entry = &active.caches.borrow[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.borrow, body_id.index)) {
@@ -972,7 +1193,12 @@ pub fn borrowByBody(active: *session.Session, body_id: session.BodyId) !BorrowRe
     const body = try checkedBody(active, body_id);
     const value = BorrowResult{
         .body_id = body_id,
-        .summary = try borrow.validateCheckedBody(body, &active.pipeline.diagnostics),
+        .summary = try borrow.validateCheckedBody(
+            active.allocator,
+            body,
+            CheckedCallableResolver{ .active = active, .module_id = body.module_id },
+            &active.pipeline.diagnostics,
+        ),
     };
     entry.value = value;
     entry.state = .complete;
@@ -982,7 +1208,10 @@ pub fn borrowByBody(active: *session.Session, body_id: session.BodyId) !BorrowRe
 pub fn lifetimesByBody(active: *session.Session, body_id: session.BodyId) !LifetimeResult {
     var entry = &active.caches.lifetimes[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.lifetimes, body_id.index)) {
@@ -1009,7 +1238,10 @@ pub fn lifetimesByBody(active: *session.Session, body_id: session.BodyId) !Lifet
 pub fn regionsByBody(active: *session.Session, body_id: session.BodyId) !RegionResult {
     var entry = &active.caches.regions[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.regions, body_id.index)) {
@@ -1036,7 +1268,10 @@ pub fn regionsByBody(active: *session.Session, body_id: session.BodyId) !RegionR
 pub fn domainStateByItem(active: *session.Session, item_id: session.ItemId) !DomainStateItemResult {
     var entry = &active.caches.domain_state_items[item_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.domain_state_item, item_id.index)) {
@@ -1063,7 +1298,10 @@ pub fn domainStateByItem(active: *session.Session, item_id: session.ItemId) !Dom
 pub fn domainStateByBody(active: *session.Session, body_id: session.BodyId) !DomainStateBodyResult {
     var entry = &active.caches.domain_state_bodies[body_id.index];
     if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
-    if (entry.state == .in_progress) return error.QueryCycle;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
 
     entry.state = .in_progress;
     if (!try active.pushActiveQuery(.domain_state_body, body_id.index)) {
@@ -1131,6 +1369,16 @@ fn resolveConstIdentifier(active: *session.Session, module_id: session.ModuleId,
     return (try constById(active, const_id)).value;
 }
 
+fn resolveAssociatedConstIdentifier(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    owner_name: []const u8,
+    const_name: []const u8,
+) !const_ir.Value {
+    const associated_const_id = try findAssociatedConstIdInModule(active, module_id, owner_name, const_name);
+    return (try associatedConstById(active, associated_const_id)).value;
+}
+
 fn findConstIdInModule(active: *const session.Session, module_id: session.ModuleId, name: []const u8) ?session.ConstId {
     for (active.semantic_index.consts.items, 0..) |const_entry, index| {
         const item_entry = active.semantic_index.itemEntry(const_entry.item_id);
@@ -1155,6 +1403,57 @@ fn findConstIdBySymbol(active: *const session.Session, symbol_name: []const u8) 
         if (std.mem.eql(u8, item.symbol_name, symbol_name)) return .{ .index = index };
     }
     return null;
+}
+
+fn findAssociatedConstIdInModule(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    owner_name: []const u8,
+    const_name: []const u8,
+) !session.AssociatedConstId {
+    var found: ?session.AssociatedConstId = null;
+    const owner_base = baseTypeName(owner_name);
+    for (active.semantic_index.associated_consts.items, 0..) |associated_entry, index| {
+        const item_entry = active.semantic_index.itemEntry(associated_entry.item_id);
+        if (item_entry.module_id.index != module_id.index) continue;
+        const signature = checkedSignature(active, associated_entry.item_id) catch |err| switch (err) {
+            error.CachedFailure, error.QueryCycle => continue,
+            else => return err,
+        };
+        const impl_block = switch (signature.facts) {
+            .impl_block => |impl_block| impl_block,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, baseTypeName(impl_block.target_type), owner_base)) continue;
+        if (associated_entry.associated_index >= impl_block.associated_consts.len) continue;
+        const binding = impl_block.associated_consts[associated_entry.associated_index];
+        if (!std.mem.eql(u8, binding.name, const_name)) continue;
+        if (found != null) return error.AmbiguousAssociatedConst;
+        found = .{ .index = index };
+    }
+
+    const module = active.module(module_id);
+    for (module.imports.items) |imported| {
+        if (!std.mem.eql(u8, imported.local_name, owner_base)) continue;
+        for (active.semantic_index.associated_consts.items, 0..) |associated_entry, index| {
+            const signature = checkedSignature(active, associated_entry.item_id) catch |err| switch (err) {
+                error.CachedFailure, error.QueryCycle => continue,
+                else => return err,
+            };
+            const impl_block = switch (signature.facts) {
+                .impl_block => |impl_block| impl_block,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, baseTypeName(impl_block.target_type), owner_base)) continue;
+            if (associated_entry.associated_index >= impl_block.associated_consts.len) continue;
+            const binding = impl_block.associated_consts[associated_entry.associated_index];
+            if (!std.mem.eql(u8, binding.name, const_name)) continue;
+            if (found != null) return error.AmbiguousAssociatedConst;
+            found = .{ .index = index };
+        }
+    }
+
+    return found orelse error.UnknownConst;
 }
 
 fn lookupTopLevel(active: *const session.Session, name: []const u8) ?resolve.Symbol {
@@ -1208,12 +1507,123 @@ fn reportConstEvalError(active: *session.Session, item: *const typed.Item, err: 
             "const '{s}' uses an invalid shift count during compile-time evaluation",
             .{item.name},
         ),
+        error.ConstIndexOutOfRange => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.index",
+            item.span,
+            "const '{s}' indexes outside a compile-time array value",
+            .{item.name},
+        ),
+        error.NegativeArrayLength => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.array_length_negative",
+            item.span,
+            "const '{s}' uses a negative compile-time array length",
+            .{item.name},
+        ),
         error.UnknownConst => try active.pipeline.diagnostics.add(
             .@"error",
             "type.const.unknown",
             item.span,
             "const '{s}' references an unknown const item",
             .{item.name},
+        ),
+        error.AmbiguousAssociatedConst => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.associated_ambiguous",
+            item.span,
+            "const '{s}' references an ambiguous associated const",
+            .{item.name},
+        ),
+        error.InvalidConversion => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.conversion",
+            item.span,
+            "const '{s}' uses an invalid compile-time conversion",
+            .{item.name},
+        ),
+        else => {},
+    }
+}
+
+fn reportAssociatedConstEvalError(active: *session.Session, item: *const typed.Item, associated_name: []const u8, err: anyerror) !void {
+    switch (err) {
+        error.QueryCycle => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.cycle",
+            item.span,
+            "associated const '{s}' participates in cyclic const evaluation",
+            .{associated_name},
+        ),
+        error.UnsupportedConstExpr => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.expr",
+            item.span,
+            "associated const '{s}' uses an unsupported const expression",
+            .{associated_name},
+        ),
+        error.ConstOverflow => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.overflow",
+            item.span,
+            "associated const '{s}' overflows during compile-time evaluation",
+            .{associated_name},
+        ),
+        error.DivideByZero => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.divide_by_zero",
+            item.span,
+            "associated const '{s}' divides by zero during compile-time evaluation",
+            .{associated_name},
+        ),
+        error.InvalidRemainder => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.invalid_remainder",
+            item.span,
+            "associated const '{s}' uses an invalid remainder operation during compile-time evaluation",
+            .{associated_name},
+        ),
+        error.InvalidShiftCount => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.invalid_shift",
+            item.span,
+            "associated const '{s}' uses an invalid shift count during compile-time evaluation",
+            .{associated_name},
+        ),
+        error.ConstIndexOutOfRange => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.index",
+            item.span,
+            "associated const '{s}' indexes outside a compile-time array value",
+            .{associated_name},
+        ),
+        error.NegativeArrayLength => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.array_length_negative",
+            item.span,
+            "associated const '{s}' uses a negative compile-time array length",
+            .{associated_name},
+        ),
+        error.UnknownConst => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.unknown",
+            item.span,
+            "associated const '{s}' references an unknown const item",
+            .{associated_name},
+        ),
+        error.AmbiguousAssociatedConst => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.associated_ambiguous",
+            item.span,
+            "associated const '{s}' references an ambiguous associated const",
+            .{associated_name},
+        ),
+        error.InvalidConversion => try active.pipeline.diagnostics.add(
+            .@"error",
+            "type.const.conversion",
+            item.span,
+            "associated const '{s}' uses an invalid compile-time conversion",
+            .{associated_name},
         ),
         else => {},
     }
@@ -1381,15 +1791,36 @@ fn signatureFactsForItem(allocator: Allocator, item: *const typed.Item) !query_t
             .where_predicates = trait_type.where_predicates,
             .methods = trait_type.methods,
             .associated_types = trait_type.associated_types,
+            .associated_consts = trait_type.associated_consts,
         } },
-        .impl_block => |*impl_block| .{ .impl_block = .{
-            .generic_params = impl_block.generic_params,
-            .where_predicates = impl_block.where_predicates,
-            .target_type = impl_block.target_type,
-            .trait_name = impl_block.trait_name,
-            .associated_types = impl_block.associated_types,
-            .methods = impl_block.methods,
-        } },
+        .impl_block => |*impl_block| .{ .impl_block = try implSignatureForItem(allocator, impl_block) },
+    };
+}
+
+fn implSignatureForItem(allocator: Allocator, impl_block: *const typed.ImplData) !query_types.ImplSignature {
+    const associated_consts = try allocator.alloc(query_types.AssociatedConstBindingSignature, impl_block.associated_consts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (associated_consts[0..initialized]) |binding| {
+            if (binding.const_item.expr) |expr| const_ir.destroyExpr(allocator, expr);
+        }
+        allocator.free(associated_consts);
+    }
+    for (impl_block.associated_consts, 0..) |binding, index| {
+        associated_consts[index] = .{
+            .name = binding.name,
+            .const_item = try constSignatureForItem(allocator, &binding.const_data),
+        };
+        initialized += 1;
+    }
+    return .{
+        .generic_params = impl_block.generic_params,
+        .where_predicates = impl_block.where_predicates,
+        .target_type = impl_block.target_type,
+        .trait_name = impl_block.trait_name,
+        .associated_types = impl_block.associated_types,
+        .associated_consts = associated_consts,
+        .methods = impl_block.methods,
     };
 }
 
@@ -1410,6 +1841,7 @@ fn constSignatureForItem(allocator: Allocator, const_item: *const typed.ConstDat
     return .{
         .type_name = const_item.type_name,
         .ty = const_item.ty,
+        .type_ref = const_item.type_ref,
         .initializer_source = const_item.initializer_source,
         .expr = lowered,
         .lower_error = lower_error,

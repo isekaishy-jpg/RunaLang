@@ -196,11 +196,17 @@ fn lowerTraitBody(
     defer methods.deinit();
     var associated_types = array_list.Managed(ast.AssociatedTypeDeclSyntax).init(allocator);
     defer associated_types.deinit();
+    var associated_consts = array_list.Managed(ast.ConstSignatureSyntax).init(allocator);
+    errdefer {
+        for (associated_consts.items) |*const_item| const_item.deinit(allocator);
+    }
+    defer associated_consts.deinit();
 
     for (tree.childSlice(block_node)) |child| {
         switch (child) {
             .node => |node_id| switch (tree.nodeKind(node_id)) {
                 .associated_type_decl => try associated_types.append(lowerAssociatedType(file, tokens, tree, node_id)),
+                .const_item => try associated_consts.append(try lowerAssociatedConst(allocator, file, tokens, tree, node_id)),
                 .function_item, .suspend_function_item => try methods.append(try lowerMethodDecl(allocator, file, tokens, tree, node_id)),
                 else => {},
             },
@@ -211,6 +217,7 @@ fn lowerTraitBody(
     return .{
         .methods = try methods.toOwnedSlice(),
         .associated_types = try associated_types.toOwnedSlice(),
+        .associated_consts = try associated_consts.toOwnedSlice(),
     };
 }
 
@@ -225,11 +232,17 @@ fn lowerImplBody(
     defer methods.deinit();
     var associated_types = array_list.Managed(ast.AssociatedTypeDeclSyntax).init(allocator);
     defer associated_types.deinit();
+    var associated_consts = array_list.Managed(ast.ConstSignatureSyntax).init(allocator);
+    errdefer {
+        for (associated_consts.items) |*const_item| const_item.deinit(allocator);
+    }
+    defer associated_consts.deinit();
 
     for (tree.childSlice(block_node)) |child| {
         switch (child) {
             .node => |node_id| switch (tree.nodeKind(node_id)) {
                 .associated_type_decl => try associated_types.append(lowerAssociatedType(file, tokens, tree, node_id)),
+                .const_item => try associated_consts.append(try lowerAssociatedConst(allocator, file, tokens, tree, node_id)),
                 .function_item, .suspend_function_item => try methods.append(try lowerMethodDecl(allocator, file, tokens, tree, node_id)),
                 else => {},
             },
@@ -240,6 +253,37 @@ fn lowerImplBody(
     return .{
         .methods = try methods.toOwnedSlice(),
         .associated_types = try associated_types.toOwnedSlice(),
+        .associated_consts = try associated_consts.toOwnedSlice(),
+    };
+}
+
+fn lowerAssociatedConst(
+    allocator: Allocator,
+    file: *const source.File,
+    tokens: syntax.TokenStore,
+    tree: *const cst.Tree,
+    declaration_node: cst.NodeId,
+) !ast.ConstSignatureSyntax {
+    const header_node = try childNodeAt(tree, declaration_node, 0);
+    const signature_node = try childNodeAt(tree, header_node, 0);
+    return lowerConstSignature(allocator, file, tokens, tree, signature_node);
+}
+
+fn lowerConstSignature(
+    allocator: Allocator,
+    file: *const source.File,
+    tokens: syntax.TokenStore,
+    tree: *const cst.Tree,
+    signature_node: cst.NodeId,
+) !ast.ConstSignatureSyntax {
+    return .{
+        .name = spanTextForChildKind(file, tokens, tree, signature_node, .item_name),
+        .ty = spanTextForChildKind(file, tokens, tree, signature_node, .const_type),
+        .initializer = spanTextForChildKind(file, tokens, tree, signature_node, .const_initializer),
+        .initializer_expr = if (spanTextForChildKind(file, tokens, tree, signature_node, .const_initializer)) |initializer|
+            try body_syntax_lower.lowerStandaloneExprSyntax(allocator, initializer)
+        else
+            null,
     };
 }
 

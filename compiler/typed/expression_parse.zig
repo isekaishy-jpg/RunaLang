@@ -17,6 +17,8 @@ const ParameterMode = typed_decls.ParameterMode;
 const GenericParam = signatures.GenericParam;
 const WherePredicate = signatures.WherePredicate;
 const baseTypeName = typed_text.baseTypeName;
+const findMatchingDelimiter = typed_text.findMatchingDelimiter;
+const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const BoundaryType = type_support.BoundaryType;
 const boundaryAccessCompatible = type_support.boundaryAccessCompatible;
 const boundaryInnerTypeCompatible = type_support.boundaryInnerTypeCompatible;
@@ -322,8 +324,82 @@ fn ExprParser(
         unsafe_context: bool,
 
         fn parse(self: *@This()) anyerror!*Expr {
-            const expr = try self.parseLogicalOr();
+            const expr = try self.parseConversion();
             return self.finalizeBareFunctionValue(expr);
+        }
+
+        fn parseConversion(self: *@This()) anyerror!*Expr {
+            var expr = try self.parseLogicalOr();
+            while (self.peekIsIdentifier("as")) {
+                _ = self.advance();
+                const target = try self.parseConversionTarget();
+                if (target.mode == .explicit_checked) {
+                    const result_type_name = try std.fmt.allocPrint(self.allocator, "Result[{s}, ConvertError]", .{target.target_type_name});
+                    errdefer self.allocator.free(result_type_name);
+                    const converted = try self.makeExpr(.{ .named = result_type_name }, .{ .conversion = .{
+                        .operand = expr,
+                        .mode = target.mode,
+                        .target_type = target.target_type,
+                        .target_type_name = target.target_type_name,
+                    } });
+                    converted.owned_type_name = result_type_name;
+                    expr = converted;
+                    continue;
+                }
+                expr = try self.makeExpr(target.target_type, .{ .conversion = .{
+                    .operand = expr,
+                    .mode = target.mode,
+                    .target_type = target.target_type,
+                    .target_type_name = target.target_type_name,
+                } });
+            }
+            return expr;
+        }
+
+        const ConversionTarget = struct {
+            mode: typed_expr.ConversionMode,
+            target_type: types.TypeRef,
+            target_type_name: []const u8,
+        };
+
+        fn parseConversionTarget(self: *@This()) anyerror!ConversionTarget {
+            var mode = typed_expr.ConversionMode.explicit_infallible;
+            var target_token = self.advance();
+
+            if (target_token.kind == .identifier and std.mem.eql(u8, target_token.lexeme, "may")) {
+                mode = .explicit_checked;
+                if (self.peek().kind != .l_bracket) {
+                    try self.diagnostics.add(.@"error", "type.expr.conversion.syntax", self.span, "checked conversion requires may[Target]", .{});
+                    return .{
+                        .mode = mode,
+                        .target_type = .unsupported,
+                        .target_type_name = "Unsupported",
+                    };
+                }
+                _ = self.advance();
+                target_token = self.advance();
+                if (self.peek().kind == .r_bracket) {
+                    _ = self.advance();
+                } else {
+                    try self.diagnostics.add(.@"error", "type.expr.conversion.syntax", self.span, "checked conversion target must close with ']'", .{});
+                }
+            }
+
+            if (target_token.kind != .identifier) {
+                try self.diagnostics.add(.@"error", "type.expr.conversion.syntax", self.span, "conversion target must be a type name", .{});
+                return .{
+                    .mode = mode,
+                    .target_type = .unsupported,
+                    .target_type_name = "Unsupported",
+                };
+            }
+
+            const target_type = shallowTypeRefFromName(target_token.lexeme);
+            return .{
+                .mode = mode,
+                .target_type = target_type,
+                .target_type_name = target_type.displayName(),
+            };
         }
 
         fn parseLogicalOr(self: *@This()) anyerror!*Expr {
@@ -924,12 +1000,15 @@ fn ExprParser(
             switch (base_expr.node) {
                 .identifier => |base_name| {
                     if (findEnumPrototype(self.enum_prototypes, base_name)) |prototype| {
-                        defer {
+                        const variant = findEnumVariant(prototype, field_token.lexeme) orelse {
+                            if (!self.expected_type.isUnsupported()) {
+                                return self.makeExpr(self.expected_type, .{ .field = .{
+                                    .base = base_expr,
+                                    .field_name = field_token.lexeme,
+                                } });
+                            }
                             base_expr.deinit(self.allocator);
                             self.allocator.destroy(base_expr);
-                        }
-
-                        const variant = findEnumVariant(prototype, field_token.lexeme) orelse {
                             try self.diagnostics.add(.@"error", "type.enum.variant_unknown", self.span, "unknown variant '{s}' on enum '{s}'", .{
                                 field_token.lexeme,
                                 prototype.name,
@@ -938,16 +1017,24 @@ fn ExprParser(
                         };
 
                         switch (variant.payload) {
-                            .none => return self.makeExpr(.{ .named = prototype.name }, .{ .enum_variant = .{
-                                .enum_name = prototype.name,
-                                .enum_symbol = prototype.symbol_name,
-                                .variant_name = variant.name,
-                            } }),
+                            .none => {
+                                base_expr.deinit(self.allocator);
+                                self.allocator.destroy(base_expr);
+                                return self.makeExpr(.{ .named = prototype.name }, .{ .enum_variant = .{
+                                    .enum_name = prototype.name,
+                                    .enum_symbol = prototype.symbol_name,
+                                    .variant_name = variant.name,
+                                } });
+                            },
                             else => {
                                 if (self.peek().kind != .colon_colon) {
+                                    base_expr.deinit(self.allocator);
+                                    self.allocator.destroy(base_expr);
                                     try self.diagnostics.add(.@"error", "type.enum.variant_payload.invoke", self.span, "payload enum variants require immediate constructor invocation with ':: call'", .{});
                                     return self.makeExpr(.unsupported, .{ .identifier = field_token.lexeme });
                                 }
+                                base_expr.deinit(self.allocator);
+                                self.allocator.destroy(base_expr);
                                 return self.makeExpr(.unsupported, .{ .enum_constructor_target = .{
                                     .enum_name = prototype.name,
                                     .enum_symbol = prototype.symbol_name,
@@ -955,6 +1042,12 @@ fn ExprParser(
                                 } });
                             },
                         }
+                    }
+                    if (findStructPrototype(self.struct_prototypes, base_name) != null) {
+                        return self.makeExpr(self.expected_type, .{ .field = .{
+                            .base = base_expr,
+                            .field_name = field_token.lexeme,
+                        } });
                     }
                 },
                 else => {},
@@ -1012,11 +1105,28 @@ fn ExprParser(
 
         fn parseKeyedAccess(self: *@This(), base_expr: *Expr) anyerror!*Expr {
             _ = self.advance();
-            try self.skipDelimitedTokens(.l_bracket, .r_bracket, "parse.expr.keyed_access", "unterminated keyed access expression");
-            base_expr.deinit(self.allocator);
-            self.allocator.destroy(base_expr);
-            try self.diagnostics.add(.@"error", "type.expr.keyed_access.stage0", self.span, "stage0 does not yet implement keyed access expressions", .{});
-            return makeUnsupportedExpr(self.allocator);
+            const previous_expected = self.expected_type;
+            self.expected_type = types.TypeRef.fromBuiltin(.index);
+            const index_expr = try self.parseConversion();
+            self.expected_type = previous_expected;
+            if (self.peek().kind == .r_bracket) {
+                _ = self.advance();
+            } else {
+                try self.diagnostics.add(.@"error", "parse.expr.keyed_access", self.span, "unterminated keyed access expression", .{});
+            }
+            if (!index_expr.ty.eql(types.TypeRef.fromBuiltin(.index)) and !index_expr.ty.isUnsupported()) {
+                try self.diagnostics.add(.@"error", "type.expr.keyed_access.index", self.span, "keyed access requires an Index expression", .{});
+            }
+            const element_type = fixedArrayElementType(base_expr.ty) orelse blk: {
+                if (!base_expr.ty.isUnsupported()) {
+                    try self.diagnostics.add(.@"error", "type.expr.keyed_access.base", self.span, "keyed access requires a fixed array expression", .{});
+                }
+                break :blk types.TypeRef.unsupported;
+            };
+            return self.makeExpr(element_type, .{ .index = .{
+                .base = base_expr,
+                .index = index_expr,
+            } });
         }
 
         fn parseTupleExpression(self: *@This()) anyerror!*Expr {
@@ -1026,45 +1136,63 @@ fn ExprParser(
         }
 
         fn parseArrayLiteral(self: *@This()) anyerror!*Expr {
+            const array_type = self.expected_type;
+            const element_type = fixedArrayElementType(array_type) orelse types.TypeRef.unsupported;
             if (self.peek().kind == .r_bracket) {
                 _ = self.advance();
-                try self.diagnostics.add(.@"error", "type.expr.array.stage0", self.span, "stage0 does not yet implement array literals", .{});
-                return makeUnsupportedExpr(self.allocator);
+                if (element_type.isUnsupported()) {
+                    try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array literal requires a fixed array contextual type", .{});
+                }
+                const items = try self.allocator.alloc(*Expr, 0);
+                return self.makeExpr(if (element_type.isUnsupported()) .unsupported else array_type, .{ .array = .{ .items = items } });
             }
 
-            const first = try self.parseLogicalOr();
+            const previous_expected = self.expected_type;
+            self.expected_type = element_type;
+            const first = try self.parseConversion();
+            self.expected_type = previous_expected;
             if (self.peek().kind == .semicolon) {
                 _ = self.advance();
-                const length = try self.parseLogicalOr();
+                self.expected_type = types.TypeRef.fromBuiltin(.index);
+                const length = try self.parseConversion();
+                self.expected_type = previous_expected;
                 if (self.peek().kind == .r_bracket) {
                     _ = self.advance();
                 } else {
                     try self.diagnostics.add(.@"error", "parse.expr.array", self.span, "unterminated array literal", .{});
                 }
-                try self.diagnostics.add(.@"error", "type.expr.array.stage0", self.span, "stage0 does not yet implement array literals", .{});
-                return self.makeExpr(.unsupported, .{ .array_repeat = .{
+                const result_type = if (element_type.isUnsupported()) types.TypeRef.unsupported else array_type;
+                if (result_type.isUnsupported()) {
+                    try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array repetition requires a fixed array contextual type", .{});
+                }
+                return self.makeExpr(result_type, .{ .array_repeat = .{
                     .value = first,
                     .length = length,
                 } });
             }
 
-            first.deinit(self.allocator);
-            self.allocator.destroy(first);
+            var items = array_list.Managed(*Expr).init(self.allocator);
+            defer items.deinit();
+            try items.append(first);
 
             while (self.peek().kind == .comma) {
                 _ = self.advance();
                 if (self.peek().kind == .r_bracket) break;
-                const item = try self.parseLogicalOr();
-                item.deinit(self.allocator);
-                self.allocator.destroy(item);
+                self.expected_type = element_type;
+                const item = try self.parseConversion();
+                self.expected_type = previous_expected;
+                try items.append(item);
             }
             if (self.peek().kind == .r_bracket) {
                 _ = self.advance();
             } else {
                 try self.diagnostics.add(.@"error", "parse.expr.array", self.span, "unterminated array literal", .{});
             }
-            try self.diagnostics.add(.@"error", "type.expr.array.stage0", self.span, "stage0 does not yet implement array literals", .{});
-            return makeUnsupportedExpr(self.allocator);
+            const result_type = if (element_type.isUnsupported()) types.TypeRef.unsupported else array_type;
+            if (result_type.isUnsupported()) {
+                try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array literal requires a fixed array contextual type", .{});
+            }
+            return self.makeExpr(result_type, .{ .array = .{ .items = try items.toOwnedSlice() } });
         }
 
         fn parenSequenceHasTopLevelComma(self: *const @This()) bool {
@@ -1216,6 +1344,11 @@ fn ExprParser(
             if (self.index + 1 < self.tokens.len) self.index += 1;
             return token;
         }
+
+        fn peekIsIdentifier(self: *const @This(), expected: []const u8) bool {
+            const token = self.peek();
+            return token.kind == .identifier and std.mem.eql(u8, token.lexeme, expected);
+        }
     };
 }
 
@@ -1258,6 +1391,23 @@ fn usesOwnedPackedCallableInput(parameter_modes: []const ParameterMode) bool {
     return true;
 }
 
+fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
+    const raw = switch (ty) {
+        .named => |name| std.mem.trim(u8, name, " \t"),
+        else => return null,
+    };
+    if (!std.mem.startsWith(u8, raw, "[")) return null;
+    const close_index = findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
+    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t").len != 0) return null;
+    const inner = raw[1..close_index];
+    const separator = findTopLevelHeaderScalar(inner, ';') orelse return null;
+    const element_type = std.mem.trim(u8, inner[0..separator], " \t");
+    if (element_type.len == 0) return null;
+    const builtin = types.Builtin.fromName(element_type);
+    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+    return .{ .named = element_type };
+}
+
 const ExprTokenKind = enum {
     identifier,
     integer,
@@ -1297,6 +1447,51 @@ const ExprToken = struct {
     kind: ExprTokenKind,
     lexeme: []const u8,
 };
+
+pub fn parseExpressionText(
+    allocator: Allocator,
+    text: []const u8,
+    expected_type: types.TypeRef,
+    scope: anytype,
+    current_where_predicates: []const WherePredicate,
+    prototypes: anytype,
+    method_prototypes: anytype,
+    struct_prototypes: anytype,
+    enum_prototypes: anytype,
+    diagnostics: *diag.Bag,
+    span: source.Span,
+    suspend_context: bool,
+    unsafe_context: bool,
+) anyerror!*Expr {
+    var tokens = array_list.Managed(ExprToken).init(allocator);
+    defer tokens.deinit();
+    try appendRawExprTokens(&tokens, text);
+    try tokens.append(.{ .kind = .eof, .lexeme = "" });
+
+    const Parser = ExprParser(
+        @TypeOf(scope),
+        @TypeOf(prototypes),
+        @TypeOf(method_prototypes),
+        @TypeOf(struct_prototypes),
+        @TypeOf(enum_prototypes),
+    );
+    var parser = Parser{
+        .allocator = allocator,
+        .diagnostics = diagnostics,
+        .scope = scope,
+        .current_where_predicates = current_where_predicates,
+        .prototypes = prototypes,
+        .method_prototypes = method_prototypes,
+        .struct_prototypes = struct_prototypes,
+        .enum_prototypes = enum_prototypes,
+        .span = span,
+        .tokens = tokens.items,
+        .expected_type = expected_type,
+        .suspend_context = suspend_context,
+        .unsafe_context = unsafe_context,
+    };
+    return parser.parse();
+}
 
 pub fn parseExpressionSyntax(
     allocator: Allocator,
@@ -1500,4 +1695,94 @@ fn binaryOperatorTokenKind(raw: []const u8) ExprTokenKind {
 fn fieldTokenKind(raw: []const u8) ExprTokenKind {
     if (raw.len != 0 and raw[0] >= '0' and raw[0] <= '9') return .integer;
     return .identifier;
+}
+
+fn appendRawExprTokens(tokens: *array_list.Managed(ExprToken), text: []const u8) !void {
+    var index: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (std.ascii.isWhitespace(byte)) {
+            index += 1;
+            continue;
+        }
+        if (std.ascii.isAlphabetic(byte) or byte == '_') {
+            const start = index;
+            index += 1;
+            while (index < text.len and (std.ascii.isAlphanumeric(text[index]) or text[index] == '_' or text[index] == '\'')) : (index += 1) {}
+            try tokens.append(.{ .kind = .identifier, .lexeme = text[start..index] });
+            continue;
+        }
+        if (std.ascii.isDigit(byte)) {
+            const start = index;
+            index += 1;
+            while (index < text.len and (std.ascii.isAlphanumeric(text[index]) or text[index] == '_')) : (index += 1) {}
+            try tokens.append(.{ .kind = .integer, .lexeme = text[start..index] });
+            continue;
+        }
+        if (byte == '"') {
+            const start = index + 1;
+            index += 1;
+            while (index < text.len and text[index] != '"') : (index += 1) {
+                if (text[index] == '\\' and index + 1 < text.len) index += 1;
+            }
+            const end = index;
+            if (index < text.len) index += 1;
+            try tokens.append(.{ .kind = .string, .lexeme = text[start..end] });
+            continue;
+        }
+
+        if (index + 1 < text.len) {
+            const two = text[index .. index + 2];
+            const kind: ?ExprTokenKind = if (std.mem.eql(u8, two, "=="))
+                .eq_eq
+            else if (std.mem.eql(u8, two, "!="))
+                .bang_eq
+            else if (std.mem.eql(u8, two, "<="))
+                .lte
+            else if (std.mem.eql(u8, two, ">="))
+                .gte
+            else if (std.mem.eql(u8, two, "<<"))
+                .lt_lt
+            else if (std.mem.eql(u8, two, ">>"))
+                .gt_gt
+            else if (std.mem.eql(u8, two, "&&"))
+                .amp_amp
+            else if (std.mem.eql(u8, two, "||"))
+                .pipe_pipe
+            else if (std.mem.eql(u8, two, "::"))
+                .colon_colon
+            else
+                null;
+            if (kind) |token_kind| {
+                try tokens.append(.{ .kind = token_kind, .lexeme = two });
+                index += 2;
+                continue;
+            }
+        }
+
+        const kind: ExprTokenKind = switch (byte) {
+            '(' => .l_paren,
+            ')' => .r_paren,
+            '[' => .l_bracket,
+            ']' => .r_bracket,
+            ',' => .comma,
+            ';' => .semicolon,
+            '.' => .dot,
+            '+' => .plus,
+            '-' => .minus,
+            '*' => .star,
+            '/' => .slash,
+            '%' => .percent,
+            '~' => .tilde,
+            '&' => .amp,
+            '|' => .pipe,
+            '^' => .caret,
+            '!' => .bang,
+            '<' => .lt,
+            '>' => .gt,
+            else => .identifier,
+        };
+        try tokens.append(.{ .kind = kind, .lexeme = text[index .. index + 1] });
+        index += 1;
+    }
 }

@@ -29,7 +29,7 @@ Runa defines `Char` as the builtin Unicode scalar-value family.
 The first-wave explicit scalar conversion directions are:
 
 - `Char` -> `U32`
-- `U32` -> `Result[Char, CharError]`
+- `U32` -> `Result[Char, ConvertError]`
 
 No implicit conversion exists between `Char` and integer families.
 
@@ -95,6 +95,7 @@ Runa v1 does not include:
 ## Relationship To Other Specs
 
 - Scalar-family law is defined in `spec/scalars.md`.
+- General conversion forms are defined in `spec/conversions.md`.
 - Value and copy law is defined in `spec/value-semantics.md`.
 - Literal syntax is defined in `spec/literals.md`.
 - Text and UTF surfaces are defined in `spec/text-and-bytes.md`.

@@ -20,7 +20,7 @@ The first-wave transport families are:
 ## Direct API Transport
 
 - Direct API transport is a typed non-C boundary transport in one address space.
-- It may use direct calls, routed calls, or runtime-managed dispatch internally.
+- It may use direct calls, routed calls, or transport-managed dispatch internally.
 - It must still obey boundary-contract legality.
 - Same-process direct transport does not make borrows, references, views, or raw pointers boundary-safe in source law.
 
@@ -41,7 +41,9 @@ The first-wave transport families are:
 ## Capability Transport
 
 - Capability transport preserves capability identity without exposing hidden representation.
-- Capability transport is explicit and runtime-owned.
+- Capability transport is explicit and transport-owned.
+- A transport may use minimal compiler-runtime leaf hooks internally, but the
+  carrier model itself is not runtime-owned.
 - Source law continues to see the declared `#boundary[capability]` family, not an erased generic carrier.
 - Capability transport must not silently degrade into string ids or fabricated sentinel handles.
 
@@ -64,6 +66,7 @@ The first-wave transport families are:
 - Boundary kinds are defined in `spec/boundary-kinds.md`.
 - Boundary contracts are defined in `spec/boundary-contracts.md`.
 - Boundary runtime and toolchain surface is defined in `spec/boundary-runtime-surface.md`.
+- Compiler-private runtime leaf ownership is defined in `spec/runtime-leaf-and-observability.md`.
 - Handle law is defined in `spec/handles.md`.
 - Package and build law are defined in `spec/packages-and-build.md`.
 - Manifest and product law are defined in `spec/manifest-and-products.md`.
@@ -79,3 +82,4 @@ The compiler, runtime, or toolchain must reject:
 - silent fallback from one transport family to another with different observable contract
 - reflection-driven invoke-by-name treated as core transport law
 - silent downgrade of capability transport into untyped erased carriers
+- treating transport routing or carrier semantics as compiler-runtime-owned

@@ -154,7 +154,7 @@ These are not part of v1:
 - dedicated `Utf16` or `Utf16Buffer` literals
 - user-defined literal suffixes
 
-`Utf16` values are formed through explicit conversion and API surface from `spec/text-and-bytes.md`.
+`Utf16` values are formed through explicit conversion and API surface from `spec/text-and-bytes.md` and `spec/conversions.md`.
 
 ## Relationship To Other Specs
 

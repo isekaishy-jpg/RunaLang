@@ -83,13 +83,159 @@ fn emitConstDefinition(
     diagnostics: *diag.Bag,
 ) !void {
     try out.appendSlice("static const ");
-    try emitBuiltinTypeName(out, const_item.ty);
+    try emitValueTypeName(out, module, const_item.type_ref, diagnostics, item.span);
     try out.appendSlice(" ");
     try appendConstSymbol(out, item.symbol_name);
     try out.appendSlice(" = ");
-
-            try emitExpr(allocator, out, module, &.{}, const_item.expr, true, diagnostics, item.span);
+    try emitConstExpr(allocator, out, module, const_item.expr, diagnostics, item.span);
     try out.appendSlice(";\n");
+}
+
+fn emitConstExpr(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const mir.Module,
+    expr: *const mir.ConstExpr,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+) anyerror!void {
+    switch (expr.node) {
+        .literal => |value| try emitConstValue(allocator, out, value, diagnostics, span),
+        .const_ref => |name| {
+            if (findConstItem(module, name)) |target| {
+                try appendConstSymbol(out, target.symbol_name);
+            } else if (findImportedConst(module, name)) |binding| {
+                try appendConstSymbol(out, binding.target_symbol);
+            } else {
+                try diagnostics.add(.@"error", "codegen.const.ref", span, "stage0 const initializer references unknown const '{s}'", .{name});
+                return error.CodegenFailed;
+            }
+        },
+        .associated_const_ref => return emitUnsupportedConstExpr(diagnostics, span, "associated const reference"),
+        .enum_variant,
+        .enum_tag,
+        .enum_construct,
+        => return emitUnsupportedConstExpr(diagnostics, span, "enum const expression"),
+        .constructor => |constructor| {
+            try out.appendSlice("{");
+            for (constructor.args, 0..) |arg, index| {
+                if (index != 0) try out.appendSlice(", ");
+                try emitConstExpr(allocator, out, module, arg, diagnostics, span);
+            }
+            try out.appendSlice("}");
+        },
+        .field => |field| {
+            try out.appendSlice("(");
+            try emitConstExpr(allocator, out, module, field.base, diagnostics, span);
+            try out.appendSlice(".");
+            try out.appendSlice(field.field_name);
+            try out.appendSlice(")");
+        },
+        .array => |array| {
+            try out.appendSlice("{");
+            for (array.items, 0..) |item, index| {
+                if (index != 0) try out.appendSlice(", ");
+                try emitConstExpr(allocator, out, module, item, diagnostics, span);
+            }
+            try out.appendSlice("}");
+        },
+        .array_repeat => return emitUnsupportedConstExpr(diagnostics, span, "array repetition const expression"),
+        .index => |index| {
+            try out.appendSlice("(");
+            try emitConstExpr(allocator, out, module, index.base, diagnostics, span);
+            try out.appendSlice("[");
+            try emitConstExpr(allocator, out, module, index.index, diagnostics, span);
+            try out.appendSlice("])");
+        },
+        .conversion => |conversion| {
+            if (conversion.mode == .explicit_checked) return emitUnsupportedConstExpr(diagnostics, span, "checked conversion const expression");
+            try out.appendSlice("((");
+            try out.appendSlice(conversion.target_type.cName());
+            try out.appendSlice(")");
+            try emitConstExpr(allocator, out, module, conversion.operand, diagnostics, span);
+            try out.appendSlice(")");
+        },
+        .unary => |unary| {
+            try out.appendSlice("(");
+            try out.appendSlice(switch (unary.op) {
+                .bool_not => "!",
+                .negate => "-",
+                .bit_not => "~",
+            });
+            try emitConstExpr(allocator, out, module, unary.operand, diagnostics, span);
+            try out.appendSlice(")");
+        },
+        .binary => |binary| {
+            try out.appendSlice("(");
+            try emitConstExpr(allocator, out, module, binary.lhs, diagnostics, span);
+            try out.appendSlice(" ");
+            try out.appendSlice(switch (binary.op) {
+                .add => "+",
+                .sub => "-",
+                .mul => "*",
+                .div => "/",
+                .mod => "%",
+                .shl => "<<",
+                .shr => ">>",
+                .eq => "==",
+                .ne => "!=",
+                .lt => "<",
+                .lte => "<=",
+                .gt => ">",
+                .gte => ">=",
+                .bit_and => "&",
+                .bit_xor => "^",
+                .bit_or => "|",
+                .bool_and => "&&",
+                .bool_or => "||",
+            });
+            try out.appendSlice(" ");
+            try emitConstExpr(allocator, out, module, binary.rhs, diagnostics, span);
+            try out.appendSlice(")");
+        },
+    }
+}
+
+fn emitUnsupportedConstExpr(diagnostics: *diag.Bag, span: ?source.Span, label: []const u8) anyerror!void {
+    try diagnostics.add(.@"error", "codegen.const.expr", span, "C codegen does not support {s}", .{label});
+    return error.CodegenFailed;
+}
+
+fn emitConstValue(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    value: mir.ConstValue,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+) anyerror!void {
+    switch (value) {
+        .bool => |bool_value| try out.appendSlice(if (bool_value) "true" else "false"),
+        .i32 => |int_value| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{int_value});
+            defer allocator.free(rendered);
+            try out.appendSlice(rendered);
+        },
+        .u32 => |int_value| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{int_value});
+            defer allocator.free(rendered);
+            try out.appendSlice(rendered);
+        },
+        .index => |int_value| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{int_value});
+            defer allocator.free(rendered);
+            try out.appendSlice(rendered);
+        },
+        .str => |string_value| try appendEscapedCString(out, string_value),
+        .array,
+        .aggregate,
+        .enum_value,
+        .unit,
+        .unsupported,
+        => {
+            try diagnostics.add(.@"error", "codegen.const.literal", span, "stage0 const initializer uses an unsupported literal", .{});
+            return error.CodegenFailed;
+        },
+    }
 }
 
 fn emitFunctionPrototype(
@@ -443,6 +589,36 @@ fn emitExpr(
             try emitExpr(allocator, out, module, parameter_context, field.base, global_const_context, diagnostics, span);
             try out.appendSlice(".");
             try out.appendSlice(field.field_name);
+            try out.appendSlice(")");
+        },
+        .array => |array| {
+            try out.appendSlice("{");
+            for (array.items, 0..) |item, index| {
+                if (index != 0) try out.appendSlice(", ");
+                try emitExpr(allocator, out, module, parameter_context, item, global_const_context, diagnostics, span);
+            }
+            try out.appendSlice("}");
+        },
+        .array_repeat => {
+            try diagnostics.add(.@"error", "codegen.array.repeat", span, "stage0 codegen does not emit array repetition expressions", .{});
+            return error.CodegenFailed;
+        },
+        .index => |index| {
+            try out.appendSlice("(");
+            try emitExpr(allocator, out, module, parameter_context, index.base, global_const_context, diagnostics, span);
+            try out.appendSlice("[");
+            try emitExpr(allocator, out, module, parameter_context, index.index, global_const_context, diagnostics, span);
+            try out.appendSlice("])");
+        },
+        .conversion => |conversion| {
+            if (conversion.mode == .explicit_checked) {
+                try diagnostics.add(.@"error", "codegen.conversion.checked", span, "stage0 codegen does not emit checked conversion expressions", .{});
+                return error.CodegenFailed;
+            }
+            try out.appendSlice("((");
+            try emitValueTypeName(out, module, conversion.target_type, diagnostics, span);
+            try out.appendSlice(")");
+            try emitExpr(allocator, out, module, parameter_context, conversion.operand, global_const_context, diagnostics, span);
             try out.appendSlice(")");
         },
         .unary => |unary| {

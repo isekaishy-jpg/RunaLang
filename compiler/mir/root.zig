@@ -1,5 +1,6 @@
 const std = @import("std");
 const array_list = std.array_list;
+const const_ir = @import("../query/const_ir.zig");
 const query_types = @import("../query/types.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
@@ -10,7 +11,10 @@ pub const requires_ownership_validation = true;
 
 pub const BinaryOp = typed.BinaryOp;
 pub const UnaryOp = typed.UnaryOp;
+pub const ConversionMode = typed.ConversionMode;
 pub const ImportedBinding = typed.ImportedBinding;
+pub const ConstExpr = const_ir.Expr;
+pub const ConstValue = const_ir.Value;
 
 pub const Expr = struct {
     ty: types.TypeRef,
@@ -28,6 +32,10 @@ pub const Expr = struct {
         call: Call,
         constructor: Constructor,
         field: Field,
+        array: Array,
+        array_repeat: ArrayRepeat,
+        index: Index,
+        conversion: Conversion,
         unary: Unary,
         binary: Binary,
     };
@@ -59,6 +67,27 @@ pub const Expr = struct {
     pub const Field = struct {
         base: *Expr,
         field_name: []const u8,
+    };
+
+    pub const Array = struct {
+        items: []*Expr,
+    };
+
+    pub const ArrayRepeat = struct {
+        value: *Expr,
+        length: *Expr,
+    };
+
+    pub const Index = struct {
+        base: *Expr,
+        index: *Expr,
+    };
+
+    pub const Conversion = struct {
+        operand: *Expr,
+        mode: ConversionMode,
+        target_type: types.TypeRef,
+        target_type_name: []const u8,
     };
 
     pub const Binary = struct {
@@ -98,6 +127,29 @@ pub const Expr = struct {
             .field => |field| {
                 field.base.deinit(allocator);
                 allocator.destroy(field.base);
+            },
+            .array => |array| {
+                for (array.items) |item| {
+                    item.deinit(allocator);
+                    allocator.destroy(item);
+                }
+                allocator.free(array.items);
+            },
+            .array_repeat => |array_repeat| {
+                array_repeat.value.deinit(allocator);
+                allocator.destroy(array_repeat.value);
+                array_repeat.length.deinit(allocator);
+                allocator.destroy(array_repeat.length);
+            },
+            .index => |index| {
+                index.base.deinit(allocator);
+                allocator.destroy(index.base);
+                index.index.deinit(allocator);
+                allocator.destroy(index.index);
+            },
+            .conversion => |conversion| {
+                conversion.operand.deinit(allocator);
+                allocator.destroy(conversion.operand);
             },
             .unary => |unary| {
                 unary.operand.deinit(allocator);
@@ -278,11 +330,11 @@ pub const FunctionData = struct {
 
 pub const ConstData = struct {
     ty: types.Builtin,
-    expr: *Expr,
+    type_ref: types.TypeRef,
+    expr: *const ConstExpr,
 
     fn deinit(self: *ConstData, allocator: Allocator) void {
-        self.expr.deinit(allocator);
-        allocator.destroy(self.expr);
+        const_ir.destroyExpr(allocator, self.expr);
     }
 };
 
@@ -401,7 +453,12 @@ pub const Module = struct {
     }
 };
 
-fn lowerModuleWithBodies(allocator: Allocator, module: typed.Module, checked_bodies: []const query_types.CheckedBody) !Module {
+fn lowerModuleWithFacts(
+    allocator: Allocator,
+    module: typed.Module,
+    checked_signatures: []const query_types.CheckedSignature,
+    checked_bodies: []const query_types.CheckedBody,
+) !Module {
     var mir_module = Module.init(allocator, module.file_id, try allocator.dupe(u8, module.module_path));
     errdefer mir_module.deinit();
 
@@ -422,7 +479,8 @@ fn lowerModuleWithBodies(allocator: Allocator, module: typed.Module, checked_bod
         });
     }
 
-    for (module.items.items) |item| {
+    for (checked_signatures) |checked_signature| {
+        const item = checked_signature.item;
         var mir_item = Item{
             .name = item.name,
             .symbol_name = item.symbol_name,
@@ -435,7 +493,7 @@ fn lowerModuleWithBodies(allocator: Allocator, module: typed.Module, checked_bod
 
         switch (item.payload) {
             .function => |function| {
-                const checked_body = findCheckedBody(checked_bodies, item.symbol_name) orelse return error.MissingCheckedBody;
+                const checked_body = findCheckedBodyByItemId(checked_bodies, checked_signature.item_id) orelse return error.MissingCheckedBody;
                 const parameters = checked_body.parameters;
 
                 const params = try allocator.alloc(Parameter, parameters.len);
@@ -460,11 +518,16 @@ fn lowerModuleWithBodies(allocator: Allocator, module: typed.Module, checked_bod
                     .foreign = function.foreign,
                 } };
             },
-            .const_item => |const_item| {
-                const expr = const_item.expr orelse return error.InvalidMirLowering;
+            .const_item => {
+                const const_signature = switch (checked_signature.facts) {
+                    .const_item => |const_item| const_item,
+                    else => return error.InvalidMirLowering,
+                };
+                const expr = const_signature.expr orelse return error.InvalidMirLowering;
                 mir_item.payload = .{ .const_item = .{
-                    .ty = const_item.ty,
-                    .expr = try cloneTypedExpr(allocator, expr),
+                    .ty = const_signature.ty,
+                    .type_ref = const_signature.type_ref,
+                    .expr = try cloneConstExpr(allocator, expr),
                 } };
             },
             .struct_type => |struct_type| {
@@ -528,24 +591,34 @@ fn lowerModuleWithBodies(allocator: Allocator, module: typed.Module, checked_bod
     return mir_module;
 }
 
-pub fn lowerModuleFromCheckedBodies(allocator: Allocator, module: typed.Module, checked_bodies: anytype) !Module {
-    for (module.items.items) |item| {
-        if (item.payload != .function) continue;
-        var found = false;
-        for (checked_bodies) |body| {
-            if (!std.mem.eql(u8, body.item.symbol_name, item.symbol_name)) continue;
-            found = true;
-            break;
+pub fn lowerModuleFromCheckedFacts(
+    allocator: Allocator,
+    module: typed.Module,
+    checked_signatures: anytype,
+    checked_bodies: anytype,
+) !Module {
+    for (checked_signatures) |checked_signature| {
+        switch (checked_signature.item.payload) {
+            .function => {
+                if (findCheckedBodyByItemId(checked_bodies, checked_signature.item_id) == null) return error.MissingCheckedBody;
+            },
+            .const_item => {
+                const const_signature = switch (checked_signature.facts) {
+                    .const_item => |const_item| const_item,
+                    else => return error.InvalidMirLowering,
+                };
+                if (const_signature.expr == null) return error.InvalidMirLowering;
+            },
+            else => {},
         }
-        if (!found) return error.MissingCheckedBody;
     }
 
-    return lowerModuleWithBodies(allocator, module, checked_bodies);
+    return lowerModuleWithFacts(allocator, module, checked_signatures, checked_bodies);
 }
 
-fn findCheckedBody(checked_bodies: []const query_types.CheckedBody, symbol_name: []const u8) ?query_types.CheckedBody {
+fn findCheckedBodyByItemId(checked_bodies: []const query_types.CheckedBody, item_id: @import("../session/ids.zig").ItemId) ?query_types.CheckedBody {
     for (checked_bodies) |body| {
-        if (std.mem.eql(u8, body.item.symbol_name, symbol_name)) return body;
+        if (body.item_id.index == item_id.index) return body;
     }
     return null;
 }
@@ -603,7 +676,8 @@ pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Modul
                 .const_item => |const_item| {
                     merged_item.payload = .{ .const_item = .{
                         .ty = const_item.ty,
-                        .expr = try cloneExpr(allocator, const_item.expr),
+                        .type_ref = const_item.type_ref,
+                        .expr = try cloneConstExpr(allocator, const_item.expr),
                     } };
                 },
                 .struct_type => |struct_type| {
@@ -907,10 +981,31 @@ fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
             } };
         },
         .method_target => return error.InvalidMirLowering,
-        .array_repeat => return error.InvalidMirLowering,
         .field => |field| .{ .field = .{
             .base = try cloneTypedExpr(allocator, field.base),
             .field_name = field.field_name,
+        } },
+        .array => |array| blk: {
+            const items = try allocator.alloc(*Expr, array.items.len);
+            errdefer allocator.free(items);
+            for (array.items, 0..) |item, index| {
+                items[index] = try cloneTypedExpr(allocator, item);
+            }
+            break :blk .{ .array = .{ .items = items } };
+        },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneTypedExpr(allocator, array_repeat.value),
+            .length = try cloneTypedExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneTypedExpr(allocator, index.base),
+            .index = try cloneTypedExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneTypedExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = conversion.target_type,
+            .target_type_name = conversion.target_type_name,
         } },
         .unary => |unary| .{ .unary = .{
             .op = unary.op,
@@ -979,6 +1074,28 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
             .base = try cloneExpr(allocator, field.base),
             .field_name = field.field_name,
         } },
+        .array => |array| blk: {
+            const items = try allocator.alloc(*Expr, array.items.len);
+            errdefer allocator.free(items);
+            for (array.items, 0..) |item, index| {
+                items[index] = try cloneExpr(allocator, item);
+            }
+            break :blk .{ .array = .{ .items = items } };
+        },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneExpr(allocator, array_repeat.value),
+            .length = try cloneExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneExpr(allocator, index.base),
+            .index = try cloneExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = conversion.target_type,
+            .target_type_name = conversion.target_type_name,
+        } },
         .unary => |unary| .{ .unary = .{
             .op = unary.op,
             .operand = try cloneExpr(allocator, unary.operand),
@@ -991,6 +1108,95 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
     };
 
     return result;
+}
+
+fn cloneConstExpr(allocator: Allocator, expr: *const ConstExpr) anyerror!*ConstExpr {
+    const result = try allocator.create(ConstExpr);
+    var initialized = false;
+    errdefer {
+        if (initialized) {
+            const_ir.destroyExpr(allocator, result);
+        } else {
+            allocator.destroy(result);
+        }
+    }
+
+    result.result_type = expr.result_type;
+    result.node = switch (expr.node) {
+        .literal => |value| .{ .literal = try const_ir.cloneValue(allocator, value) },
+        .const_ref => |name| .{ .const_ref = name },
+        .associated_const_ref => |ref| .{ .associated_const_ref = .{
+            .owner_name = ref.owner_name,
+            .const_name = ref.const_name,
+        } },
+        .enum_variant => |variant| .{ .enum_variant = .{
+            .enum_name = variant.enum_name,
+            .variant_name = variant.variant_name,
+        } },
+        .enum_tag => |variant| .{ .enum_tag = .{
+            .enum_name = variant.enum_name,
+            .variant_name = variant.variant_name,
+        } },
+        .enum_construct => |construct| .{ .enum_construct = .{
+            .enum_name = construct.enum_name,
+            .variant_name = construct.variant_name,
+            .args = try cloneConstExprSlice(allocator, construct.args),
+        } },
+        .constructor => |constructor| .{ .constructor = .{
+            .type_name = constructor.type_name,
+            .args = try cloneConstExprSlice(allocator, constructor.args),
+        } },
+        .field => |field| .{ .field = .{
+            .base = try cloneConstExpr(allocator, field.base),
+            .field_name = field.field_name,
+        } },
+        .array => |array| .{ .array = .{
+            .items = try cloneConstExprSlice(allocator, array.items),
+        } },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneConstExpr(allocator, array_repeat.value),
+            .length = try cloneConstExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneConstExpr(allocator, index.base),
+            .index = try cloneConstExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneConstExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = conversion.target_type,
+        } },
+        .unary => |unary| .{ .unary = .{
+            .op = unary.op,
+            .operand = try cloneConstExpr(allocator, unary.operand),
+        } },
+        .binary => |binary| blk: {
+            const lhs = try cloneConstExpr(allocator, binary.lhs);
+            errdefer const_ir.destroyExpr(allocator, lhs);
+            const rhs = try cloneConstExpr(allocator, binary.rhs);
+            break :blk .{ .binary = .{
+                .op = binary.op,
+                .lhs = lhs,
+                .rhs = rhs,
+            } };
+        },
+    };
+    initialized = true;
+    return result;
+}
+
+fn cloneConstExprSlice(allocator: Allocator, exprs: []*ConstExpr) anyerror![]*ConstExpr {
+    const cloned = try allocator.alloc(*ConstExpr, exprs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |expr| const_ir.destroyExpr(allocator, expr);
+        allocator.free(cloned);
+    }
+    for (exprs, 0..) |expr, index| {
+        cloned[index] = try cloneConstExpr(allocator, expr);
+        initialized += 1;
+    }
+    return cloned;
 }
 
 fn duplicateImportedEnumVariants(allocator: Allocator, variants: []typed.EnumVariant) ![]typed.EnumVariant {

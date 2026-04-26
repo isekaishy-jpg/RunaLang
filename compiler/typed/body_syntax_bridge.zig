@@ -16,6 +16,7 @@ const TupleField = typed_decls.TupleField;
 const EnumVariant = typed_decls.EnumVariant;
 const TraitMethod = typed_decls.TraitMethod;
 const TraitAssociatedType = typed_decls.TraitAssociatedType;
+const TraitAssociatedConst = typed_decls.TraitAssociatedConst;
 const ParameterMode = typed_decls.ParameterMode;
 const isPlainIdentifier = typed_text.isPlainIdentifier;
 const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
@@ -23,11 +24,13 @@ const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 pub const ParsedTraitBody = struct {
     methods: []TraitMethod,
     associated_types: []TraitAssociatedType,
+    associated_consts: []TraitAssociatedConst,
 
     pub fn deinit(self: *ParsedTraitBody, allocator: Allocator) void {
         for (self.methods) |*method| method.deinit(allocator);
         allocator.free(self.methods);
         allocator.free(self.associated_types);
+        allocator.free(self.associated_consts);
     }
 };
 
@@ -176,6 +179,8 @@ pub fn parseTraitBodyFromSyntax(
     }
     var associated_types = std.array_list.Managed(TraitAssociatedType).init(allocator);
     errdefer associated_types.deinit();
+    var associated_consts = std.array_list.Managed(TraitAssociatedConst).init(allocator);
+    errdefer associated_consts.deinit();
 
     for (body.associated_types) |associated_type| {
         const name = associated_type.name orelse {
@@ -207,6 +212,49 @@ pub fn parseTraitBodyFromSyntax(
         try associated_types.append(.{ .name = name.text });
     }
 
+    for (body.associated_consts) |associated_const| {
+        const name = associated_const.name orelse {
+            try diagnostics.add(.@"error", "type.trait.associated_const", span, "malformed trait associated const", .{});
+            continue;
+        };
+        if (associated_const.initializer != null) {
+            try diagnostics.add(.@"error", "type.trait.associated_const_default", span, "trait associated const '{s}' cannot define a default in v1", .{name.text});
+            continue;
+        }
+        const type_text = associated_const.ty orelse {
+            try diagnostics.add(.@"error", "type.trait.associated_const", span, "trait associated const '{s}' requires an explicit type", .{name.text});
+            continue;
+        };
+
+        const name_text = std.mem.trim(u8, name.text, " \t");
+        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        if (!isPlainIdentifier(name_text) or type_name.len == 0) {
+            try diagnostics.add(.@"error", "type.trait.associated_const", span, "malformed trait associated const '{s}'", .{name.text});
+            continue;
+        }
+        var duplicate = false;
+        for (associated_consts.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name_text)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            try diagnostics.add(.@"error", "type.trait.associated_const_duplicate", span, "duplicate associated const '{s}' in trait '{s}'", .{
+                name_text,
+                item_name,
+            });
+            continue;
+        }
+        const builtin = types.Builtin.fromName(type_name);
+        try associated_consts.append(.{
+            .name = name_text,
+            .type_name = type_name,
+            .ty = builtin,
+            .type_ref = if (builtin == .unsupported) .{ .named = type_name } else types.TypeRef.fromBuiltin(builtin),
+        });
+    }
+
     for (body.methods) |method| {
         var lowered = try parseTraitMethodFromSyntax(allocator, inherited_generic_params, method, span, diagnostics);
         errdefer lowered.deinit(allocator);
@@ -232,6 +280,7 @@ pub fn parseTraitBodyFromSyntax(
     return .{
         .methods = try methods.toOwnedSlice(),
         .associated_types = try associated_types.toOwnedSlice(),
+        .associated_consts = try associated_consts.toOwnedSlice(),
     };
 }
 

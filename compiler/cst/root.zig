@@ -1685,6 +1685,7 @@ const Parser = struct {
         return switch (self.currentKind()) {
             .keyword_suspend => if (self.tokenKindAt(self.index + 1) == .keyword_fn) .suspend_function_item else null,
             .keyword_fn => .function_item,
+            .keyword_const => .const_item,
             else => null,
         };
     }
@@ -2138,7 +2139,7 @@ const ExprParser = struct {
                 continue;
             }
 
-            const precedence = infixPrecedence(self.currentKind()) orelse break;
+            const precedence = if (self.isAsOperator()) @as(u8, 5) else infixPrecedence(self.currentKind()) orelse break;
             if (precedence < min_precedence) break;
 
             const operator_index = self.index;
@@ -2418,6 +2419,11 @@ const ExprParser = struct {
         if (index >= self.end) return .eof;
         return self.parser.tokenKindAt(index);
     }
+
+    fn isAsOperator(self: *const ExprParser) bool {
+        if (self.currentKind() != .identifier) return false;
+        return std.mem.eql(u8, self.parser.tokens.get(self.index).lexeme, "as");
+    }
 };
 
 fn infixPrecedence(kind: syntax.TokenKind) ?u8 {
@@ -2523,8 +2529,18 @@ test "structured CST classifies top-level declarations and preserves token cover
     const header = try firstChildNode(&tree, declaration, 0);
     const signature = try firstChildNode(&tree, header, 0);
     const signature_children = tree.childSlice(signature);
-    try std.testing.expectEqual(NodeKind.visibility, tree.nodes[@intFromEnum(switch (signature_children[0]) { .node => |node_id| node_id, else => return error.UnexpectedStructure })].kind);
-    try std.testing.expectEqual(NodeKind.item_name, tree.nodes[@intFromEnum(switch (signature_children[3]) { .node => |node_id| node_id, else => return error.UnexpectedStructure })].kind);
+    try std.testing.expectEqual(NodeKind.visibility, tree.nodes[
+        @intFromEnum(switch (signature_children[0]) {
+            .node => |node_id| node_id,
+            else => return error.UnexpectedStructure,
+        })
+    ].kind);
+    try std.testing.expectEqual(NodeKind.item_name, tree.nodes[
+        @intFromEnum(switch (signature_children[3]) {
+            .node => |node_id| node_id,
+            else => return error.UnexpectedStructure,
+        })
+    ].kind);
 }
 
 test "structured CST groups where clauses and nested blocks" {
@@ -2892,7 +2908,7 @@ test "structured CST parses trait and impl members" {
 
     const file_id = try table.addVirtualFile(
         "traits.rna",
-        "trait Iterator:\n    type Item\n    fn next(edit self) -> Option[Self.Item]\n    fn reset(edit self) -> Unit\n    where Self: Clone:\n        return self.state\n\nimpl Iterator for Cursor:\n    type Item = Str\n    fn next(edit self) -> Option[Self.Item]:\n        return self.value\n",
+        "trait Iterator:\n    type Item\n    const LIMIT: Index\n    fn next(edit self) -> Option[Self.Item]\n    fn reset(edit self) -> Unit\n    where Self: Clone:\n        return self.state\n\nimpl Iterator for Cursor:\n    type Item = Str\n    const LIMIT: Index = 4\n    fn next(edit self) -> Option[Self.Item]:\n        return self.value\n",
     );
     const file = table.get(file_id);
 
@@ -2909,9 +2925,11 @@ test "structured CST parses trait and impl members" {
     const trait_decl = try firstChildNode(&tree, trait_item, 0);
     const trait_block = try firstChildNode(&tree, trait_decl, 1);
     const assoc_type = try firstChildNode(&tree, trait_block, 1);
-    const method = try firstChildNode(&tree, trait_block, 2);
-    const default_method = try firstChildNode(&tree, trait_block, 3);
+    const assoc_const = try firstChildNode(&tree, trait_block, 2);
+    const method = try firstChildNode(&tree, trait_block, 3);
+    const default_method = try firstChildNode(&tree, trait_block, 4);
     try std.testing.expectEqual(NodeKind.associated_type_decl, tree.nodes[@intFromEnum(assoc_type)].kind);
+    try std.testing.expectEqual(NodeKind.const_item, tree.nodes[@intFromEnum(assoc_const)].kind);
     try std.testing.expectEqual(NodeKind.function_item, tree.nodes[@intFromEnum(method)].kind);
     try std.testing.expectEqual(NodeKind.function_item, tree.nodes[@intFromEnum(default_method)].kind);
 
@@ -2927,8 +2945,10 @@ test "structured CST parses trait and impl members" {
     const impl_decl = try firstChildNode(&tree, impl_item, 0);
     const impl_block = try firstChildNode(&tree, impl_decl, 1);
     const impl_assoc = try firstChildNode(&tree, impl_block, 1);
-    const impl_method = try firstChildNode(&tree, impl_block, 2);
+    const impl_assoc_const = try firstChildNode(&tree, impl_block, 2);
+    const impl_method = try firstChildNode(&tree, impl_block, 3);
     try std.testing.expectEqual(NodeKind.associated_type_decl, tree.nodes[@intFromEnum(impl_assoc)].kind);
+    try std.testing.expectEqual(NodeKind.const_item, tree.nodes[@intFromEnum(impl_assoc_const)].kind);
     try std.testing.expectEqual(NodeKind.function_item, tree.nodes[@intFromEnum(impl_method)].kind);
 }
 

@@ -37,6 +37,8 @@ pub const OpaqueTypeData = typed_decls.OpaqueTypeData;
 pub const TraitMethod = typed_decls.TraitMethod;
 pub const TraitAssociatedType = typed_decls.TraitAssociatedType;
 pub const TraitAssociatedTypeBinding = typed_decls.TraitAssociatedTypeBinding;
+pub const TraitAssociatedConst = typed_decls.TraitAssociatedConst;
+pub const TraitAssociatedConstBinding = typed_decls.TraitAssociatedConstBinding;
 pub const TraitData = typed_decls.TraitData;
 pub const ImplData = typed_decls.ImplData;
 pub const GenericParam = signatures.GenericParam;
@@ -80,10 +82,17 @@ pub fn validateSimpleTypeName(name: []const u8, context: anytype, span: source.S
         return;
     }
     if (types.Builtin.fromName(name) != .unsupported) return;
+    if (isCompilerKnownNominalType(name)) return;
     if (contextAllowSelf(context) and std.mem.eql(u8, name, "Self")) return;
     if (genericParamExists(contextGenericParams(context), name, .type_param)) return;
     if (context.type_scope.contains(name)) return;
     try diagnostics.add(.@"error", "type.name.unknown_type", span, "unknown type name '{s}'", .{name});
+}
+
+fn isCompilerKnownNominalType(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Option") or
+        std.mem.eql(u8, name, "Result") or
+        std.mem.eql(u8, name, "ConvertError");
 }
 
 pub fn validateTypeExpression(raw: []const u8, context: anytype, span: source.Span, diagnostics: *diag.Bag) !void {
@@ -98,7 +107,7 @@ pub fn validateTypeExpression(raw: []const u8, context: anytype, span: source.Sp
             try diagnostics.add(.@"error", "type.lifetime.syntax", span, "malformed retained-borrow syntax '{s}'", .{trimmed});
             return;
         };
-        const lifetime_name = std.mem.trim(u8, trimmed["hold[".len .. close_index], " \t");
+        const lifetime_name = std.mem.trim(u8, trimmed["hold[".len..close_index], " \t");
         try validateLifetimeReference(lifetime_name, contextGenericParams(context), span, diagnostics);
 
         const rest = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t");
@@ -330,6 +339,7 @@ pub fn parseTraitDeclaration(allocator: Allocator, item: hir.Item, diagnostics: 
                 .where_predicates = where_predicates,
                 .methods = parsed_body.methods,
                 .associated_types = parsed_body.associated_types,
+                .associated_consts = parsed_body.associated_consts,
             };
         },
         .none => .{
@@ -337,6 +347,7 @@ pub fn parseTraitDeclaration(allocator: Allocator, item: hir.Item, diagnostics: 
             .where_predicates = where_predicates,
             .methods = try allocator.alloc(TraitMethod, 0),
             .associated_types = try allocator.alloc(TraitAssociatedType, 0),
+            .associated_consts = try allocator.alloc(TraitAssociatedConst, 0),
         },
         else => error.InvalidParse,
     };
@@ -359,6 +370,7 @@ pub fn parseImplDeclaration(allocator: Allocator, item: hir.Item, diagnostics: *
                 .target_type = target_type,
                 .trait_name = trait_name,
                 .associated_types = try parseImplAssociatedTypes(allocator, body.associated_types, item.span, diagnostics),
+                .associated_consts = try parseImplAssociatedConsts(allocator, body.associated_consts, item.span, diagnostics),
                 .methods = try body_syntax_bridge.parseImplMethodsFromSyntax(allocator, generic_params, body, item.span, diagnostics),
             };
         },
@@ -368,6 +380,7 @@ pub fn parseImplDeclaration(allocator: Allocator, item: hir.Item, diagnostics: *
             .target_type = target_type,
             .trait_name = trait_name,
             .associated_types = try allocator.alloc(TraitAssociatedTypeBinding, 0),
+            .associated_consts = try allocator.alloc(TraitAssociatedConstBinding, 0),
             .methods = try allocator.alloc(TraitMethod, 0),
         },
         else => error.InvalidParse,
@@ -416,6 +429,62 @@ fn parseImplAssociatedTypes(
             .name = name_text,
             .value_type_name = value_text,
             .value_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(value_text)),
+        });
+    }
+
+    return lowered.toOwnedSlice();
+}
+
+fn parseImplAssociatedConsts(
+    allocator: Allocator,
+    associated_consts: []const ast.ConstSignatureSyntax,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) ![]TraitAssociatedConstBinding {
+    var lowered = array_list.Managed(TraitAssociatedConstBinding).init(allocator);
+    errdefer {
+        for (lowered.items) |*binding| binding.deinit(allocator);
+        lowered.deinit();
+    }
+
+    for (associated_consts) |associated_const| {
+        const name = associated_const.name orelse {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding", .{});
+            continue;
+        };
+        const type_text = associated_const.ty orelse {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "impl associated const '{s}' requires an explicit type", .{name.text});
+            continue;
+        };
+        if (associated_const.initializer == null) {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "impl associated const '{s}' requires a const initializer", .{name.text});
+            continue;
+        }
+
+        const name_text = std.mem.trim(u8, name.text, " \t");
+        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        if (!isPlainIdentifier(name_text) or type_name.len == 0) {
+            try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding '{s}'", .{name.text});
+            continue;
+        }
+
+        var duplicate = false;
+        for (lowered.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name_text)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            try diagnostics.add(.@"error", "type.impl.associated_const_duplicate", span, "duplicate associated const binding '{s}' in impl", .{name_text});
+            continue;
+        }
+
+        var const_data = try item_syntax_bridge.parseConstDataFromSyntax(allocator, associated_const, span, diagnostics);
+        errdefer const_data.deinit(allocator);
+        try lowered.append(.{
+            .name = name_text,
+            .const_data = const_data,
         });
     }
 
@@ -1112,6 +1181,9 @@ pub fn validateImplBlock(module: anytype, impl_block: *const ImplData, type_scop
     }
     for (impl_block.associated_types) |binding| {
         try validateTypeExpression(binding.value_type_name, context, span, diagnostics);
+    }
+    for (impl_block.associated_consts) |binding| {
+        try validateTypeExpression(binding.const_data.type_name, context, span, diagnostics);
     }
     try validateWherePredicates(module, impl_block.where_predicates, context, span, diagnostics);
 }

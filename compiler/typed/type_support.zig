@@ -114,6 +114,7 @@ pub fn inferExprBoundaryTypeInScope(scope: anytype, expr: *const Expr) BoundaryT
         .identifier => |name| scope.getOrigin(name) orelse direct,
         .field => |field| inheritBoundaryFromBase(scope, field.base, current_inner),
         .method_target => |target| inheritBoundaryFromBase(scope, target.base, current_inner),
+        .index => |index| inheritBoundaryFromBase(scope, index.base, current_inner),
         else => direct,
     };
 }

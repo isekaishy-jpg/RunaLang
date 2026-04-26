@@ -18,6 +18,7 @@ The accepted v1 pattern families are:
 - binding pattern:
   - `name`
 - literal pattern
+- constant pattern
 - exact tuple pattern
 - exact struct pattern
 - enum variant pattern
@@ -43,8 +44,9 @@ select value:
 ## Literal Patterns
 
 - Literal patterns compare against one exact literal value.
-- Literal patterns do not perform implicit conversion.
-- Literal-pattern compatibility follows the literal and scalar rules already accepted elsewhere.
+- Literal patterns are one kind of constant pattern.
+- Literal-pattern typing follows literal, scalar, and const-pattern law.
+- Literal patterns do not imply trait-driven equality or arbitrary coercion.
 
 Examples:
 
@@ -59,6 +61,16 @@ select code:
     when 0 => ok :: :: call
     else => fail :: :: call
 ```
+
+## Constant Patterns
+
+- Constant patterns use the const law from `spec/consts.md`.
+- Constant patterns are first-wave.
+- Constant patterns are valid only for exact-value matching.
+- Named const references are valid constant patterns.
+- `Str` and `Bytes` constant patterns are exact whole-value matches only.
+- Constant-pattern structural matching is exact and compiler-owned, not trait-driven.
+- Constant patterns do not permit arbitrary function calls, method calls, or computed guards masquerading as patterns.
 
 ## Tuple Patterns
 
@@ -145,6 +157,7 @@ select event:
 - Guarded `select:` uses boolean expressions, not patterns.
 - Control-flow arm semantics are defined in `spec/control-flow.md`.
 - Local binding law is defined in `spec/bindings.md`.
+- Constant-pattern const law is defined in `spec/consts.md`.
 - Tuple pattern details are defined in `spec/tuples.md`.
 - Declaration families matched by patterns are defined in `spec/types.md`.
 - `where` does not refine patterns in v1.
@@ -164,4 +177,5 @@ The compiler must reject:
 - unknown enum variants in patterns
 - unknown named payload fields in variant patterns
 - malformed nested pattern shapes
+- invalid constant patterns
 - unreachable later arms after an earlier irrefutable `select value:` arm

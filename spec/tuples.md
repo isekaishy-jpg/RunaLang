@@ -37,6 +37,7 @@ Tuple value syntax:
 - `(A, B)` is distinct from `(A, B, C)`.
 - Tuple identity is structural and order-sensitive.
 - Tuple layout is not a public source-visible ABI contract.
+- Tuple shape does not by itself imply foreign-stable layout or boundary safety.
 
 ## Projection
 
@@ -97,6 +98,7 @@ select pair:
 
 - Tuples are for small unnamed grouped values, not domain-shaped records.
 - Records are preferred when field names carry semantic meaning.
+- Layout and repr law remain defined in `spec/layout-and-repr.md`.
 - Tuple destructuring in parameter lists is not part of v1.
 - Binding statement law is defined in `spec/bindings.md`.
 - Tuple field assignment such as `pair.0 = x` is not part of v1.
@@ -113,3 +115,4 @@ The compiler must reject:
 - tuple patterns with wrong arity
 - tuple rest or spread patterns
 - tuple field assignment
+- treating tuple shape alone as an implied layout, ABI, or boundary contract

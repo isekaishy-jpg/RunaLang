@@ -11,6 +11,30 @@ pub const GenericParam = typed_signatures.GenericParam;
 pub const WherePredicate = typed_signatures.WherePredicate;
 pub const Block = typed_statement.Block;
 
+pub const ConstRequiredExprKind = enum {
+    array_length,
+    enum_discriminant,
+};
+
+pub const ConstRequiredExpr = struct {
+    kind: ConstRequiredExprKind,
+    source: []const u8,
+    owner_name: []const u8 = "",
+    expr: ?*Expr = null,
+    parse_error: ?anyerror = null,
+
+    pub fn deinit(self: *ConstRequiredExpr, allocator: Allocator) void {
+        if (self.expr) |expr| {
+            expr.deinit(allocator);
+            allocator.destroy(expr);
+        }
+        self.* = .{
+            .kind = .array_length,
+            .source = "",
+        };
+    }
+};
+
 pub const ParameterMode = enum {
     owned,
     take,
@@ -65,6 +89,7 @@ pub const FunctionData = struct {
 pub const ConstData = struct {
     type_name: []const u8,
     ty: types.Builtin,
+    type_ref: types.TypeRef,
     initializer_source: []const u8,
     initializer_syntax: ?*ast.BodyExprSyntax = null,
     expr: ?*Expr = null,
@@ -179,10 +204,26 @@ pub const TraitAssociatedType = struct {
     name: []const u8,
 };
 
+pub const TraitAssociatedConst = struct {
+    name: []const u8,
+    type_name: []const u8,
+    ty: types.Builtin,
+    type_ref: types.TypeRef,
+};
+
 pub const TraitAssociatedTypeBinding = struct {
     name: []const u8,
     value_type_name: []const u8,
     value_type: types.TypeRef = .unsupported,
+};
+
+pub const TraitAssociatedConstBinding = struct {
+    name: []const u8,
+    const_data: ConstData,
+
+    pub fn deinit(self: *TraitAssociatedConstBinding, allocator: Allocator) void {
+        self.const_data.deinit(allocator);
+    }
 };
 
 pub const TraitData = struct {
@@ -190,6 +231,7 @@ pub const TraitData = struct {
     where_predicates: []WherePredicate,
     methods: []TraitMethod,
     associated_types: []TraitAssociatedType,
+    associated_consts: []TraitAssociatedConst,
 
     pub fn deinit(self: *TraitData, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
@@ -197,6 +239,7 @@ pub const TraitData = struct {
         for (self.methods) |*method| method.deinit(allocator);
         allocator.free(self.methods);
         allocator.free(self.associated_types);
+        allocator.free(self.associated_consts);
     }
 };
 
@@ -206,12 +249,15 @@ pub const ImplData = struct {
     target_type: []const u8,
     trait_name: ?[]const u8,
     associated_types: []TraitAssociatedTypeBinding,
+    associated_consts: []TraitAssociatedConstBinding,
     methods: []TraitMethod,
 
     pub fn deinit(self: *ImplData, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
         if (self.where_predicates.len != 0) allocator.free(self.where_predicates);
         allocator.free(self.associated_types);
+        for (self.associated_consts) |*binding| binding.deinit(allocator);
+        allocator.free(self.associated_consts);
         for (self.methods) |*method| method.deinit(allocator);
         allocator.free(self.methods);
     }

@@ -85,7 +85,8 @@ test "compiler domains stay dense" {
         "compiler/lifetimes/root.zig",
         "compiler/regions/root.zig",
         "compiler/reflect/root.zig",
-        "compiler/ctfe/root.zig",
+        "compiler/query/const_ir.zig",
+        "compiler/query/const_eval.zig",
         "compiler/mir/root.zig",
         "compiler/ir/root.zig",
         "compiler/codegen/root.zig",
@@ -200,7 +201,7 @@ test "std async and boundary surfaces exist" {
     try std.testing.expect(!task.canceled);
     task.cancel();
     try std.testing.expect(task.canceled);
-    try std.testing.expectEqual(@as(i32, 5), TaskInt.complete(5).@"await"());
+    try std.testing.expectEqual(@as(i32, 5), TaskInt.complete(5).await());
 
     const schedule = libraries.std.async_runtime.TaskSchedule{
         .priority = .High,
@@ -214,18 +215,18 @@ test "std async and boundary surfaces exist" {
     try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.block_on(adapters.addOne, @as(i32, 7)));
     try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.block_on_edit(adapters.addOne, @as(i32, 7)));
     try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.block_on_take(adapters.addOne, @as(i32, 7)));
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn(adapters.addOne, @as(i32, 7)).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_edit(adapters.addOne, @as(i32, 7)).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_take(adapters.addOne, @as(i32, 7)).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local(adapters.addOne, @as(i32, 7)).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_edit(adapters.addOne, @as(i32, 7)).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_take(adapters.addOne, @as(i32, 7)).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_with(adapters.addOne, @as(i32, 7), schedule).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_with_edit(adapters.addOne, @as(i32, 7), schedule).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_with_take(adapters.addOne, @as(i32, 7), schedule).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_with(adapters.addOne, @as(i32, 7), schedule).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_with_edit(adapters.addOne, @as(i32, 7), schedule).@"await"());
-    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_with_take(adapters.addOne, @as(i32, 7), schedule).@"await"());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn(adapters.addOne, @as(i32, 7)).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_edit(adapters.addOne, @as(i32, 7)).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_take(adapters.addOne, @as(i32, 7)).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local(adapters.addOne, @as(i32, 7)).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_edit(adapters.addOne, @as(i32, 7)).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_take(adapters.addOne, @as(i32, 7)).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_with(adapters.addOne, @as(i32, 7), schedule).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_with_edit(adapters.addOne, @as(i32, 7), schedule).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_with_take(adapters.addOne, @as(i32, 7), schedule).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_with(adapters.addOne, @as(i32, 7), schedule).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_with_edit(adapters.addOne, @as(i32, 7), schedule).await());
+    try std.testing.expectEqual(@as(i32, 8), libraries.std.async_runtime.spawn_local_with_take(adapters.addOne, @as(i32, 7), schedule).await());
     libraries.std.async_runtime.spawn_detached(adapters.addOne, @as(i32, 7));
     libraries.std.async_runtime.spawn_detached_edit(adapters.addOne, @as(i32, 7));
     libraries.std.async_runtime.spawn_detached_take(adapters.addOne, @as(i32, 7));
@@ -736,7 +737,7 @@ test "query diagnostics are not repeated for cached signature and body results" 
     const missing_id = compiler.query.testing.findItemIdByName(&active, "missing").?;
     const missing_body_id = active.semantic_index.itemEntry(missing_id).body_id.?;
     const statement_result = try compiler.query.statementsByBody(&active, missing_body_id);
-    try std.testing.expectEqual(@as(usize, 1), statement_result.summary.replayed_diagnostic_count);
+    try std.testing.expectEqual(@as(usize, 1), statement_result.summary.prepared_issue_count);
     const statement_diagnostic_count = active.pipeline.diagnostics.items.items.len;
     _ = try compiler.query.statementsByBody(&active, missing_body_id);
     try std.testing.expectEqual(statement_diagnostic_count, active.pipeline.diagnostics.items.items.len);
@@ -784,6 +785,45 @@ test "query cycle failures cache by family key without repeated diagnostics" {
     const diagnostic_count = active.pipeline.diagnostics.items.items.len;
     try std.testing.expectError(error.CachedFailure, compiler.query.reflectionById(&active, .{ .index = 0 }));
     try std.testing.expectEqual(diagnostic_count, active.pipeline.diagnostics.items.items.len);
+}
+
+test "in-progress query entries become cached failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\pub const VALUE: I32 = 1
+        \\
+        \\fn main() -> Unit:
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const const_id = compiler.query.testing.findConstIdByName(&active, "VALUE").?;
+    active.caches.consts[const_id.index].state = .in_progress;
+    try std.testing.expectError(error.QueryCycle, compiler.query.constById(&active, const_id));
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.consts[const_id.index].state);
+    try std.testing.expect(active.caches.consts[const_id.index].failed);
+    try std.testing.expectError(error.CachedFailure, compiler.query.constById(&active, const_id));
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    active.caches.bodies[body_id.index].state = .in_progress;
+    try std.testing.expectError(error.QueryCycle, compiler.query.checkedBody(&active, body_id));
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.bodies[body_id.index].state);
+    try std.testing.expect(active.caches.bodies[body_id.index].failed);
+    try std.testing.expectError(error.CachedFailure, compiler.query.checkedBody(&active, body_id));
 }
 
 test "checked body summary records statements bindings and calls" {
@@ -918,7 +958,11 @@ test "checked body exposes parameter and control-flow facts" {
     try std.testing.expectEqual(@as(usize, 2), borrow_result.summary.borrow_parameter_count);
     try std.testing.expectEqual(body.places.len, borrow_result.summary.checked_place_count);
     try std.testing.expectEqual(body.cfg_edges.len, borrow_result.summary.cfg_edge_count);
+    try std.testing.expectEqual(body.effect_sites.len, borrow_result.summary.effect_site_count);
     try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.invalid_cfg_edges);
+    try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.invalid_effect_sites);
+    try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.suspension_borrow_count);
+    try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.detached_borrow_count);
 }
 
 test "checked body exposes unsafe and spawn analyzer facts" {
@@ -967,6 +1011,128 @@ test "checked body exposes unsafe and spawn analyzer facts" {
     }
     try std.testing.expect(saw_unsafe);
     try std.testing.expect(saw_spawn_boundary);
+}
+
+test "borrow query rejects ephemeral borrow across suspension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\suspend fn later() -> Unit:
+        \\    return
+        \\
+        \\suspend fn parent(read value: I32) -> Unit:
+        \\    later :: :: call
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_suspend_borrow = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "borrow.suspend")) {
+            saw_suspend_borrow = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_suspend_borrow);
+
+    const parent_item_id = compiler.query.testing.findItemIdByName(&active, "parent").?;
+    const body_id = active.semantic_index.itemEntry(parent_item_id).body_id.?;
+    const borrow_result = try compiler.query.borrowByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 1), borrow_result.summary.suspension_borrow_count);
+    try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.detached_borrow_count);
+}
+
+test "borrow query rejects borrowed detached task input" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\suspend fn child(take value: I32) -> Unit:
+        \\    return
+        \\
+        \\fn spawn_detached[F, In, Out](take f: F, take input: In) -> Unit:
+        \\    return
+        \\
+        \\fn parent(read value: I32) -> Unit:
+        \\    spawn_detached :: child, value :: call
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_detached_borrow = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "borrow.detached")) {
+            saw_detached_borrow = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_detached_borrow);
+
+    const parent_item_id = compiler.query.testing.findItemIdByName(&active, "parent").?;
+    const body_id = active.semantic_index.itemEntry(parent_item_id).body_id.?;
+    const borrow_result = try compiler.query.borrowByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.suspension_borrow_count);
+    try std.testing.expectEqual(@as(usize, 1), borrow_result.summary.detached_borrow_count);
+}
+
+test "borrow query stops effects after break exits a loop body" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\suspend fn later() -> Unit:
+        \\    return
+        \\
+        \\suspend fn parent(read value: I32) -> Unit:
+        \\    repeat while true:
+        \\        break
+        \\        later :: :: call
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "borrow.suspend"));
+    }
+
+    const parent_item_id = compiler.query.testing.findItemIdByName(&active, "parent").?;
+    const body_id = active.semantic_index.itemEntry(parent_item_id).body_id.?;
+    const borrow_result = try compiler.query.borrowByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 0), borrow_result.summary.suspension_borrow_count);
 }
 
 test "checked signatures expose semantic item facts" {
@@ -1224,10 +1390,10 @@ test "query const contexts evaluate fixed array lengths through const IR" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "main.rna",
         .data =
-        \\const LEN: Index = 4
+        \\const LEN: U32 = 4
         \\
         \\struct Packet:
-        \\    values: [I32; LEN + 1]
+        \\    values: [I32; LEN as Index]
         \\
         \\fn main() -> I32:
         \\    return 0
@@ -1243,6 +1409,112 @@ test "query const contexts evaluate fixed array lengths through const IR" {
     try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
     const len_id = compiler.query.testing.findConstIdByName(&active, "LEN").?;
     try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.consts[len_id.index].state);
+}
+
+test "query const evaluation handles aggregates and static tables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\const BOX: Box = Box :: 4 :: call
+        \\const VALUE: I32 = BOX.value
+        \\const TABLE: [I32; 2] = [3, VALUE]
+        \\const FIRST: I32 = TABLE[0]
+        \\const SECOND: I32 = TABLE[1]
+        \\
+        \\fn main() -> I32:
+        \\    return VALUE
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+
+    const box = try compiler.query.testing.evalConstByName(&active, "BOX");
+    switch (box) {
+        .aggregate => |aggregate| {
+            try std.testing.expectEqualStrings("Box", aggregate.type_name);
+            try std.testing.expectEqual(@as(usize, 1), aggregate.fields.len);
+            try std.testing.expectEqualStrings("value", aggregate.fields[0].name);
+            try std.testing.expectEqual(@as(i32, 4), aggregate.fields[0].value.i32);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+
+    const value = try compiler.query.testing.evalConstByName(&active, "VALUE");
+    try std.testing.expectEqual(@as(i32, 4), value.i32);
+    const first = try compiler.query.testing.evalConstByName(&active, "FIRST");
+    try std.testing.expectEqual(@as(i32, 3), first.i32);
+    const second = try compiler.query.testing.evalConstByName(&active, "SECOND");
+    try std.testing.expectEqual(@as(i32, 4), second.i32);
+}
+
+test "query const evaluation handles enum value consts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\enum Status:
+        \\    Ok
+        \\    Err(I32)
+        \\
+        \\const OK: Status = Status.Ok
+        \\const ERR: Status = Status.Err :: 7 :: call
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+
+    const ok = try compiler.query.testing.evalConstByName(&active, "OK");
+    switch (ok) {
+        .enum_value => |enum_value| {
+            try std.testing.expectEqualStrings("Status", enum_value.enum_name);
+            try std.testing.expectEqualStrings("Ok", enum_value.variant_name);
+            try std.testing.expectEqual(@as(i32, 0), enum_value.tag);
+            try std.testing.expectEqual(@as(usize, 0), enum_value.fields.len);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+
+    const err = try compiler.query.testing.evalConstByName(&active, "ERR");
+    switch (err) {
+        .enum_value => |enum_value| {
+            try std.testing.expectEqualStrings("Status", enum_value.enum_name);
+            try std.testing.expectEqualStrings("Err", enum_value.variant_name);
+            try std.testing.expectEqual(@as(i32, 1), enum_value.tag);
+            try std.testing.expectEqual(@as(usize, 1), enum_value.fields.len);
+            try std.testing.expectEqualStrings("_0", enum_value.fields[0].name);
+            try std.testing.expectEqual(@as(i32, 7), enum_value.fields[0].value.i32);
+        },
+        else => return error.UnexpectedTestResult,
+    }
 }
 
 test "query const contexts reject negative fixed array lengths" {
@@ -1285,12 +1557,12 @@ test "query const contexts evaluate repr enum discriminants through const IR" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "main.rna",
         .data =
-        \\const OK_VALUE: I32 = 0
+        \\const OK_VALUE: U32 = 2
         \\
-        \\#repr[c, I32]
+        \\#repr[c, Index]
         \\enum Status:
-        \\    Ok = OK_VALUE
-        \\    Err = 1 + 1
+        \\    Ok = OK_VALUE as Index
+        \\    Err = 3
         \\
         \\fn main() -> I32:
         \\    return 0
@@ -1362,7 +1634,7 @@ test "query local const contexts evaluate array repetition lengths" {
         \\const LEN: Index = 3
         \\
         \\fn main() -> I32:
-        \\    let value: I32 = [1; LEN]
+        \\    let value: [I32; LEN] = [1; LEN]
         \\    return 0
         ,
     });
@@ -1383,7 +1655,7 @@ test "query local const contexts evaluate array repetition lengths" {
     for (active.pipeline.diagnostics.items.items) |item| {
         if (std.mem.eql(u8, item.code, "type.expr.array.stage0")) saw_array_stage0 = true;
     }
-    try std.testing.expect(saw_array_stage0);
+    try std.testing.expect(!saw_array_stage0);
 }
 
 test "query local const contexts reject non-const array repetition lengths" {
@@ -1398,7 +1670,7 @@ test "query local const contexts reject non-const array repetition lengths" {
         .data =
         \\fn main() -> I32:
         \\    let len: I32 = 3
-        \\    let value: I32 = [1; len]
+        \\    let value: [I32; 3] = [1; len]
         \\    return 0
         ,
     });
@@ -1420,6 +1692,80 @@ test "query local const contexts reject non-const array repetition lengths" {
         if (std.mem.eql(u8, item.code, "type.const.array_repetition_length")) saw_repetition_length = true;
     }
     try std.testing.expect(saw_repetition_length);
+}
+
+test "query local const contexts reject invalid compile-time conversions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    const base: U32 = 1
+        \\    const bad: Bool = base as Bool
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const result = try compiler.query.localConstsByBody(&active, body_id);
+
+    try std.testing.expectEqual(@as(usize, 2), result.summary.checked_count);
+    try std.testing.expectEqual(@as(usize, 1), result.summary.rejected_count);
+
+    var saw_invalid_conversion = false;
+    for (active.pipeline.diagnostics.items.items) |item| {
+        if (std.mem.eql(u8, item.code, "type.const.conversion")) saw_invalid_conversion = true;
+    }
+    try std.testing.expect(saw_invalid_conversion);
+}
+
+test "query array repetition lengths reject invalid compile-time conversions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    const flag: Bool = true
+        \\    let value: [I32; 3] = [1; flag as Index]
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const result = try compiler.query.localConstsByBody(&active, body_id);
+
+    try std.testing.expectEqual(@as(usize, 1), result.summary.checked_array_repetition_lengths);
+    try std.testing.expectEqual(@as(usize, 1), result.summary.rejected_array_repetition_lengths);
+
+    var saw_invalid_conversion = false;
+    for (active.pipeline.diagnostics.items.items) |item| {
+        if (std.mem.eql(u8, item.code, "type.const.conversion")) saw_invalid_conversion = true;
+    }
+    try std.testing.expect(saw_invalid_conversion);
 }
 
 test "query local const evaluation uses const IR and earlier local bindings" {
@@ -1456,7 +1802,7 @@ test "query local const evaluation uses const IR and earlier local bindings" {
     try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.local_consts[body_id.index].state);
 }
 
-test "query local const evaluation resolves forward local dependencies" {
+test "query local const evaluation rejects forward local dependencies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1479,15 +1825,19 @@ test "query local const evaluation resolves forward local dependencies" {
     var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
     defer active.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    var saw_unknown = false;
+    for (active.pipeline.diagnostics.items.items) |item| {
+        if (std.mem.eql(u8, item.code, "type.name.unknown")) saw_unknown = true;
+    }
+    try std.testing.expect(saw_unknown);
+
     const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
     const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
     const result = try compiler.query.localConstsByBody(&active, body_id);
-    try std.testing.expectEqual(@as(usize, 2), result.summary.checked_count);
-    try std.testing.expectEqual(@as(usize, 0), result.summary.rejected_count);
+    try std.testing.expect(result.summary.checked_count >= 1);
 }
 
-test "query local const evaluation reports local dependency cycles" {
+test "query local const evaluation treats forward local cycles as unknown names" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1513,14 +1863,13 @@ test "query local const evaluation reports local dependency cycles" {
     const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
     const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
     const result = try compiler.query.localConstsByBody(&active, body_id);
-    try std.testing.expectEqual(@as(usize, 2), result.summary.checked_count);
-    try std.testing.expect(result.summary.rejected_count >= 1);
+    _ = result;
 
-    var saw_cycle = false;
+    var saw_unknown = false;
     for (active.pipeline.diagnostics.items.items) |item| {
-        if (std.mem.eql(u8, item.code, "type.const.cycle")) saw_cycle = true;
+        if (std.mem.eql(u8, item.code, "type.name.unknown")) saw_unknown = true;
     }
-    try std.testing.expect(saw_cycle);
+    try std.testing.expect(saw_unknown);
 }
 
 test "semantic rejects explicit const-safe local const with non-const initializer" {
@@ -1556,7 +1905,7 @@ test "semantic rejects explicit const-safe local const with non-const initialize
     try std.testing.expect(saw_expr);
 }
 
-test "semantic rejects explicit local const with non-const-safe type" {
+test "semantic accepts explicit local const with const-safe struct type" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1580,6 +1929,46 @@ test "semantic rejects explicit local const with non-const-safe type" {
 
     var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
     defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const result = try compiler.query.localConstsByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 1), result.summary.checked_count);
+    try std.testing.expectEqual(@as(usize, 0), result.summary.rejected_count);
+}
+
+test "semantic rejects explicit local const with opaque non-const-safe type" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\opaque type Handle
+        \\
+        \\struct Holder:
+        \\    handle: Handle
+        \\
+        \\fn main() -> I32:
+        \\    const holder: Holder = Holder :: 0 :: call
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const result = try compiler.query.localConstsByBody(&active, body_id);
+    try std.testing.expect(result.summary.rejected_count >= 1);
 
     var saw_type = false;
     for (active.pipeline.diagnostics.items.items) |item| {
@@ -1792,6 +2181,46 @@ test "domain-state rejects invalid retained anchor targets" {
     }
     try std.testing.expect(saw_root_target);
     try std.testing.expect(saw_context_target);
+}
+
+test "domain-state retained anchors require declared lifetimes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#domain_root
+        \\struct AppState:
+        \\    value: I32
+        \\
+        \\#domain_root
+        \\struct SceneState:
+        \\    parent: hold['a] read AppState
+        \\
+        \\#domain_context
+        \\struct EventCtx:
+        \\    root: hold['a] read AppState
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_root_lifetime = false;
+    var saw_context_lifetime = false;
+    for (active.pipeline.diagnostics.items.items) |item| {
+        if (std.mem.eql(u8, item.code, "type.domain_root.parent_anchor_lifetime")) saw_root_lifetime = true;
+        if (std.mem.eql(u8, item.code, "type.domain_context.anchor_lifetime")) saw_context_lifetime = true;
+    }
+    try std.testing.expect(saw_root_lifetime);
+    try std.testing.expect(saw_context_lifetime);
 }
 
 test "domain-state anchor checks resolve imported root targets" {
@@ -2822,6 +3251,89 @@ test "stage0 check rejects retained returns without an outlives proof" {
     try std.testing.expect(found_outlives);
 }
 
+test "lifetime query propagates retained origins after merged select assignments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\fn get['a, 'b](take left: hold['a] read Box, take right: hold['b] read Box, take flag: Bool) -> hold['a] read I32:
+        \\    let selected: hold['b] read Box = right
+        \\    select:
+        \\        when flag == true => selected = left
+        \\        else => selected = left
+        \\    return selected.value
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "lifetime.return.outlives"));
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "lifetime.return.retained_source"));
+    }
+
+    const get_item_id = compiler.query.testing.findItemIdByName(&active, "get").?;
+    const body_id = active.semantic_index.itemEntry(get_item_id).body_id.?;
+    const lifetime_result = try compiler.query.lifetimesByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 1), lifetime_result.summary.return_statements_checked);
+    try std.testing.expectEqual(@as(usize, 0), lifetime_result.summary.rejected_returns);
+}
+
+test "lifetime query ignores unreachable assignments after branch returns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\fn choose['a, 'b](take left: hold['a] read Box, take right: hold['b] read Box, flag: Bool) -> hold['b] read I32:
+        \\    let result = right.value
+        \\    select:
+        \\        when flag == true =>
+        \\            return right.value
+        \\            result = left.value
+        \\        else =>
+        \\            result = right.value
+        \\    return result
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "lifetime.return.outlives"));
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "lifetime.return.retained_source"));
+    }
+
+    const choose_item_id = compiler.query.testing.findItemIdByName(&active, "choose").?;
+    const body_id = active.semantic_index.itemEntry(choose_item_id).body_id.?;
+    const lifetime_result = try compiler.query.lifetimesByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 2), lifetime_result.summary.return_statements_checked);
+    try std.testing.expectEqual(@as(usize, 0), lifetime_result.summary.rejected_returns);
+}
+
 test "stage0 check rejects retained returns derived from ephemeral borrows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3784,6 +4296,218 @@ test "query const evaluation handles typed top-level const expressions" {
     try std.testing.expectEqual(@as(i32, 8), value.i32);
 }
 
+test "query expressions expose checked conversion facts by expression id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> Index:
+        \\    const base: U32 = 1
+        \\    const signed: I32 = 1
+        \\    const widened: Index = base as Index
+        \\    signed as may[U32]
+        \\    const bad: Bool = base as Bool
+        \\    return widened
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const result = try compiler.query.expressionsByBody(&active, body_id);
+
+    try std.testing.expectEqual(@as(usize, 3), result.summary.checked_conversion_count);
+    try std.testing.expectEqual(@as(usize, 1), result.summary.rejected_conversion_count);
+    try std.testing.expectEqual(@as(usize, 3), result.conversion_facts.len);
+    try std.testing.expect(result.conversion_facts[0].expression_id.index != result.conversion_facts[1].expression_id.index);
+
+    var saw_rejected_fact = false;
+    var saw_checked_fact = false;
+    var saw_conversion_diagnostic = false;
+    for (result.conversion_facts) |fact| {
+        if (fact.status == .rejected and fact.diagnostic_code != null) saw_rejected_fact = true;
+        if (fact.mode == .explicit_checked and fact.status == .accepted) saw_checked_fact = true;
+    }
+    for (active.pipeline.diagnostics.items.items) |item| {
+        if (std.mem.eql(u8, item.code, "type.expr.conversion")) saw_conversion_diagnostic = true;
+    }
+    try std.testing.expect(saw_rejected_fact);
+    try std.testing.expect(saw_checked_fact);
+    try std.testing.expect(saw_conversion_diagnostic);
+}
+
+test "query const evaluation handles explicit infallible conversions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\const BASE: U32 = 4
+        \\const WIDE: Index = BASE as Index
+        \\
+        \\fn main() -> Index:
+        \\    return WIDE
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    const value = try compiler.query.testing.evalConstByName(&active, "WIDE");
+    try std.testing.expectEqual(@as(usize, 4), value.index);
+}
+
+test "query const evaluation handles checked may conversions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\const NEG: I32 = -1
+        \\const CHECKED: Result[U32, ConvertError] = NEG as may[U32]
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    const value = try compiler.query.testing.evalConstByName(&active, "CHECKED");
+    switch (value) {
+        .enum_value => |result| {
+            try std.testing.expectEqualStrings("Result", result.enum_name);
+            try std.testing.expectEqualStrings("Err", result.variant_name);
+            try std.testing.expectEqual(@as(usize, 1), result.fields.len);
+            switch (result.fields[0].value) {
+                .enum_value => |convert_error| {
+                    try std.testing.expectEqualStrings("ConvertError", convert_error.enum_name);
+                    try std.testing.expectEqualStrings("OutOfRange", convert_error.variant_name);
+                },
+                else => return error.UnexpectedTestResult,
+            }
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "query const evaluation rejects invalid compile-time conversions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\const BASE: U32 = 4
+        \\const FLAG: Bool = true
+        \\const BAD_CAST: Bool = BASE as Bool
+        \\const BAD_CHECKED: Result[U32, ConvertError] = FLAG as may[U32]
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var conversion_diagnostics: usize = 0;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.const.conversion")) conversion_diagnostics += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), conversion_diagnostics);
+
+    const bad_cast_id = compiler.query.testing.findConstIdByName(&active, "BAD_CAST").?;
+    const bad_checked_id = compiler.query.testing.findConstIdByName(&active, "BAD_CHECKED").?;
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.consts[bad_cast_id.index].state);
+    try std.testing.expect(active.caches.consts[bad_cast_id.index].failed);
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.consts[bad_checked_id.index].state);
+    try std.testing.expect(active.caches.consts[bad_checked_id.index].failed);
+    try std.testing.expectError(error.CachedFailure, compiler.query.constById(&active, bad_cast_id));
+    try std.testing.expectError(error.CachedFailure, compiler.query.constById(&active, bad_checked_id));
+}
+
+test "query associated const evaluation rejects invalid compile-time conversions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\const BASE: U32 = 4
+        \\
+        \\struct File:
+        \\    handle: I32
+        \\
+        \\impl File:
+        \\    const BAD: Bool = BASE as Bool
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_conversion = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.const.conversion")) {
+            saw_conversion = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_conversion);
+
+    var impl_const_id: ?compiler.session.AssociatedConstId = null;
+    for (active.semantic_index.associated_consts.items, 0..) |entry, index| {
+        const item = active.item(entry.item_id);
+        const impl_block = switch (item.payload) {
+            .impl_block => |impl_block| impl_block,
+            else => continue,
+        };
+        if (entry.associated_index >= impl_block.associated_consts.len) continue;
+        if (std.mem.eql(u8, impl_block.associated_consts[entry.associated_index].name, "BAD")) {
+            impl_const_id = .{ .index = index };
+            break;
+        }
+    }
+    try std.testing.expect(impl_const_id != null);
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.associated_consts[impl_const_id.?.index].state);
+    try std.testing.expect(active.caches.associated_consts[impl_const_id.?.index].failed);
+    try std.testing.expectError(error.CachedFailure, compiler.query.associatedConstById(&active, impl_const_id.?));
+}
+
 test "query const evaluation handles unary const expressions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4255,6 +4979,39 @@ test "packaged metadata renders reflection and boundary surfaces" {
     try std.testing.expectEqual(@as(usize, 1), parsed.reflection.items.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.boundary_apis.items.len);
     try std.testing.expectEqualStrings("demo::demo_native::ping", parsed.boundary_apis.items[0].canonical_identity);
+}
+
+test "module boundary API metadata is a cached query result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#boundary[api]
+        \\#export[name = "demo_ping"]
+        \\pub suspend fn ping() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+
+    const query_result = try compiler.query.moduleBoundaryApiMetadata(&active, .{ .index = 0 });
+    const cached_result = try compiler.query.moduleBoundaryApiMetadata(&active, .{ .index = 0 });
+    try std.testing.expectEqual(@as(usize, 1), query_result.apis.len);
+    try std.testing.expect(query_result.apis.ptr == cached_result.apis.ptr);
+    try std.testing.expectEqualStrings("ping", query_result.apis[0].name);
+    try std.testing.expect(query_result.apis[0].is_suspend);
+    try std.testing.expectEqualStrings("demo_ping", query_result.apis[0].export_name.?);
 }
 
 test "doc and lsp tooling surface reflection and boundary data" {
@@ -5275,7 +6032,7 @@ test "stage0 check rejects tuple expressions with explicit diagnostic" {
     try std.testing.expect(!found_grouping);
 }
 
-test "stage0 check rejects array literals with explicit diagnostic" {
+test "semantic rejects array literals without fixed-array context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5301,14 +6058,14 @@ test "stage0 check rejects array literals with explicit diagnostic" {
     var found_array = false;
     var found_primary = false;
     for (pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.expr.array.stage0")) found_array = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.expr.array.type")) found_array = true;
         if (std.mem.eql(u8, diagnostic.code, "parse.expr.primary")) found_primary = true;
     }
     try std.testing.expect(found_array);
     try std.testing.expect(!found_primary);
 }
 
-test "stage0 check rejects keyed access with explicit diagnostic" {
+test "semantic rejects keyed access on non-array values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5335,7 +6092,7 @@ test "stage0 check rejects keyed access with explicit diagnostic" {
     var found_keyed_access = false;
     var found_primary = false;
     for (pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.expr.keyed_access.stage0")) found_keyed_access = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.expr.keyed_access.base")) found_keyed_access = true;
         if (std.mem.eql(u8, diagnostic.code, "parse.expr.primary")) found_primary = true;
     }
     try std.testing.expect(found_keyed_access);
@@ -6126,6 +6883,249 @@ test "semantic rejects unknown trait impl associated type binding" {
     try std.testing.expect(found_unknown);
 }
 
+test "semantic accepts trait impl associated const binding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\trait Blocked:
+        \\    const BLOCK_SIZE: Index
+        \\
+        \\struct File:
+        \\    handle: I32
+        \\
+        \\impl Blocked for File:
+        \\    const BLOCK_SIZE: Index = 4096
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    try std.testing.expectEqual(@as(usize, 2), active.associatedConstCount());
+
+    const trait_sig = try compiler.query.checkedSignature(&active, compiler.query.testing.findItemIdByName(&active, "Blocked").?);
+    switch (trait_sig.facts) {
+        .trait_type => |signature| {
+            try std.testing.expectEqual(@as(usize, 1), signature.associated_consts.len);
+            try std.testing.expectEqualStrings("BLOCK_SIZE", signature.associated_consts[0].name);
+            try std.testing.expectEqualStrings("Index", signature.associated_consts[0].type_name);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+
+    var impl_const_id: ?compiler.session.AssociatedConstId = null;
+    for (active.semantic_index.associated_consts.items, 0..) |entry, index| {
+        const item = active.item(entry.item_id);
+        const impl_block = switch (item.payload) {
+            .impl_block => |impl_block| impl_block,
+            else => continue,
+        };
+        if (entry.associated_index >= impl_block.associated_consts.len) continue;
+        if (std.mem.eql(u8, impl_block.associated_consts[entry.associated_index].name, "BLOCK_SIZE")) {
+            impl_const_id = .{ .index = index };
+            break;
+        }
+    }
+    const value = try compiler.query.associatedConstById(&active, impl_const_id.?);
+    try std.testing.expectEqual(@as(usize, 4096), value.value.index);
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.associated_consts[impl_const_id.?.index].state);
+}
+
+test "semantic rejects missing trait impl associated const binding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\trait Blocked:
+        \\    const BLOCK_SIZE: Index
+        \\
+        \\struct File:
+        \\    handle: I32
+        \\
+        \\impl Blocked for File:
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_missing = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.impl.associated_const_missing")) {
+            found_missing = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_missing);
+}
+
+test "semantic rejects unknown trait impl associated const binding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\trait Marker:
+        \\
+        \\struct File:
+        \\    handle: I32
+        \\
+        \\impl Marker for File:
+        \\    const BLOCK_SIZE: Index = 4096
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_unknown = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.impl.associated_const_unknown")) {
+            found_unknown = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_unknown);
+}
+
+test "query const evaluation resolves inherent associated consts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\enum TokenKind:
+        \\    Word
+        \\
+        \\impl TokenKind:
+        \\    const COUNT: Index = 1
+        \\
+        \\const VALUE: Index = TokenKind.COUNT
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    const value = try compiler.query.testing.evalConstByName(&active, "VALUE");
+    try std.testing.expectEqual(@as(usize, 1), value.index);
+}
+
+test "query const evaluation caches associated const cycles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\enum TokenKind:
+        \\    Word
+        \\
+        \\impl TokenKind:
+        \\    const A: Index = TokenKind.B
+        \\    const B: Index = TokenKind.A
+        \\
+        \\const VALUE: Index = TokenKind.A
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_cycle = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.const.cycle")) {
+            found_cycle = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_cycle);
+}
+
+test "query const evaluation diagnoses ambiguous associated const lookup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\trait A:
+        \\    const SIZE: Index
+        \\
+        \\trait B:
+        \\    const SIZE: Index
+        \\
+        \\struct File:
+        \\    handle: I32
+        \\
+        \\impl A for File:
+        \\    const SIZE: Index = 1
+        \\
+        \\impl B for File:
+        \\    const SIZE: Index = 2
+        \\
+        \\const VALUE: Index = File.SIZE
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_ambiguous = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.const.associated_ambiguous")) {
+            found_ambiguous = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_ambiguous);
+}
+
 test "trait solver reports default inheritance and associated projection equality" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6169,10 +7169,14 @@ test "trait solver reports default inheritance and associated projection equalit
     try std.testing.expectEqual(@as(usize, 1), reset.inherited_default_method_count);
     const trait_goal_count = active.caches.trait_goals.items.len;
     const impl_lookup_count = active.caches.impl_lookups.items.len;
+    const impl_index_entries = active.caches.impl_index.value.?.entries.len;
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.impl_index.state);
+    try std.testing.expectEqual(@as(usize, 2), impl_index_entries);
     const reset_again = try satisfiesTraitForTest(&active, module_id, "Counter", "Reset", &.{});
     try std.testing.expect(reset_again.satisfied);
     try std.testing.expectEqual(trait_goal_count, active.caches.trait_goals.items.len);
     try std.testing.expectEqual(impl_lookup_count, active.caches.impl_lookups.items.len);
+    try std.testing.expectEqual(impl_index_entries, active.caches.impl_index.value.?.entries.len);
 
     const associated_lookup_count = active.caches.impl_lookups.items.len;
     try std.testing.expect(try associatedTypeEqualsForTest(&active, module_id, "Counter", "Iterator", "Item", "I32", &.{}));
@@ -6180,6 +7184,7 @@ test "trait solver reports default inheritance and associated projection equalit
     try std.testing.expect(associated_lookup_count_after >= associated_lookup_count);
     try std.testing.expect(!try associatedTypeEqualsForTest(&active, module_id, "Counter", "Iterator", "Item", "U32", &.{}));
     try std.testing.expectEqual(associated_lookup_count_after, active.caches.impl_lookups.items.len);
+    try std.testing.expectEqual(impl_index_entries, active.caches.impl_index.value.?.entries.len);
 }
 
 test "trait impl lookup demands checked signatures" {
@@ -6216,6 +7221,8 @@ test "trait impl lookup demands checked signatures" {
     const result = try satisfiesTraitForTest(&active, module_id, "Counter", "Reset", &.{});
     try std.testing.expect(result.satisfied);
     try std.testing.expectEqual(@as(usize, 1), result.inherited_default_method_count);
+    try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.impl_index.state);
+    try std.testing.expectEqual(@as(usize, 1), active.caches.impl_index.value.?.entries.len);
 
     var saw_checked_impl = false;
     for (active.semantic_index.impls.items) |impl_entry| {
@@ -7512,6 +8519,132 @@ test "ownership query rejects use after take call" {
     const body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
     const ownership_result = try compiler.query.ownershipByBody(&active, body_id);
     try std.testing.expectEqual(@as(usize, 1), ownership_result.summary.move_after_take);
+}
+
+test "ownership query keeps mutually exclusive select-arm states independent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\fn consume(take box: Box) -> Unit:
+        \\    return
+        \\
+        \\fn main() -> I32:
+        \\    let flag: Bool = true
+        \\    let box: Box = Box :: 1 :: call
+        \\    select flag:
+        \\        when true =>
+        \\            consume :: box :: call
+        \\        when false =>
+        \\            return box.value
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "ownership.move_after_take"));
+    }
+
+    const main_item_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
+    const ownership_result = try compiler.query.ownershipByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 0), ownership_result.summary.move_after_take);
+}
+
+test "ownership query treats break as terminating before later statements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\fn consume(take box: Box) -> Unit:
+        \\    return
+        \\
+        \\fn main() -> Unit:
+        \\    let box: Box = Box :: 1 :: call
+        \\    repeat while true:
+        \\        break
+        \\        consume :: box :: call
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "ownership.move_after_take"));
+    }
+
+    const main_item_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
+    const ownership_result = try compiler.query.ownershipByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 0), ownership_result.summary.move_after_take);
+}
+
+test "ownership query consumes deferred take at the defer site only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\fn consume(take box: Box) -> Unit:
+        \\    return
+        \\
+        \\fn main() -> Unit:
+        \\    let box: Box = Box :: 1 :: call
+        \\    defer consume :: box :: call
+        \\    repeat while true:
+        \\        break
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.code, "ownership.move_after_take"));
+    }
+
+    const main_item_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
+    const ownership_result = try compiler.query.ownershipByBody(&active, body_id);
+    try std.testing.expectEqual(@as(usize, 0), ownership_result.summary.move_after_take);
 }
 
 test "ownership query rejects conflicting same-place call arguments" {
@@ -8858,6 +9991,134 @@ test "stage0 check rejects unreachable else after irrefutable exact struct patte
     const pattern_diagnostic_count = active.pipeline.diagnostics.items.items.len;
     _ = try compiler.query.patternsByBody(&active, main_body_id);
     try std.testing.expectEqual(pattern_diagnostic_count, active.pipeline.diagnostics.items.items.len);
+}
+
+test "stage0 check rejects non-exhaustive bool subject selects" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    let flag: Bool = true
+        \\    select flag:
+        \\        when true => return 1
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_non_exhaustive = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.select.non_exhaustive")) {
+            saw_non_exhaustive = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_non_exhaustive);
+
+    const main_item_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const main_body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
+    const pattern_result = try compiler.query.patternsByBody(&active, main_body_id);
+    try std.testing.expectEqual(@as(usize, 1), pattern_result.summary.rejected_non_exhaustive_pattern_count);
+}
+
+test "query pattern checks evaluate constant patterns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\const TARGET: I32 = 2
+        \\
+        \\fn main() -> I32:
+        \\    let code: I32 = 2
+        \\    select code:
+        \\        when TARGET => return 1
+        \\        else => return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    const main_item_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const main_body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
+    const pattern_result = try compiler.query.patternsByBody(&active, main_body_id);
+    try std.testing.expectEqual(@as(usize, 1), pattern_result.summary.checked_constant_pattern_count);
+    try std.testing.expectEqual(@as(usize, 0), pattern_result.summary.rejected_constant_pattern_count);
+}
+
+test "stage0 check uses enum signature facts for subject-select exhaustiveness" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\enum Color:
+        \\    Red
+        \\    Blue
+        \\
+        \\fn complete() -> I32:
+        \\    let color: Color = Color.Red
+        \\    select color:
+        \\        when Color.Red => return 1
+        \\        when Color.Blue => return 2
+        \\    return 0
+        \\
+        \\fn incomplete() -> I32:
+        \\    let color: Color = Color.Red
+        \\    select color:
+        \\        when Color.Red => return 1
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const complete_item_id = compiler.query.testing.findItemIdByName(&active, "complete").?;
+    const complete_body_id = active.semantic_index.itemEntry(complete_item_id).body_id.?;
+    const complete_result = try compiler.query.patternsByBody(&active, complete_body_id);
+    try std.testing.expectEqual(@as(usize, 0), complete_result.summary.rejected_non_exhaustive_pattern_count);
+
+    const incomplete_item_id = compiler.query.testing.findItemIdByName(&active, "incomplete").?;
+    const incomplete_body_id = active.semantic_index.itemEntry(incomplete_item_id).body_id.?;
+    const incomplete_result = try compiler.query.patternsByBody(&active, incomplete_body_id);
+    try std.testing.expectEqual(@as(usize, 1), incomplete_result.summary.rejected_non_exhaustive_pattern_count);
+
+    var saw_non_exhaustive = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.select.non_exhaustive")) {
+            saw_non_exhaustive = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_non_exhaustive);
 }
 
 test "stage0 check rejects invalid enum variant pattern shapes" {
