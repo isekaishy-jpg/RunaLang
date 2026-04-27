@@ -8,6 +8,7 @@ Runa uses `Send` as the first-wave concurrency-crossing marker trait.
 - `Send` is a built-in reserved marker trait.
 - `Send` satisfaction is compiler-owned and spec-owned in v1.
 - User-written `impl Send for Type` is not part of v1.
+- No package, including the standard library, receives privileged `Send`-impl authority in v1.
 - `spawn` and later worker-crossing runtime surfaces use `Send` as the safe-crossing gate.
 
 ## Built-In Trait
@@ -78,6 +79,14 @@ These are not `Send` by default in v1:
 
 Later explicit concurrency-marker growth may add narrower rules, but no fallback `Send` widening exists in v1.
 
+## Deferred Growth Direction
+
+- Later `Send` growth, if added, should use explicit `unsafe impl Send for Type` on local nominal types.
+- Later `Send` growth should not use package-specific privilege such as "std-only open `impl Send`".
+- Later `Send` growth does not by itself widen borrows, references, views, raw pointers, plain `opaque type`, or handles.
+- Any later `Send` opt-in remains separate from any future `Share`-style contract.
+- `Share` is not part of v1 and is not implied by `Send`.
+
 ## Relationship To Other Specs
 
 - Async concurrency semantics are defined in `spec/async-and-concurrency.md`.
@@ -92,6 +101,7 @@ Later explicit concurrency-marker growth may add narrower rules, but no fallback
 The compiler must reject:
 
 - user-written `impl Send for Type` in v1
+- package-specific privileged `Send` impl lanes in v1
 - treating borrows, references, or views as `Send` by default
 - treating raw pointers as `Send` by default
 - treating handles or plain `opaque type` families as `Send` by default

@@ -51,6 +51,7 @@ Law:
   - retained borrows into the iterated family
   - owned copyable items
 - Consuming iteration and mutable iteration may be added later only by explicit capability growth.
+- `Iterable['a]` does not imply mutable or consuming iteration capability.
 
 ## `repeat` Lowering Contract
 
@@ -61,6 +62,20 @@ Law:
 - `Option.None` ends the loop.
 - No fallback iteration path exists outside this capability contract.
 - No hidden move or implicit copy of non-copyable elements from read-borrowed storage exists in this lowering.
+
+## Deferred Growth Shape
+
+- Mutable iteration is not part of v1.
+- Consuming iteration is not part of v1.
+- Later mutable iteration should use a separate explicit capability instead of overloading `Iterable['a]`.
+- Later consuming iteration should use a separate explicit capability instead of overloading `Iterable['a]`.
+- `repeat pattern in items:` remains read-oriented unless a later spec explicitly grows a distinct mutable or consuming loop surface.
+- For later ordered mutable families such as `List[T]`, the expected mutable-yield direction is `hold['a] edit T`.
+- For later `Map[K, V]`, the expected mutable-yield direction is `(hold['a] read K, hold['a] edit V)`.
+- Later mutable map iteration must not yield editable keys.
+- For later consuming sequence families such as `List[T]`, the expected consuming-yield direction is owned `T`.
+- For later consuming `Map[K, V]`, the expected consuming-yield direction is owned `(K, V)`.
+- Exact future trait or capability names are not locked by this spec revision.
 
 ## Keyed Access Capability
 

@@ -95,6 +95,9 @@ Builtin equality and ordering are not implied in v1 for:
 
 Those may gain comparison only through later explicit contracts.
 
+`Eq` and `Hash` are separate explicit trait contracts from `spec/equality-and-hashing.md`.
+Satisfying `Eq` does not by itself expand builtin `==` and `!=` operator availability in v1.
+
 ## Relationship To Other Specs
 
 - Ownership and invalidation are defined in `spec/ownership-model.md`.
@@ -103,6 +106,7 @@ Those may gain comparison only through later explicit contracts.
 - Tuple copyability depends on `spec/tuples.md`.
 - Array copyability depends on `spec/arrays.md`.
 - Builtin operator surface is defined in `spec/expressions-and-operators.md`.
+- Explicit equality and hashing contract law is defined in `spec/equality-and-hashing.md`.
 - Handle-family restrictions are defined in `spec/handles.md`.
 - Async task-handle restrictions are defined in `spec/async-and-concurrency.md`.
 

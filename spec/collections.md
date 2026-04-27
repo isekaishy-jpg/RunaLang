@@ -69,9 +69,10 @@ Fixed-size array law is defined in `spec/arrays.md`.
 ## Sequence And Map Participation
 
 - Ordered sequence families participate through the index domain and index-range domain.
-- Associative families participate through their declared key type.
+- Associative families participate through their declared key type and any explicit key contract required by the family.
 - Future sequence families such as arrays, deques, ropes, image buffers, and audio buffers may join existing syntax by implementing the required capabilities.
 - Future associative families such as ordered maps may join existing syntax by implementing the required capabilities.
+- The first-wave standard `Map[K, V]` family requires `K: Eq` and `K: Hash`; later ordered-map families may use separate ordered-key contracts.
 
 ## Iteration
 
@@ -80,15 +81,18 @@ Fixed-size array law is defined in `spec/arrays.md`.
 - The collection model must leave room for ownership-aware iteration behavior without redesign.
 - Read-oriented iteration may yield retained borrows for non-copyable elements or owned copyable items, depending on the family contract.
 - Map iteration yields pair-like tuple values; tuple law is defined in `spec/tuples.md`.
+- v1 collection iteration does not infer mutable or consuming behavior from context.
+- Later mutable or consuming iteration must come from explicit capability growth, not silent mode switching inside `repeat`.
 
 ## Keyed Access
 
 - `value[key]` requires keyed access capability.
 - Sequence-like families use index-domain keys.
 - Ordered subrange access uses index-range keys.
-- Associative families use their declared key type.
+- Associative families use their declared key type and any family-required key contract.
 - `[]` is strict access.
 - `[]` never implies clamping, negative indexing, implicit default values, or silent fallback behavior.
+- The first-wave standard `Map[K, V]` family uses exact `K` lookup only; borrowed-equivalent and heterogeneous lookup are not part of v1.
 
 ## Range And View Semantics
 
@@ -140,6 +144,7 @@ The zero-arg form above is valid only if `List` explicitly defines a standard co
 
 - This spec defines collection law, not every library API.
 - Capability-layer details are defined in `spec/collection-capabilities.md`.
+- Equality and hashing key-contract law is defined in `spec/equality-and-hashing.md`.
 - First-wave ordinary `List[T]` and `Map[K, V]` family APIs are defined in `spec/standard-collection-apis.md`.
 - Operations outside that first-wave standardized surface remain ordinary contracts or later library growth.
 - Fixed-size array semantics live in `spec/arrays.md`.
@@ -152,6 +157,7 @@ The compiler or runtime must reject:
 - `repeat pattern in items:` when `items` lacks iteration capability
 - `value[key]` when the value lacks keyed access capability
 - keys outside the accepted key domain for the accessed family
+- associative-family use when the key type lacks a required family key contract
 - malformed or invalid range-domain access
 - out-of-bounds strict sequence access
 - strict associative access that misses the required key

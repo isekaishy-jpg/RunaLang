@@ -131,7 +131,10 @@ The goal is to implement all specs, not a partial showcase subset.
 ## Types And Data
 - [x] Authoritative conversion law in `spec/conversions.md`
 - [x] Authoritative type-alias law in `spec/type-aliases.md`
+- [x] Authoritative equality and hashing law in `spec/equality-and-hashing.md`
 - [ ] Type aliases from `spec/type-aliases.md`
+- [ ] Equality and hashing contracts from `spec/equality-and-hashing.md`
+- [ ] Narrow `Send` opt-in growth from `spec/send.md`
 - [ ] Tuples from `spec/tuples.md`
 - [ ] Arrays from `spec/arrays.md`
 - [ ] Handles from `spec/handles.md`
@@ -139,6 +142,7 @@ The goal is to implement all specs, not a partial showcase subset.
 - [ ] Text and bytes surface from `spec/text-and-bytes.md`
 - [ ] Char family support from `spec/char-family.md`
 - [ ] Collections and capabilities from `spec/collections.md`
+- [ ] Mutable and consuming collection-iteration growth from `spec/collection-capabilities.md`
 - [ ] Standard constructors from `spec/standard-constructors.md`
 - [ ] Standard collection APIs from `spec/standard-collection-apis.md`
 - [ ] Scalar and literal edge-case coverage

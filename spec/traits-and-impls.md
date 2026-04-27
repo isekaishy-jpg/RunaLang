@@ -29,6 +29,16 @@ trait Clone:
 ```
 
 ```runa
+trait Eq:
+    fn eq(read self, read other: Self) -> Bool
+```
+
+```runa
+trait Hash:
+    fn hash(read self) -> U64
+```
+
+```runa
 trait Iterator:
     type Item
     fn next(edit self) -> Option[Self.Item]
@@ -210,6 +220,7 @@ where T: Clone:
 - Async and suspend callable law is defined in `spec/async-and-concurrency.md`.
 - Built-in `Send` marker-trait law is defined in `spec/send.md`.
 - Standard iterator and collection-capability contracts are defined in `spec/collection-capabilities.md`.
+- Equality and hashing contract law is defined in `spec/equality-and-hashing.md`.
 - Type declarations are defined in `spec/types.md`.
 - Generic-constraint law is defined in `spec/where.md`.
 - Invocation syntax for methods is defined in `spec/invocation.md`.

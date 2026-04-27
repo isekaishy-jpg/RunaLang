@@ -32,6 +32,7 @@ impl[T] List[T]:
 Law:
 
 - `count` returns the current element count.
+- First-wave read iteration yields `hold['a] read T` through `Iterable['a]`.
 - `push` appends one element at the end.
 - `pop` removes and returns the last element when present, otherwise `Option.None`.
 - `insert` accepts only valid insertion positions in the range `0..=count`.
@@ -44,6 +45,7 @@ Law:
 - `Map[K, V]` is the standard first-wave associative map family.
 - `Map[K, V]` participates in iteration and keyed access through `spec/collection-capabilities.md`.
 - `Map[K, V]` defines a zero-arg standard constructor contract through `spec/standard-constructors.md`.
+- The first-wave standard `Map[K, V]` surface requires `K: Eq` and `K: Hash`.
 
 The standard first-wave `Map[K, V]` surface includes:
 
@@ -61,10 +63,15 @@ impl[K, V] Map[K, V]:
 Law:
 
 - `count` returns the current entry count.
+- Key identity uses `Eq.eq`.
+- Key bucket placement uses `Hash.hash`.
+- First-wave read iteration yields `(hold['a] read K, hold['a] read V)` through `Iterable['a]`.
 - `contains_key` is the explicit presence query.
 - `insert` adds or replaces one entry and returns `Option.Some(old_value)` when replacement occurred.
 - `remove` removes one entry when present and returns `Option.Some(value)`, otherwise `Option.None`.
 - Strict `value[key]` access remains separate and still rejects a missing key.
+- First-wave `Map` lookup uses exact key type `K`; borrowed-equivalent and heterogeneous lookup are not part of v1.
+- First-wave `Map` iteration order is not part of the language or standard-library contract.
 - `clear` removes all entries and obeys ordinary invalidation law.
 - `reserve` is an explicit capacity-growth request, not hidden fallback behavior.
 
@@ -72,6 +79,7 @@ Law:
 
 - Collection syntax is defined in `spec/collections.md`.
 - Collection capability participation is defined in `spec/collection-capabilities.md`.
+- Equality and hashing key-contract law is defined in `spec/equality-and-hashing.md`.
 - Standard constructor contracts are defined in `spec/standard-constructors.md`.
 - `Option[...]` law is defined in `spec/result-and-option.md`.
 - Value and ownership law are defined in `spec/value-semantics.md` and `spec/ownership-model.md`.
@@ -81,6 +89,7 @@ Law:
 The compiler or runtime must reject:
 
 - treating `List.remove` as clamping or forgiving out-of-range access
+- using first-wave `Map[K, V]` with a key type that lacks required `Eq` and `Hash` satisfaction
 - treating `Map[key]` as equivalent to `contains_key` or `remove`
 - hidden fallback insertion or reserve behavior
 - assuming `List[T]` or `Map[K, V]` APIs exist under different standardized names in v1

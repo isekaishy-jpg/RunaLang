@@ -29,6 +29,7 @@ Conversion law is defined in `spec/conversions.md`.
 Type-declaration law is defined in `spec/types.md`.
 Type-alias law is defined in `spec/type-aliases.md`.
 Trait and impl law is defined in `spec/traits-and-impls.md`.
+Equality and hashing contract law is defined in `spec/equality-and-hashing.md`.
 Reflection law is defined in `spec/reflection.md`.
 Domain-state root law is defined in `spec/domain-state-roots.md`.
 Domain-state surface law is defined in `spec/domain-state-surface.md`.
