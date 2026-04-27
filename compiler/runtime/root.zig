@@ -1,11 +1,13 @@
 pub const entry = @import("entry/root.zig");
 pub const abort = @import("abort/root.zig");
 pub const target = @import("target/root.zig");
+pub const dynamic_library = @import("dynamic_library/root.zig");
 
 pub const private_to_compiler = true;
 pub const owns_only = [_][]const u8{
     "entry",
     "abort",
+    "dynamic_library",
     "target_leafs",
 };
 

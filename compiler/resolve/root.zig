@@ -79,7 +79,7 @@ pub fn resolveModule(allocator: Allocator, module: hir.Module, diagnostics: *dia
 fn categoryFor(kind: ast.ItemKind) SymbolCategory {
     return switch (kind) {
         .function, .suspend_function, .const_item => .value,
-        .struct_type, .enum_type, .union_type, .opaque_type => .type_decl,
+        .type_alias, .struct_type, .enum_type, .union_type, .opaque_type => .type_decl,
         .trait_type => .trait_decl,
         .impl_block => .impl_block,
         .foreign_function => .foreign_decl,

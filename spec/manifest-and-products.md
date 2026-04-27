@@ -38,7 +38,7 @@ Example:
 ```toml
 [package]
 name = "demo"
-version = "0.1.0"
+version = "2026.0.01"
 edition = "2026"
 lang_version = "0.00"
 ```
@@ -47,12 +47,28 @@ Law:
 
 - `name` is the stable package identity name used by dependency and package law.
 - `version` is the package version, not the language version.
+- `version` uses the calendar package-version model from
+  `spec/dependency-resolution.md`.
 - `edition` selects the yearly language edition.
 - `edition` uses a four-digit year string.
 - `lang_version` selects the language version within the chosen edition.
 - `lang_version` uses `0.00`-style formatting in v1.
 - The initial first-wave language version for an edition is `0.00`.
 - Package version and language version are separate and must not be conflated.
+- The Runa toolchain itself follows the same package-version model.
+
+## Package Versions
+
+- Package versions use exact calendar versioning.
+- The canonical version format is `YYYY.0.N`.
+- `YYYY` is the four-digit release year.
+- The middle component is reserved `0` in v1.
+- `N` is the within-year release counter.
+- The canonical rendering of `N` uses at least two digits.
+- The first release in one year is therefore `YYYY.0.01`.
+- Same-year increments are ordinary release progression.
+- A year change begins a new major or breaking line.
+- Package versioning law is defined in `spec/dependency-resolution.md`.
 
 ## Editions And Language Versions
 
@@ -70,32 +86,40 @@ Law:
 - The first-wave accepted dependency forms are:
   - version string
   - inline table with `version`
-  - inline table with `version` and `registry`
+  - inline table with `version` and optional `edition` and `lang_version`
+  - inline table with `version`, `registry`, and optional `edition` and `lang_version`
   - inline table with `path`
-  - inline table with `version` and `path`
+  - inline table with `version`, `path`, and optional `edition` and `lang_version`
 
 Examples:
 
 ```toml
 [dependencies]
-coremath = "1.2.0"
+coremath = "2026.0.56"
 nativewin = { path = "../nativewin" }
-fastfmt = { version = "0.3.1" }
-privatefmt = { version = "0.3.1", registry = "company" }
-localfmt = { version = "0.3.1", path = "../fastfmt" }
+fastfmt = { version = "2026.0.56" }
+privatefmt = { version = "2026.0.56", registry = "company" }
+localfmt = { version = "2026.0.56", path = "../fastfmt" }
+coreui = { version = "2026.0.56", edition = "2026" }
 ```
 
 Law:
 
 - Dependency edges must match `spec/packages-and-build.md`.
+- Dependency version matching must match `spec/dependency-resolution.md`.
 - Path dependencies are explicit local package dependencies.
 - Versioned dependencies are explicit resolved-package dependencies.
 - `registry` selects one explicit named registry for versioned dependency resolution.
 - A bare version string or inline `{ version = ... }` uses the configured default registry.
 - `{ version = ..., registry = ... }` is versioned registry resolution against the named registry.
+- `version` is an exact calendar-version pin in v1.
+- `edition` and `lang_version` on one dependency entry are optional validation
+  constraints, not second selectors.
 - `{ path = ... }` is path-based local resolution and does not consult registries for source acquisition.
 - `{ version = ..., path = ... }` is still path-based local resolution.
 - In `{ version = ..., path = ... }`, `version` is a validation constraint against the dependency package found at `path`, not a second source of package acquisition.
+- `path` may point into workspace-root `vendor/` when vendoring is used.
+- no dedicated `vendor = ...` dependency key exists in v1.
 - `path` and `registry` must not appear together in one dependency entry.
 - Hidden fallback dependency resolution is not part of the model.
 
@@ -223,8 +247,12 @@ Manifest owns:
 ## Relationship To Other Specs
 
 - Package graph, lockfile, and incremental behavior are defined in `spec/packages-and-build.md`.
+- Dependency resolution and version law are defined in
+  `spec/dependency-resolution.md`.
 - Managed package lifecycle is defined in `spec/package-management.md`.
 - Registry identity is defined in `spec/registry-model.md`.
+- Local registry, vendoring, and exchange law is defined in
+  `spec/local-registries-vendoring-and-exchange.md`.
 - Lockfile structure is defined in `spec/lockfile.md`.
 - Publication flow is defined in `spec/publication.md`.
 - Product kinds are defined in `spec/product-kinds.md`.
@@ -239,13 +267,17 @@ The toolchain must reject:
 - missing `runa.toml` for a package build
 - missing required `[package]` fields
 - malformed edition strings
+- malformed package version strings
 - malformed `lang_version` strings
+- malformed dependency version strings
 - package version treated as language version
 - language version treated as package version
+- unsupported semver-style or range dependency syntax
 - unsupported product kinds
 - invalid product roots
 - missing dependency identity or unsupported dependency forms
 - conflicting dependency source keys such as `path` with `registry`
+- dependency edition or language-version validation mismatch
 - path dependency version mismatch against an explicit `{ version = ..., path = ... }` declaration
 - hidden fallback target selection
 - hidden fallback product selection

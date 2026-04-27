@@ -252,6 +252,7 @@ fn itemNameFromSyntax(lowered_syntax: ast.ItemSyntax) []const u8 {
     return switch (lowered_syntax) {
         .function => |signature| if (signature.name) |name| name.text else "",
         .const_item => |signature| if (signature.name) |name| name.text else "",
+        .type_alias => |signature| if (signature.name) |name| name.text else "",
         .named_decl => |signature| if (signature.name) |name| name.text else "",
         .use_decl => |binding| if (binding.alias) |alias| alias.text else if (binding.leaf) |leaf| leaf.text else "",
         .impl_block, .none => "",
@@ -368,6 +369,7 @@ fn astItemKind(kind: cst.NodeKind) ast.ItemKind {
         .suspend_function_item => .suspend_function,
         .foreign_function_item => .foreign_function,
         .const_item => .const_item,
+        .type_alias_item => .type_alias,
         .struct_item => .struct_type,
         .enum_item => .enum_type,
         .union_item => .union_type,

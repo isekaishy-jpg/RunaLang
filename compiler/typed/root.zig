@@ -86,6 +86,7 @@ pub const Expr = typed_expr.Expr;
 pub const Statement = typed_statement.Statement;
 pub const Block = typed_statement.Block;
 pub const FunctionData = typed_decls.FunctionData;
+pub const CheckedFunctionData = typed_decls.FunctionData;
 pub const ConstData = typed_decls.ConstData;
 pub const StructField = typed_decls.StructField;
 pub const TupleField = typed_decls.TupleField;
@@ -303,7 +304,7 @@ fn createTypedItem(
 
     const category: ItemCategory = switch (item.kind) {
         .function, .suspend_function, .const_item => .value,
-        .struct_type, .enum_type, .union_type, .opaque_type => .type_decl,
+        .type_alias, .struct_type, .enum_type, .union_type, .opaque_type => .type_decl,
         .trait_type => .trait_decl,
         .impl_block => .impl_block,
         .foreign_function => .foreign_decl,

@@ -3,6 +3,7 @@ const const_ir = @import("const_ir.zig");
 const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
+const standard_families = @import("standard_families.zig");
 const typed = @import("../typed/root.zig");
 const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
@@ -279,6 +280,9 @@ fn enumSubjectSelectExhaustive(
 ) !bool {
     const enum_name = typed_text.baseTypeName(raw_type_name);
     const subject_temp_name = statement.select_subject_temp_name orelse return false;
+    if (try standard_families.exhaustiveVariantNames(active.allocator, raw_type_name)) |variants| {
+        return standardSubjectSelectExhaustive(statement, subject_temp_name, raw_type_name, variants);
+    }
     const item_id = resolveTypeItemId(active, module_id, enum_name) orelse return false;
     const signature = try signature_resolver(active, item_id);
     const enum_signature = switch (signature.facts) {
@@ -291,6 +295,25 @@ fn enumSubjectSelectExhaustive(
         for (statement.select_arms) |arm| {
             const covered_variant = enumPatternVariant(arm.condition, subject_temp_name, enum_name) orelse continue;
             if (!std.mem.eql(u8, covered_variant, variant.name)) continue;
+            covered = true;
+            break;
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+fn standardSubjectSelectExhaustive(
+    statement: checked_body.StatementSite,
+    subject_temp_name: []const u8,
+    raw_type_name: []const u8,
+    variants: []const []const u8,
+) bool {
+    for (variants) |variant| {
+        var covered = false;
+        for (statement.select_arms) |arm| {
+            const covered_variant = enumPatternVariant(arm.condition, subject_temp_name, raw_type_name) orelse continue;
+            if (!std.mem.eql(u8, covered_variant, variant)) continue;
             covered = true;
             break;
         }

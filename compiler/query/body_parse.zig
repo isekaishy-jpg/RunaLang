@@ -1,7 +1,10 @@
 const std = @import("std");
 const array_list = std.array_list;
+const c_va_list = @import("../abi/c/va_list.zig");
 const ast = @import("../ast/root.zig");
 const diag = @import("../diag/root.zig");
+const dynamic_library = @import("../runtime/dynamic_library/root.zig");
+const foreign_callable_types = @import("foreign_callable_types.zig");
 const query_attributes = @import("attributes.zig");
 const expression_parse = @import("expression_parse.zig");
 const pattern_parse = @import("pattern_parse.zig");
@@ -9,6 +12,7 @@ const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
 const typed_expr = @import("../typed/expr.zig");
 const type_support = @import("type_support.zig");
+const tuple_types = @import("tuple_types.zig");
 const query_text = @import("text.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
@@ -54,7 +58,7 @@ pub fn parseFunctionBody(
     try scope.extendFrom(global_scope);
 
     for (function.parameters.items) |parameter| {
-        try scope.putWithOrigin(parameter.name, parameter.ty, switch (parameter.mode) {
+        try scope.putWithOrigin(c_va_list.localName(parameter.name), parameter.ty, switch (parameter.mode) {
             .read => false,
             .owned, .take, .edit => true,
         }, boundaryFromParameter(parameter));
@@ -785,7 +789,9 @@ fn parseBindingStatementSyntax(
     );
     const binding_type = if (!declared_type.isUnsupported()) declared_type else expr.ty;
 
-    if (!declared_type.isUnsupported() and !expr.ty.isUnsupported() and !expr.ty.eql(declared_type)) {
+    if (!declared_type.isUnsupported() and !expr.ty.isUnsupported() and
+        !type_support.callArgumentTypeCompatible(expr.ty, declared_type, declared_type.displayName(), &.{}, false))
+    {
         try diagnostics.add(.@"error", "type.binding.mismatch", span, "local binding '{s}' initializer type does not match declared type", .{name});
     }
 
@@ -857,7 +863,10 @@ fn parseAssignmentStatementSyntax(
         try diagnostics.add(.@"error", "type.assign.mismatch", span, "assignment target '{s}' does not match the right-hand type", .{resolved_target.rendered_name});
     }
 
-    if (assign.op == null and std.mem.indexOfScalar(u8, resolved_target.rendered_name, '.') == null) {
+    if (assign.op == null and
+        std.mem.indexOfScalar(u8, resolved_target.rendered_name, '.') == null and
+        std.mem.indexOfScalar(u8, resolved_target.rendered_name, '[') == null)
+    {
         scope.updateOrigin(resolved_target.rendered_name, inferExprBoundaryTypeInScope(scope, expr));
     }
 
@@ -907,6 +916,10 @@ fn resolveAssignmentTargetSyntax(
                 },
             };
             const field_name = std.mem.trim(u8, field.field_name.text, " \t");
+            if (tuple_types.projectionIndex(field_name) != null) {
+                try diagnostics.add(.@"error", "type.tuple.assign", span, "tuple field assignment is not part of v1", .{});
+                return null;
+            }
             if (!isPlainIdentifier(base_name) or !isPlainIdentifier(field_name)) {
                 try diagnostics.add(.@"error", "type.assign.target", span, "stage0 assignment supports only plain locals or one struct field projection", .{});
                 return null;
@@ -947,6 +960,46 @@ fn resolveAssignmentTargetSyntax(
                 struct_name,
             });
             return null;
+        },
+        .index => |index| {
+            const base_name = switch (index.base.node) {
+                .name => |name| std.mem.trim(u8, name.text, " \t"),
+                else => {
+                    try diagnostics.add(.@"error", "type.assign.target", span, "array element assignment requires a local array base", .{});
+                    return null;
+                },
+            };
+            if (!isPlainIdentifier(base_name)) {
+                try diagnostics.add(.@"error", "type.assign.target", span, "array element assignment requires a local array base", .{});
+                return null;
+            }
+            const base_type = scope.get(base_name) orelse {
+                try diagnostics.add(.@"error", "type.assign.unknown", span, "assignment target '{s}' is not a known local name", .{base_name});
+                return null;
+            };
+            if (!scope.isMutable(base_name)) {
+                try diagnostics.add(.@"error", "type.assign.immutable", span, "assignment target '{s}' is not mutable in stage0", .{base_name});
+                return null;
+            }
+            const element_type = fixedArrayElementType(base_type) orelse {
+                try diagnostics.add(.@"error", "type.assign.target", span, "array element assignment requires a fixed array target", .{});
+                return null;
+            };
+            const index_text = simpleIndexTargetText(index.index) orelse {
+                try diagnostics.add(.@"error", "type.assign.target", span, "stage0 array element assignment requires a simple index key", .{});
+                return null;
+            };
+            if (index.index.node == .name) {
+                const key_type = scope.get(index_text) orelse .unsupported;
+                if (!key_type.eql(types.TypeRef.fromBuiltin(.index)) and !key_type.isUnsupported()) {
+                    try diagnostics.add(.@"error", "type.expr.keyed_access.index", span, "keyed access requires an Index expression", .{});
+                }
+            }
+            return .{
+                .rendered_name = try std.fmt.allocPrint(allocator, "{s}[{s}]", .{ base_name, index_text }),
+                .owns_name = true,
+                .ty = element_type,
+            };
         },
         else => {
             try diagnostics.add(.@"error", "type.assign.target", span, "stage0 assignment supports only plain locals or one struct field projection", .{});
@@ -1060,11 +1113,50 @@ fn resolveDeclaredValueType(
 ) !types.TypeRef {
     const builtin = types.Builtin.fromName(type_name);
     if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+    if (c_va_list.isTypeName(type_name)) return .{ .named = c_va_list.type_name };
+    if (dynamic_library.isTypeName(type_name)) return .{ .named = dynamic_library.type_name };
+    if (types.CAbiAlias.fromName(type_name) != null) return .{ .named = type_name };
+    if (rawPointerPointee(type_name) != null) return .{ .named = type_name };
+    if (foreign_callable_types.startsForeignCallableType(type_name)) return .{ .named = type_name };
+    if (std.mem.startsWith(u8, std.mem.trim(u8, type_name, " \t"), "Result[")) return .{ .named = type_name };
     if (std.mem.startsWith(u8, std.mem.trim(u8, type_name, " \t"), "[")) return .{ .named = type_name };
+    if (try tuple_types.isTupleTypeName(diagnostics.allocator, type_name)) return .{ .named = type_name };
     if (findStructPrototype(struct_prototypes, type_name) != null) return .{ .named = type_name };
     if (findEnumPrototype(enum_prototypes, type_name) != null) return .{ .named = type_name };
     try diagnostics.add(.@"error", "type.binding.declared", span, "unsupported stage0 local binding type '{s}'", .{type_name});
     return .unsupported;
+}
+
+fn rawPointerPointee(raw_type_name: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "*read ")) return std.mem.trim(u8, trimmed["*read ".len..], " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "*edit ")) return std.mem.trim(u8, trimmed["*edit ".len..], " \t\r\n");
+    return null;
+}
+
+fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
+    const raw = switch (ty) {
+        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
+        else => return null,
+    };
+    if (!std.mem.startsWith(u8, raw, "[")) return null;
+    const close_index = findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
+    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t\r\n").len != 0) return null;
+    const inner = raw[1..close_index];
+    const separator = findTopLevelHeaderScalar(inner, ';') orelse return null;
+    const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
+    if (element_name.len == 0) return null;
+    const builtin = types.Builtin.fromName(element_name);
+    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+    return .{ .named = element_name };
+}
+
+fn simpleIndexTargetText(expr: *const ast.BodyExprSyntax) ?[]const u8 {
+    return switch (expr.node) {
+        .integer => |integer| std.mem.trim(u8, integer.text, " \t\r\n"),
+        .name => |name| std.mem.trim(u8, name.text, " \t\r\n"),
+        else => null,
+    };
 }
 
 const NameSet = struct {
@@ -1195,4 +1287,3 @@ pub const Scope = struct {
         }
     }
 };
-

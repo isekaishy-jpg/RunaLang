@@ -1,4 +1,5 @@
 const query_types = @import("types.zig");
+const c_va_list = @import("../abi/c/va_list.zig");
 const typed = @import("../typed/root.zig");
 const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
@@ -104,6 +105,6 @@ pub fn seedModuleConsts(scope: *ScopeStack, body: query_types.CheckedBody) !void
 
 pub fn seedParameters(scope: *ScopeStack, parameters: []const typed.Parameter) !void {
     for (parameters) |parameter| {
-        try scope.putWithOrigin(parameter.name, parameter.ty, parameter.mode != .read, type_support.boundaryFromParameter(parameter));
+        try scope.putWithOrigin(c_va_list.localName(parameter.name), parameter.ty, parameter.mode != .read, type_support.boundaryFromParameter(parameter));
     }
 }

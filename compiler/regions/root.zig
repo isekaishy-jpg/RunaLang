@@ -660,6 +660,13 @@ fn inferExprOrigins(
                 try origins.add(projectBoundary(base_origin, typeRefRawName(expr.ty)));
             }
         },
+        .tuple => |tuple| {
+            for (tuple.items) |item| {
+                var item_origins = try inferExprOrigins(allocator, state, item);
+                defer item_origins.deinit();
+                try origins.mergeFrom(&item_origins);
+            }
+        },
         .index => |index| {
             var base_origins = try inferExprOrigins(allocator, state, index.base);
             defer base_origins.deinit();

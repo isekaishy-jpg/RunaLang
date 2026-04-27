@@ -3,10 +3,12 @@ const array_list = std.array_list;
 const ast = @import("../ast/root.zig");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
+const standard_families = @import("standard_families.zig");
 const typed_expr = @import("../typed/expr.zig");
 const signatures = @import("signatures.zig");
 const typed_statement = @import("../typed/statement.zig");
 const typed_text = @import("text.zig");
+const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const Expr = typed_expr.Expr;
@@ -256,15 +258,119 @@ fn parseSubjectPatternSyntaxRecursive(
                 binding_names,
             );
         },
-        .tuple => {
-            try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", pattern_syntax.span, "tuple subject patterns require a tuple-typed subject", .{});
-            return try makeInvalidSubjectPattern(allocator);
-        },
+        .tuple => |items| return try parseTuplePatternSyntax(
+            parseExpressionSyntaxFn,
+            allocator,
+            pattern_syntax.span,
+            items,
+            subject,
+            current_symbol_prefix,
+            scope,
+            prototypes,
+            method_prototypes,
+            struct_prototypes,
+            enum_prototypes,
+            diagnostics,
+            suspend_context,
+            unsafe_context,
+            pattern_diagnostics,
+            binding_names,
+        ),
         .@"error" => {
             try pattern_diagnostics.add(.@"error", "type.pattern.syntax", pattern_syntax.span, "unsupported subject pattern syntax", .{});
             return try makeInvalidSubjectPattern(allocator);
         },
     }
+}
+
+fn parseTuplePatternSyntax(
+    comptime parseExpressionSyntaxFn: anytype,
+    allocator: Allocator,
+    span: source.Span,
+    items: []const *ast.BodyPatternSyntax,
+    subject: *Expr,
+    current_symbol_prefix: []const u8,
+    scope: anytype,
+    prototypes: anytype,
+    method_prototypes: anytype,
+    struct_prototypes: anytype,
+    enum_prototypes: anytype,
+    diagnostics: *diag.Bag,
+    suspend_context: bool,
+    unsafe_context: bool,
+    pattern_diagnostics: *PatternDiagnosticCollector,
+    binding_names: *BindingNameSet,
+) anyerror!SubjectPattern {
+    const subject_type_name = switch (subject.ty) {
+        .named => |name| name,
+        else => {
+            try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", span, "tuple subject patterns require a tuple-typed subject", .{});
+            return try makeInvalidSubjectPattern(allocator);
+        },
+    };
+    const parts = (try tuple_types.splitTypeParts(allocator, subject_type_name)) orelse {
+        try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", span, "tuple subject patterns require a tuple-typed subject", .{});
+        return try makeInvalidSubjectPattern(allocator);
+    };
+    defer allocator.free(parts);
+    if (!tuple_types.validTupleParts(parts)) {
+        try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", span, "tuple subject patterns require a tuple-typed subject", .{});
+        return try makeInvalidSubjectPattern(allocator);
+    }
+    if (items.len != parts.len) {
+        try pattern_diagnostics.add(.@"error", "type.pattern.tuple_arity", span, "tuple pattern has wrong arity", .{});
+        return try makeInvalidSubjectPattern(allocator);
+    }
+
+    var condition = try makeBoolExpr(allocator, true);
+    errdefer {
+        condition.deinit(allocator);
+        allocator.destroy(condition);
+    }
+    var bindings = array_list.Managed(Statement.SelectBinding).init(allocator);
+    errdefer {
+        for (bindings.items) |binding| binding.deinit(allocator);
+        bindings.deinit();
+    }
+
+    var irrefutable = true;
+    for (items, parts, 0..) |item_pattern, part, index| {
+        const field_subject = try makeFieldExpr(allocator, subject, tuple_types.shallowTypeRefFromName(part), tuplePayloadFieldName(index));
+        defer {
+            field_subject.deinit(allocator);
+            allocator.destroy(field_subject);
+        }
+
+        var subpattern = try parseSubjectPatternSyntaxRecursive(
+            parseExpressionSyntaxFn,
+            allocator,
+            item_pattern,
+            field_subject,
+            current_symbol_prefix,
+            scope,
+            prototypes,
+            method_prototypes,
+            struct_prototypes,
+            enum_prototypes,
+            diagnostics,
+            suspend_context,
+            unsafe_context,
+            pattern_diagnostics,
+            binding_names,
+        );
+
+        condition = try makeBoolAndExpr(allocator, condition, subpattern.condition);
+        for (subpattern.bindings) |binding| try bindings.append(binding);
+        allocator.free(subpattern.bindings);
+        subpattern.bindings = &.{};
+        irrefutable = irrefutable and subpattern.irrefutable;
+    }
+
+    return .{
+        .condition = condition,
+        .bindings = try bindings.toOwnedSlice(),
+        .irrefutable = irrefutable,
+    };
 }
 
 fn parseLiteralPatternSyntax(
@@ -503,6 +609,27 @@ fn parseEnumVariantPatternSyntax(
         try pattern_diagnostics.add(.@"error", "type.pattern.enum_syntax", span, "malformed enum variant pattern '{s}'", .{aggregate.name.text});
         return try makeInvalidSubjectPattern(allocator);
     };
+    if (standard_families.familyFromName(split.enum_name) != null) {
+        return parseStandardEnumVariantSubjectPatternSyntax(
+            parseExpressionSyntaxFn,
+            allocator,
+            aggregate,
+            split,
+            subject,
+            current_symbol_prefix,
+            scope,
+            prototypes,
+            method_prototypes,
+            struct_prototypes,
+            enum_prototypes,
+            diagnostics,
+            span,
+            suspend_context,
+            unsafe_context,
+            pattern_diagnostics,
+            binding_names,
+        );
+    }
     switch (subject.ty) {
         .named => |subject_name| {
             if (!std.mem.eql(u8, subject_name, split.enum_name)) {
@@ -739,6 +866,130 @@ fn parseEnumVariantPatternSyntax(
     }
 }
 
+fn parseStandardEnumVariantSubjectPatternSyntax(
+    comptime parseExpressionSyntaxFn: anytype,
+    allocator: Allocator,
+    aggregate: ast.BodyPatternSyntax.Aggregate,
+    split: VariantPath,
+    subject: *Expr,
+    current_symbol_prefix: []const u8,
+    scope: anytype,
+    prototypes: anytype,
+    method_prototypes: anytype,
+    struct_prototypes: anytype,
+    enum_prototypes: anytype,
+    diagnostics: *diag.Bag,
+    span: source.Span,
+    suspend_context: bool,
+    unsafe_context: bool,
+    pattern_diagnostics: *PatternDiagnosticCollector,
+    binding_names: *BindingNameSet,
+) anyerror!SubjectPattern {
+    const maybe_variant = try standard_families.variantForSubject(allocator, subject.ty, split.enum_name, split.variant_name);
+    const variant = maybe_variant orelse {
+        switch (subject.ty) {
+            .named => |subject_name| try pattern_diagnostics.add(.@"error", "type.pattern.enum_subject", span, "standard enum variant pattern '{s}' does not match subject type '{s}'", .{
+                aggregate.name.text,
+                subject_name,
+            }),
+            else => try pattern_diagnostics.add(.@"error", "type.pattern.enum_subject", span, "standard enum variant patterns require an enum-typed subject", .{}),
+        }
+        return try makeInvalidSubjectPattern(allocator);
+    };
+
+    const subject_tag = try makeFieldExpr(allocator, subject, types.TypeRef.fromBuiltin(.i32), "tag");
+    const tag_condition = try makeEqExpr(allocator, subject_tag, try makeEnumTagExprRaw(allocator, variant.concrete_type_name, variant.family_name, variant.variant_name));
+
+    const payload_type_name = variant.payload_type_name orelse {
+        switch (aggregate.payload) {
+            .none => {},
+            else => {
+                tag_condition.deinit(allocator);
+                allocator.destroy(tag_condition);
+                try pattern_diagnostics.add(.@"error", "type.pattern.enum_payload_missing", span, "unit variant '{s}.{s}' does not take payload patterns", .{
+                    variant.family_name,
+                    variant.variant_name,
+                });
+                return try makeInvalidSubjectPattern(allocator);
+            },
+        }
+        return .{
+            .condition = tag_condition,
+            .bindings = try allocator.alloc(Statement.SelectBinding, 0),
+            .irrefutable = false,
+        };
+    };
+
+    const payload_items = switch (aggregate.payload) {
+        .tuple => |items| items,
+        else => {
+            tag_condition.deinit(allocator);
+            allocator.destroy(tag_condition);
+            try pattern_diagnostics.add(.@"error", "type.pattern.enum_payload_required", span, "payload variant '{s}.{s}' requires tuple payload patterns", .{
+                variant.family_name,
+                variant.variant_name,
+            });
+            return try makeInvalidSubjectPattern(allocator);
+        },
+    };
+
+    if (payload_items.len != 1) {
+        tag_condition.deinit(allocator);
+        allocator.destroy(tag_condition);
+        try pattern_diagnostics.add(.@"error", "type.pattern.enum_tuple_arity", span, "tuple payload pattern for '{s}.{s}' has wrong arity", .{
+            variant.family_name,
+            variant.variant_name,
+        });
+        return try makeInvalidSubjectPattern(allocator);
+    }
+
+    var condition = tag_condition;
+    errdefer {
+        condition.deinit(allocator);
+        allocator.destroy(condition);
+    }
+
+    const field_subject = try makeEnumPayloadFieldExpr(
+        allocator,
+        subject,
+        variant.variant_name,
+        variant.payload_field_name.?,
+        standard_families.typeRefFromName(payload_type_name),
+    );
+    defer {
+        field_subject.deinit(allocator);
+        allocator.destroy(field_subject);
+    }
+
+    var subpattern = try parseSubjectPatternSyntaxRecursive(
+        parseExpressionSyntaxFn,
+        allocator,
+        payload_items[0],
+        field_subject,
+        current_symbol_prefix,
+        scope,
+        prototypes,
+        method_prototypes,
+        struct_prototypes,
+        enum_prototypes,
+        diagnostics,
+        suspend_context,
+        unsafe_context,
+        pattern_diagnostics,
+        binding_names,
+    );
+
+    condition = try makeBoolAndExpr(allocator, condition, subpattern.condition);
+    const bindings = subpattern.bindings;
+    subpattern.bindings = &.{};
+
+    return .{
+        .condition = condition,
+        .bindings = bindings,
+        .irrefutable = false,
+    };
+}
+
 fn makeBoolAndExpr(allocator: Allocator, lhs: *Expr, rhs: *Expr) !*Expr {
     const expr = try allocator.create(Expr);
     expr.* = .{
@@ -799,17 +1050,21 @@ fn makeEnumPayloadFieldExpr(
     return makeFieldExpr(allocator, variant_expr, field_ty, field_name);
 }
 
-fn makeEnumTagExpr(allocator: Allocator, prototype: anytype, variant_name: []const u8) !*Expr {
+fn makeEnumTagExprRaw(allocator: Allocator, enum_name: []const u8, enum_symbol: []const u8, variant_name: []const u8) !*Expr {
     const expr = try allocator.create(Expr);
     expr.* = .{
         .ty = types.TypeRef.fromBuiltin(.i32),
         .node = .{ .enum_tag = .{
-            .enum_name = prototype.name,
-            .enum_symbol = prototype.symbol_name,
+            .enum_name = enum_name,
+            .enum_symbol = enum_symbol,
             .variant_name = variant_name,
         } },
     };
     return expr;
+}
+
+fn makeEnumTagExpr(allocator: Allocator, prototype: anytype, variant_name: []const u8) !*Expr {
+    return makeEnumTagExprRaw(allocator, prototype.name, prototype.symbol_name, variant_name);
 }
 
 fn makeInvalidSubjectPattern(allocator: Allocator) !SubjectPattern {

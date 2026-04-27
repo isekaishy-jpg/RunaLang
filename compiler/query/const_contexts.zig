@@ -39,6 +39,7 @@ pub fn validateSignature(
             try validateTypeName(active, checked.module_id, function.return_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .const_item => |const_item| try validateTypeName(active, checked.module_id, const_item.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary),
+        .type_alias => |type_alias| try validateTypeName(active, checked.module_id, type_alias.target_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary),
         .struct_type => |struct_type| for (struct_type.fields) |field| {
             try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
@@ -93,7 +94,7 @@ fn validateEnumDiscriminants(
     resolve_associated_const: AssociatedResolver,
     summary: *Summary,
 ) !void {
-        const repr = try reprEnumInfo(active, checked.item.attributes);
+    const repr = try reprEnumInfo(active, checked.item.attributes);
     if (!repr.has_repr) {
         for (variants) |variant| {
             if (variant.discriminant != null) {

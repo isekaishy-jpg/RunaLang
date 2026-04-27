@@ -2,12 +2,16 @@ const ast = @import("../ast/root.zig");
 const body_scope = @import("body_scope.zig");
 const conversions = @import("conversions.zig");
 const diag = @import("../diag/root.zig");
+const dynamic_library = @import("../runtime/dynamic_library/root.zig");
+const foreign_callable_types = @import("foreign_callable_types.zig");
+const raw_pointer = @import("../raw_pointer/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
 const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
+const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -16,6 +20,10 @@ const ScopeStack = body_scope.ScopeStack;
 const boundaryAccessCompatible = type_support.boundaryAccessCompatible;
 const boundaryInnerTypeCompatible = type_support.boundaryInnerTypeCompatible;
 const callArgumentTypeCompatible = type_support.callArgumentTypeCompatible;
+const cVariadicArgumentTypeSupported = type_support.cVariadicArgumentTypeSupported;
+const cVariadicCallArityValid = type_support.cVariadicCallArityValid;
+const cVariadicFixedParameterCount = type_support.cVariadicFixedParameterCount;
+const cVariadicTailIndex = type_support.cVariadicTailIndex;
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;
 const findMethodPrototype = type_support.findMethodPrototype;
 const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
@@ -52,6 +60,10 @@ pub fn analyzeBody(
         try body_scope.seedModuleConsts(&scope, body);
         try body_scope.seedParameters(&scope, body.parameters);
         try analyzeBlock(active, &scope, body, &block_syntax.structured, &body.function.body, diagnostics, &summary, false);
+
+        var dynamic_state = DynamicLibraryState.init(allocator);
+        defer dynamic_state.deinit();
+        try analyzeKnownDynamicLibraryInvalidation(&dynamic_state, &block_syntax.structured, &body.function.body, diagnostics, &summary);
     }
 
     var conversion_facts = std.array_list.Managed(query_types.CheckedConversionFact).init(allocator);
@@ -275,13 +287,26 @@ fn analyzeExpr(
         .name => |name| {
             const text = std.mem.trim(u8, name.text, " \t");
             if (std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "false")) return;
+            if (std.mem.eql(u8, text, "await")) return;
             const expr = typed_expr orelse return;
             if (expr.ty.isUnsupported() and !scope.contains(text) and !moduleHasNamedBinding(body, text)) {
                 try emit(diagnostics, summary, "type.name.unknown", syntax_expr.span, "unknown name '{s}'", .{text});
             }
         },
         .group => |group| try analyzeExpr(active, scope, body, group, typed_expr, diagnostics, summary, effective_unsafe),
-        .tuple => try emit(diagnostics, summary, "type.expr.tuple.stage0", syntax_expr.span, "stage0 does not yet implement tuple expressions", .{}),
+        .tuple => |items| {
+            const typed_items = if (typed_expr) |expr| switch (expr.node) {
+                .tuple => |tuple| tuple.items,
+                else => &[_]*typed.Expr{},
+            } else &[_]*typed.Expr{};
+            if (items.len < 2) {
+                try emit(diagnostics, summary, "type.tuple.arity", syntax_expr.span, "tuple expressions must have at least two elements", .{});
+            }
+            for (items, 0..) |item, index| {
+                const item_typed = if (index < typed_items.len) typed_items[index] else null;
+                try analyzeExpr(active, scope, body, item, item_typed, diagnostics, summary, effective_unsafe);
+            }
+        },
         .array => |items| {
             const typed_items = switch (typed_expr orelse return) {
                 else => blk: {
@@ -315,13 +340,35 @@ fn analyzeExpr(
                 try emit(diagnostics, summary, "type.expr.array.type", syntax_expr.span, "array repetition requires a fixed array contextual type", .{});
             }
         },
+        .raw_pointer => |raw_pointer_expr| {
+            const place_typed = if (typed_expr) |expr| switch (expr.node) {
+                .call => |call| if (call.args.len == 1 and raw_pointer.isLeafCallee(call.callee)) call.args[0] else null,
+                else => null,
+            } else null;
+            try analyzeExpr(active, scope, body, raw_pointer_expr.place, place_typed, diagnostics, summary, effective_unsafe);
+            if (!effective_unsafe) {
+                try emit(diagnostics, summary, "type.raw_pointer.formation.unsafe", syntax_expr.span, "raw pointer formation requires #unsafe", .{});
+            }
+        },
         .field => |field| {
             const base_typed = typedFieldBase(typed_expr);
             try analyzeExpr(active, scope, body, field.base, base_typed, diagnostics, summary, effective_unsafe);
 
             const field_name = std.mem.trim(u8, field.field_name.text, " \t");
-            if (isIntegerText(field_name)) {
-                try emit(diagnostics, summary, "type.expr.tuple_projection.stage0", syntax_expr.span, "stage0 does not yet implement tuple projection", .{});
+            if (tuple_types.projectionIndex(field_name)) |projection_index| {
+                const base_expr = base_typed orelse return;
+                const tuple_name = switch (base_expr.ty) {
+                    .named => |name| name,
+                    else => {
+                        if (!base_expr.ty.isUnsupported()) {
+                            try emit(diagnostics, summary, "type.tuple.projection", syntax_expr.span, "tuple projection requires a tuple-typed base expression", .{});
+                        }
+                        return;
+                    },
+                };
+                if ((try tuple_types.projectionElementType(diagnostics.allocator, tuple_name, projection_index)) == null) {
+                    try emit(diagnostics, summary, "type.tuple.projection", syntax_expr.span, "invalid tuple projection '.{s}'", .{field_name});
+                }
                 return;
             }
 
@@ -445,7 +492,7 @@ fn analyzeExpr(
             } else if (isComparisonOperator(operator)) {
                 if (isComparisonSyntax(binary.lhs)) {
                     try emit(diagnostics, summary, "type.expr.compare_chain", syntax_expr.span, "comparison chaining requires explicit grouping", .{});
-                } else if (!lhs.ty.eql(rhs.ty) and !lhs.ty.isUnsupported() and !rhs.ty.isUnsupported()) {
+                } else if (!comparisonOperandsCompatible(operator, lhs.ty, rhs.ty) and !lhs.ty.isUnsupported() and !rhs.ty.isUnsupported()) {
                     try emit(diagnostics, summary, "type.expr.compare", syntax_expr.span, "comparison operands must have matching types", .{});
                 }
             } else if (std.mem.eql(u8, operator, "<<") or std.mem.eql(u8, operator, ">>")) {
@@ -474,6 +521,10 @@ fn analyzeExpr(
                     const name = std.mem.trim(u8, callee_name.text, " \t");
                     if (try resolveDirectFunction(active, body, name)) |resolved| {
                         try validateDirectCall(scope, body, name, call.callee.span, resolved, typed_args, effective_unsafe, diagnostics, summary);
+                        return;
+                    }
+                    if (dynamic_library.isPublicCallee(name)) {
+                        try validateDynamicLibraryCall(name, typed_expr, typed_args, effective_unsafe, syntax_expr.span, diagnostics, summary);
                         return;
                     }
                     if (findStructFields(body, name)) |fields| {
@@ -580,6 +631,455 @@ const ResolvedFunction = union(enum) {
     }
 };
 
+const DynamicSymbolBinding = struct {
+    symbol_name: []const u8,
+    library_name: []const u8,
+};
+
+const DynamicLibraryState = struct {
+    allocator: Allocator,
+    symbols: std.array_list.Managed(DynamicSymbolBinding),
+    closed_libraries: std.array_list.Managed([]const u8),
+
+    fn init(allocator: Allocator) DynamicLibraryState {
+        return .{
+            .allocator = allocator,
+            .symbols = std.array_list.Managed(DynamicSymbolBinding).init(allocator),
+            .closed_libraries = std.array_list.Managed([]const u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *DynamicLibraryState) void {
+        self.symbols.deinit();
+        self.closed_libraries.deinit();
+    }
+
+    fn markLookup(self: *DynamicLibraryState, symbol_name: []const u8, library_name: []const u8) !void {
+        for (self.symbols.items) |*binding| {
+            if (std.mem.eql(u8, binding.symbol_name, symbol_name)) {
+                binding.library_name = library_name;
+                return;
+            }
+        }
+        try self.symbols.append(.{
+            .symbol_name = symbol_name,
+            .library_name = library_name,
+        });
+    }
+
+    fn markClosed(self: *DynamicLibraryState, library_name: []const u8) !void {
+        for (self.closed_libraries.items) |closed_library| {
+            if (std.mem.eql(u8, closed_library, library_name)) return;
+        }
+        try self.closed_libraries.append(library_name);
+    }
+
+    fn closed(self: *const DynamicLibraryState, library_name: []const u8) bool {
+        for (self.closed_libraries.items) |closed_library| {
+            if (std.mem.eql(u8, closed_library, library_name)) return true;
+        }
+        return false;
+    }
+
+    fn invalidatedLibrary(self: *const DynamicLibraryState, symbol_name: []const u8) ?[]const u8 {
+        for (self.symbols.items) |binding| {
+            if (std.mem.eql(u8, binding.symbol_name, symbol_name) and self.closed(binding.library_name)) {
+                return binding.library_name;
+            }
+        }
+        return null;
+    }
+
+    fn restore(self: *DynamicLibraryState, symbol_count: usize, closed_count: usize) void {
+        self.symbols.shrinkRetainingCapacity(symbol_count);
+        self.closed_libraries.shrinkRetainingCapacity(closed_count);
+    }
+};
+
+fn analyzeKnownDynamicLibraryInvalidation(
+    state: *DynamicLibraryState,
+    syntax_block: *const ast.BodyBlockSyntax,
+    typed_block: *const typed.Block,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) anyerror!void {
+    if (syntax_block.statements.len != typed_block.statements.items.len) return error.InvalidBodySync;
+    for (syntax_block.statements, typed_block.statements.items) |syntax_statement, typed_statement| {
+        try analyzeDynamicStatement(state, syntax_statement, typed_statement, diagnostics, summary);
+    }
+}
+
+fn analyzeDynamicStatement(
+    state: *DynamicLibraryState,
+    syntax_statement: ast.BodyStatementSyntax,
+    typed_statement: typed.Statement,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) anyerror!void {
+    switch (syntax_statement) {
+        .placeholder, .break_stmt, .continue_stmt => {},
+        .let_decl => |binding| {
+            const lowered = switch (typed_statement) {
+                .let_decl => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            try diagnoseClosedDynamicExpr(state, lowered.expr, binding.expr.span, diagnostics, summary);
+            try trackDynamicLookupBinding(state, lowered.name, lowered.ty, lowered.expr);
+        },
+        .const_decl => |binding| {
+            const lowered = switch (typed_statement) {
+                .const_decl => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            try diagnoseClosedDynamicExpr(state, lowered.expr, binding.expr.span, diagnostics, summary);
+            try trackDynamicLookupBinding(state, lowered.name, lowered.ty, lowered.expr);
+        },
+        .assign_stmt => |assign| switch (typed_statement) {
+            .assign_stmt => |lowered| try diagnoseClosedDynamicExpr(state, lowered.expr, assign.expr.span, diagnostics, summary),
+            .placeholder => {},
+            else => return error.InvalidBodySync,
+        },
+        .select_stmt => |select_syntax| {
+            const lowered = switch (typed_statement) {
+                .select_stmt => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            if (lowered.subject) |subject| try diagnoseClosedDynamicExpr(state, subject, null, diagnostics, summary);
+
+            var lowered_arm_index: usize = 0;
+            for (select_syntax.arms) |arm_syntax| {
+                if (select_syntax.subject != null and arm_syntax.head == .guard) continue;
+                if (select_syntax.subject == null and arm_syntax.head == .pattern) continue;
+                if (lowered_arm_index >= lowered.arms.len) return error.InvalidBodySync;
+                const lowered_arm = lowered.arms[lowered_arm_index];
+                lowered_arm_index += 1;
+
+                if (select_syntax.subject == null) {
+                    try diagnoseClosedDynamicExpr(state, lowered_arm.condition, null, diagnostics, summary);
+                }
+                try analyzeNonPropagatingDynamicBlock(state, arm_syntax.body, lowered_arm.body, diagnostics, summary);
+            }
+
+            if (select_syntax.else_body) |else_body| {
+                const lowered_else = lowered.else_body orelse return error.InvalidBodySync;
+                try analyzeNonPropagatingDynamicBlock(state, else_body, lowered_else, diagnostics, summary);
+            }
+        },
+        .repeat_stmt => |repeat_syntax| {
+            const lowered = switch (typed_statement) {
+                .loop_stmt => |value| value,
+                .placeholder => null,
+                else => return error.InvalidBodySync,
+            };
+            if (lowered) |loop_data| {
+                if (loop_data.condition) |condition| {
+                    try diagnoseClosedDynamicExpr(state, condition, null, diagnostics, summary);
+                }
+                try analyzeNonPropagatingDynamicBlock(state, repeat_syntax.body, loop_data.body, diagnostics, summary);
+            }
+        },
+        .unsafe_block => |unsafe_body| {
+            const lowered = switch (typed_statement) {
+                .unsafe_block => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            try analyzeKnownDynamicLibraryInvalidation(state, unsafe_body, lowered, diagnostics, summary);
+        },
+        .defer_stmt => |expr_syntax| {
+            const expr = switch (typed_statement) {
+                .defer_stmt => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            try diagnoseClosedDynamicExpr(state, expr, expr_syntax.span, diagnostics, summary);
+        },
+        .return_stmt => |expr_syntax| {
+            const lowered = switch (typed_statement) {
+                .return_stmt => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            if (lowered) |expr| {
+                const span = if (expr_syntax) |syntax| syntax.span else null;
+                try diagnoseClosedDynamicExpr(state, expr, span, diagnostics, summary);
+            }
+        },
+        .expr_stmt => |expr_syntax| {
+            const expr = switch (typed_statement) {
+                .expr_stmt => |value| value,
+                else => return error.InvalidBodySync,
+            };
+            try diagnoseClosedDynamicExpr(state, expr, expr_syntax.span, diagnostics, summary);
+            if (closedLibraryNameFromExpr(expr)) |library_name| {
+                try state.markClosed(library_name);
+            }
+        },
+    }
+}
+
+fn analyzeNonPropagatingDynamicBlock(
+    state: *DynamicLibraryState,
+    syntax_block: *const ast.BodyBlockSyntax,
+    typed_block: *const typed.Block,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) !void {
+    const symbol_count = state.symbols.items.len;
+    const closed_count = state.closed_libraries.items.len;
+    defer state.restore(symbol_count, closed_count);
+    try analyzeKnownDynamicLibraryInvalidation(state, syntax_block, typed_block, diagnostics, summary);
+}
+
+fn trackDynamicLookupBinding(
+    state: *DynamicLibraryState,
+    binding_name: []const u8,
+    binding_type: types.TypeRef,
+    expr: *const typed.Expr,
+) !void {
+    if (!try dynamicLookupTypeSupported(state.allocator, binding_type)) return;
+    const call = switch (expr.node) {
+        .call => |value| value,
+        else => return,
+    };
+    if (!std.mem.eql(u8, call.callee, dynamic_library.lookup_callee)) return;
+    if (call.args.len < 1) return;
+    const library_name = identifierName(call.args[0]) orelse return;
+    try state.markLookup(binding_name, library_name);
+}
+
+fn diagnoseClosedDynamicExpr(
+    state: *const DynamicLibraryState,
+    expr: ?*const typed.Expr,
+    span: ?source.Span,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) anyerror!void {
+    const value = expr orelse return;
+    switch (value.node) {
+        .identifier => |name| try diagnoseInvalidatedSymbolUse(state, name, span, diagnostics, summary),
+        .call => |call| {
+            try diagnoseInvalidatedSymbolUse(state, call.callee, span, diagnostics, summary);
+            if (std.mem.eql(u8, call.callee, dynamic_library.lookup_callee) and call.args.len >= 1) {
+                if (identifierName(call.args[0])) |library_name| {
+                    if (state.closed(library_name)) {
+                        try emit(diagnostics, summary, "runtime.dynamic.close.invalidated", span, "dynamic-library symbol lookup uses closed library '{s}'", .{library_name});
+                    }
+                }
+            }
+            for (call.args) |arg| try diagnoseClosedDynamicExpr(state, arg, span, diagnostics, summary);
+        },
+        .enum_construct => |construct| {
+            for (construct.args) |arg| try diagnoseClosedDynamicExpr(state, arg, span, diagnostics, summary);
+        },
+        .constructor => |constructor| {
+            for (constructor.args) |arg| try diagnoseClosedDynamicExpr(state, arg, span, diagnostics, summary);
+        },
+        .method_target => |target| try diagnoseClosedDynamicExpr(state, target.base, span, diagnostics, summary),
+        .field => |field| try diagnoseClosedDynamicExpr(state, field.base, span, diagnostics, summary),
+        .array => |array| {
+            for (array.items) |item| try diagnoseClosedDynamicExpr(state, item, span, diagnostics, summary);
+        },
+        .array_repeat => |array_repeat| {
+            try diagnoseClosedDynamicExpr(state, array_repeat.value, span, diagnostics, summary);
+            try diagnoseClosedDynamicExpr(state, array_repeat.length, span, diagnostics, summary);
+        },
+        .index => |index| {
+            try diagnoseClosedDynamicExpr(state, index.base, span, diagnostics, summary);
+            try diagnoseClosedDynamicExpr(state, index.index, span, diagnostics, summary);
+        },
+        .conversion => |conversion| try diagnoseClosedDynamicExpr(state, conversion.operand, span, diagnostics, summary),
+        .unary => |unary| try diagnoseClosedDynamicExpr(state, unary.operand, span, diagnostics, summary),
+        .binary => |binary| {
+            try diagnoseClosedDynamicExpr(state, binary.lhs, span, diagnostics, summary);
+            try diagnoseClosedDynamicExpr(state, binary.rhs, span, diagnostics, summary);
+        },
+        else => {},
+    }
+}
+
+fn diagnoseInvalidatedSymbolUse(
+    state: *const DynamicLibraryState,
+    symbol_name: []const u8,
+    span: ?source.Span,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) !void {
+    if (state.invalidatedLibrary(symbol_name)) |library_name| {
+        try emit(diagnostics, summary, "runtime.dynamic.close.invalidated", span, "symbol '{s}' was looked up from closed dynamic library '{s}'", .{
+            symbol_name,
+            library_name,
+        });
+    }
+}
+
+fn closedLibraryNameFromExpr(expr: *const typed.Expr) ?[]const u8 {
+    const call = switch (expr.node) {
+        .call => |value| value,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, call.callee, dynamic_library.close_callee)) return null;
+    if (call.args.len != 1) return null;
+    return identifierName(call.args[0]);
+}
+
+fn identifierName(expr: *const typed.Expr) ?[]const u8 {
+    return switch (expr.node) {
+        .identifier => |name| name,
+        else => null,
+    };
+}
+
+fn validateDynamicLibraryCall(
+    callee_name: []const u8,
+    typed_expr: ?*const typed.Expr,
+    args: []const *typed.Expr,
+    unsafe_context: bool,
+    span: ?source.Span,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) !void {
+    if (std.mem.eql(u8, callee_name, dynamic_library.open_name)) {
+        if (args.len != 1) {
+            try emit(diagnostics, summary, "runtime.dynamic.open.arity", span, "open_library expects exactly one path argument", .{});
+            return;
+        }
+        if (!args[0].ty.isUnsupported() and !args[0].ty.eql(types.TypeRef.fromBuiltin(.str))) {
+            try emit(diagnostics, summary, "runtime.dynamic.open.path", span, "open_library path must be Str", .{});
+        }
+        const result_type = if (typed_expr) |expr| expr.ty else types.TypeRef.unsupported;
+        if (!result_type.isNamed(dynamic_library.open_result_type_name) and !result_type.isUnsupported()) {
+            try emit(diagnostics, summary, "runtime.dynamic.open.result", span, "open_library returns Result[DynamicLibrary, DynamicLibraryError]", .{});
+        }
+        return;
+    }
+    if (std.mem.eql(u8, callee_name, dynamic_library.lookup_name)) {
+        if (!unsafe_context) {
+            try emit(diagnostics, summary, "runtime.dynamic.lookup.unsafe", span, "dynamic-library symbol lookup requires #unsafe", .{});
+        }
+        if (args.len != 2) {
+            try emit(diagnostics, summary, "runtime.dynamic.lookup.arity", span, "lookup_symbol expects a DynamicLibrary and symbol name", .{});
+            return;
+        }
+        if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+            try emit(diagnostics, summary, "runtime.dynamic.lookup.library", span, "lookup_symbol first argument must be DynamicLibrary", .{});
+        }
+        if (!args[1].ty.isUnsupported() and !args[1].ty.eql(types.TypeRef.fromBuiltin(.str))) {
+            try emit(diagnostics, summary, "runtime.dynamic.lookup.name", span, "lookup_symbol name must be Str", .{});
+        }
+        const result_type = if (typed_expr) |expr| expr.ty else types.TypeRef.unsupported;
+        if (!try dynamicLookupResultTypeSupported(diagnostics.allocator, result_type)) {
+            try emit(diagnostics, summary, "runtime.dynamic.lookup.type", span, "lookup_symbol requires contextual type Result[T, SymbolLookupError] where T is a foreign function pointer or raw pointer", .{});
+        }
+        return;
+    }
+    if (std.mem.eql(u8, callee_name, dynamic_library.close_name)) {
+        if (!unsafe_context) {
+            try emit(diagnostics, summary, "runtime.dynamic.close.unsafe", span, "dynamic-library close requires #unsafe", .{});
+        }
+        if (args.len != 1) {
+            try emit(diagnostics, summary, "runtime.dynamic.close.arity", span, "close_library expects exactly one DynamicLibrary argument", .{});
+            return;
+        }
+        if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+            try emit(diagnostics, summary, "runtime.dynamic.close.library", span, "close_library argument must be DynamicLibrary", .{});
+        }
+        const result_type = if (typed_expr) |expr| expr.ty else types.TypeRef.unsupported;
+        if (!result_type.isNamed(dynamic_library.close_result_type_name) and !result_type.isUnsupported()) {
+            try emit(diagnostics, summary, "runtime.dynamic.close.result", span, "close_library returns Result[Unit, DynamicLibraryError]", .{});
+        }
+    }
+}
+
+fn dynamicLookupTypeSupported(allocator: Allocator, ty: types.TypeRef) !bool {
+    const raw = switch (ty) {
+        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
+        else => return false,
+    };
+    if (std.mem.startsWith(u8, raw, "*read ") or std.mem.startsWith(u8, raw, "*edit ")) return true;
+    var syntax = try foreign_callable_types.parseSyntax(allocator, raw) orelse return false;
+    defer syntax.deinit(allocator);
+    return syntax.variadic_tail == null;
+}
+
+fn dynamicLookupResultTypeSupported(allocator: Allocator, ty: types.TypeRef) !bool {
+    const raw = switch (ty) {
+        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
+        else => return false,
+    };
+    if (!std.mem.startsWith(u8, raw, "Result[")) return false;
+    const open_index = "Result".len;
+    const close_index = findMatchingDelimiter(raw, open_index, '[', ']') orelse return false;
+    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t\r\n").len != 0) return false;
+    const args = try typed_text.splitTopLevelCommaParts(allocator, raw[open_index + 1 .. close_index]);
+    defer allocator.free(args);
+    if (args.len != 2) return false;
+    const ok_type = std.mem.trim(u8, args[0], " \t\r\n");
+    const err_type = std.mem.trim(u8, args[1], " \t\r\n");
+    if (!std.mem.eql(u8, err_type, dynamic_library.lookup_error_type_name)) return false;
+    return dynamicLookupTypeSupported(allocator, .{ .named = ok_type });
+}
+
+fn comparisonOperandsCompatible(operator: []const u8, lhs: types.TypeRef, rhs: types.TypeRef) bool {
+    if (std.mem.eql(u8, operator, "==") or std.mem.eql(u8, operator, "!=")) return equalityComparable(lhs, rhs);
+    if (typeIsRawPointer(lhs) or typeIsRawPointer(rhs)) return false;
+    return orderingComparable(lhs, rhs);
+}
+
+fn equalityComparable(lhs: types.TypeRef, rhs: types.TypeRef) bool {
+    if (lhs.eql(rhs)) return typeSupportsBuiltinEquality(lhs);
+    const lhs_pointer = switch (lhs) {
+        .named => |name| raw_pointer.parse(name) orelse return false,
+        else => return false,
+    };
+    const rhs_pointer = switch (rhs) {
+        .named => |name| raw_pointer.parse(name) orelse return false,
+        else => return false,
+    };
+    return std.mem.eql(u8, lhs_pointer.pointee, rhs_pointer.pointee) and
+        (lhs_pointer.access == rhs_pointer.access or lhs_pointer.access == .read or rhs_pointer.access == .read);
+}
+
+fn orderingComparable(lhs: types.TypeRef, rhs: types.TypeRef) bool {
+    return lhs.eql(rhs) and typeSupportsBuiltinOrdering(lhs);
+}
+
+fn typeSupportsBuiltinEquality(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .builtin => |builtin| switch (builtin) {
+            .unit, .bool, .i32, .u32, .index, .isize => true,
+            .str, .unsupported => false,
+        },
+        .named => |name| blk: {
+            if (raw_pointer.parse(name) != null) break :blk true;
+            if (foreign_callable_types.startsForeignCallableType(name)) break :blk true;
+            if (types.CAbiAlias.fromName(name)) |alias| break :blk alias != .c_void;
+            if (std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "IndexRange")) break :blk true;
+            break :blk false;
+        },
+        .unsupported => false,
+    };
+}
+
+fn typeSupportsBuiltinOrdering(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .builtin => |builtin| switch (builtin) {
+            .i32, .u32, .index, .isize => true,
+            .unit, .bool, .str, .unsupported => false,
+        },
+        .named => |name| blk: {
+            if (types.CAbiAlias.fromName(name)) |alias| break :blk alias != .c_void;
+            if (std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "IndexRange")) break :blk true;
+            break :blk false;
+        },
+        .unsupported => false,
+    };
+}
+
+fn typeIsRawPointer(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .named => |name| raw_pointer.parse(name) != null,
+        else => false,
+    };
+}
+
 fn importedParameterTypes(binding: *const typed.ImportedBinding) []const types.TypeRef {
     return if (binding.function_parameter_types) |value| value else &.{};
 }
@@ -640,12 +1140,17 @@ fn validateDirectCall(
         try emit(diagnostics, summary, "type.call.suspend_borrow", span, "stage0 does not yet permit suspend calls that borrow arguments", .{});
     }
 
-    if (args.len != resolved.parameterCount()) {
+    const parameter_type_names = try resolvedParameterTypeNames(diagnostics.allocator, resolved);
+    const free_parameter_type_names = false;
+    defer if (free_parameter_type_names and parameter_type_names.len != 0) diagnostics.allocator.free(parameter_type_names);
+
+    if (!cVariadicCallArityValid(args.len, resolved.parameterCount(), parameter_type_names)) {
         try emit(diagnostics, summary, "type.call.arity", span, "call to '{s}' has wrong arity", .{callee_name});
         return;
     }
 
-    for (args, 0..) |arg, index| {
+    const fixed_count = cVariadicFixedParameterCount(resolved.parameterCount(), parameter_type_names);
+    for (args[0..@min(args.len, fixed_count)], 0..) |arg, index| {
         const expected = resolved.parameterType(index);
         const expected_name = resolved.parameterTypeName(index);
         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
@@ -658,10 +1163,18 @@ fn validateDirectCall(
         }
     }
 
+    if (cVariadicTailIndex(parameter_type_names) != null) {
+        for (args[fixed_count..], fixed_count..) |arg, index| {
+            if (!arg.ty.isUnsupported() and !cVariadicArgumentTypeSupported(arg.ty)) {
+                try emit(diagnostics, summary, "abi.c.variadic.arg", span, "variadic argument {d} to '{s}' is not C ABI-safe", .{
+                    index + 1,
+                    callee_name,
+                });
+            }
+        }
+    }
+
     try validateBorrowArguments(scope, callee_name, span, resolved, args, diagnostics, summary);
-    const parameter_type_names = try resolvedParameterTypeNames(diagnostics.allocator, resolved);
-    const free_parameter_type_names = false;
-    defer if (free_parameter_type_names and parameter_type_names.len != 0) diagnostics.allocator.free(parameter_type_names);
     try validateRetainedCallArguments(
         scope,
         body.function.where_predicates,
@@ -746,7 +1259,7 @@ fn validateBorrowArguments(
     summary: *Summary,
 ) !void {
     for (args, 0..) |arg, index| {
-        const mode = resolved.parameterMode(index);
+        const mode = if (index < resolved.parameterCount()) resolved.parameterMode(index) else typed.ParameterMode.owned;
         switch (mode) {
             .owned, .take => {},
             .read => try validateBorrowArgumentExpr(scope, arg, false, callee_name, index + 1, span, diagnostics, summary),
@@ -817,6 +1330,27 @@ fn validateBorrowArgumentExpr(
                 }
             },
             else => try emit(diagnostics, summary, "type.call.borrow_arg", span, "borrow argument {d} to '{s}' must be a plain local or one field projection in stage0", .{
+                arg_index,
+                callee_name,
+            }),
+        },
+        .index => |index| switch (index.base.node) {
+            .identifier => |base_name| {
+                if (!scope.contains(base_name)) {
+                    try emit(diagnostics, summary, "type.call.borrow_arg", span, "borrow argument {d} to '{s}' must come from a local place in stage0", .{
+                        arg_index,
+                        callee_name,
+                    });
+                    return;
+                }
+                if (require_mutable and !scope.isMutable(base_name)) {
+                    try emit(diagnostics, summary, "type.call.borrow_mut", span, "edit borrow argument {d} to '{s}' requires a mutable local place in stage0", .{
+                        arg_index,
+                        callee_name,
+                    });
+                }
+            },
+            else => try emit(diagnostics, summary, "type.call.borrow_arg", span, "borrow argument {d} to '{s}' must be a plain local, field, or array element place in stage0", .{
                 arg_index,
                 callee_name,
             }),

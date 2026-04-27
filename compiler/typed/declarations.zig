@@ -36,6 +36,7 @@ pub const FunctionData = struct {
     block_syntax: ?ast.BlockSyntax = null,
     body: Block,
     export_name: ?[]const u8,
+    link_name: ?[]const u8,
     abi: ?[]const u8,
 
     pub fn init(allocator: Allocator, is_suspend: bool, foreign: bool) FunctionData {
@@ -49,6 +50,7 @@ pub const FunctionData = struct {
             .return_type = types.TypeRef.fromBuiltin(.unit),
             .body = Block.init(allocator),
             .export_name = null,
+            .link_name = null,
             .abi = null,
         };
     }

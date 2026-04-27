@@ -6,15 +6,20 @@ Runa registries store immutable published source packages and immutable publishe
 
 - Registries are named package sources.
 - Registries are explicit; registry identity is part of managed package identity.
+- Registries are configured local filesystem roots in core v1.
 - Registries store immutable source package entries and immutable artifact entries.
 - Republish of the same exact published identity with different contents is forbidden.
 - Registry law is toolchain law, not core expression or type law.
+- Published package versions use the exact calendar version model from
+  `spec/dependency-resolution.md`.
 
 ## Named Registries
 
 - A registry has one stable registry identity name.
+- A configured registry name maps to one local filesystem root.
 - Toolchains may support one default configured registry, but dependency and lock metadata must still preserve registry identity where it matters.
 - No silent fallback across registries is part of the model.
+- Online registry endpoints are outside core v1 law.
 
 ## Published Source Identity
 
@@ -67,6 +72,12 @@ Runa registries store immutable published source packages and immutable publishe
 ## Relationship To Other Specs
 
 - Managed package lifecycle is defined in `spec/package-management.md`.
+- Dependency resolution and version law are defined in
+  `spec/dependency-resolution.md`.
+- Global store structure and integrity law are defined in
+  `spec/global-store.md`.
+- Local registry, vendoring, and exchange law is defined in
+  `spec/local-registries-vendoring-and-exchange.md`.
 - Workspace pinning is defined in `spec/lockfile.md`.
 - Publication flow is defined in `spec/publication.md`.
 - Product kinds are defined in `spec/product-kinds.md`.
@@ -80,3 +91,4 @@ The registry or toolchain must reject:
 - source entries missing required manifest-derived metadata
 - artifact entries missing source package identity, product kind, or target metadata
 - silent registry fallback during resolution
+- online registry retrieval treated as core `runa` behavior

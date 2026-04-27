@@ -92,7 +92,9 @@ test "compiler domains stay dense" {
         "compiler/codegen/root.zig",
         "compiler/link/root.zig",
         "compiler/target/root.zig",
+        "compiler/layout/root.zig",
         "compiler/abi/root.zig",
+        "compiler/backend_contract/root.zig",
         "compiler/runtime/root.zig",
     };
 
@@ -103,13 +105,14 @@ test "compiler domains stay dense" {
 
 test "runtime remains tiny and target-isolated" {
     try std.testing.expect(compiler.runtime.private_to_compiler);
-    try std.testing.expectEqual(@as(usize, 3), compiler.runtime.owns_only.len);
+    try std.testing.expectEqual(@as(usize, 4), compiler.runtime.owns_only.len);
     try std.testing.expect(compiler.runtime.forbidden.len >= 9);
     try std.testing.expectEqualStrings(compiler.target.hostName(), compiler.runtime.hostRuntimeLeafName());
 
     const required = [_][]const u8{
         "compiler/runtime/entry/root.zig",
         "compiler/runtime/abort/root.zig",
+        "compiler/runtime/dynamic_library/root.zig",
         "compiler/runtime/target/windows/root.zig",
         "compiler/runtime/target/linux/root.zig",
     };
@@ -240,6 +243,18 @@ test "std async and boundary surfaces exist" {
     libraries.std.async_runtime.spawn_local_detached_with_edit(adapters.addOne, @as(i32, 7), schedule);
     libraries.std.async_runtime.spawn_local_detached_with_take(adapters.addOne, @as(i32, 7), schedule);
     try std.testing.expectEqualStrings("#boundary[api]", libraries.std.boundary_runtime.api_attribute);
+    try std.testing.expect(libraries.std.boundary_runtime.binding_is_explicit);
+    try std.testing.expect(!libraries.std.boundary_runtime.ambient_auto_registration);
+    try std.testing.expect(!libraries.std.boundary_runtime.wildcard_endpoint_discovery);
+    try std.testing.expect(!libraries.std.boundary_runtime.runtime_invoke_by_name);
+    try std.testing.expect(!libraries.std.boundary_runtime.erased_universal_call_object);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.TransportFamily.direct_api, libraries.std.boundary_runtime.direct_api_transport.family);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.InvocationShape.typed_stub, libraries.std.boundary_runtime.direct_api_transport.invocation_shape);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.FailureSurface.none, libraries.std.boundary_runtime.direct_api_transport.failure_surface);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.TransportFamily.message, libraries.std.boundary_runtime.message_transport.family);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.FailureSurface.explicit_transport_failure, libraries.std.boundary_runtime.message_transport.failure_surface);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.TransportFamily.host_plugin, libraries.std.boundary_runtime.host_plugin_transport.family);
+    try std.testing.expectEqual(libraries.std.boundary_runtime.FailureSurface.explicit_transport_failure, libraries.std.boundary_runtime.host_plugin_transport.failure_surface);
 }
 
 test "bootstrap and primary cli stay wired" {
@@ -845,6 +860,1077 @@ test "checked signature facts come from stored syntax not typed payload" {
         try std.testing.expect(mir_function.return_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
     }
     try std.testing.expect(found_main);
+}
+
+test "canonical type query uses semantic ids for nominal names" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a.rna",
+        .data =
+        \\struct Thing:
+        \\    value: I32
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b.rna",
+        .data =
+        \\struct Thing:
+        \\    value: I32
+        ,
+    });
+
+    const a_path = try std.fs.path.join(std.testing.allocator, &.{ root, "a.rna" });
+    defer std.testing.allocator.free(a_path);
+    const b_path = try std.fs.path.join(std.testing.allocator, &.{ root, "b.rna" });
+    defer std.testing.allocator.free(b_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{ a_path, b_path });
+    defer active.deinit();
+    try std.testing.expect(active.moduleCount() >= 2);
+
+    const first = try compiler.query.testing.canonicalTypeForName(&active, .{ .index = 0 }, "Thing");
+    const second = try compiler.query.testing.canonicalTypeForName(&active, .{ .index = 1 }, "Thing");
+    try std.testing.expect(!first.eql(second));
+
+    const first_key = compiler.query.testing.canonicalTypeKey(&active, first) orelse return error.UnexpectedStructure;
+    const second_key = compiler.query.testing.canonicalTypeKey(&active, second) orelse return error.UnexpectedStructure;
+    const first_nominal = switch (first_key) {
+        .nominal => |nominal| nominal,
+        else => return error.UnexpectedStructure,
+    };
+    const second_nominal = switch (second_key) {
+        .nominal => |nominal| nominal,
+        else => return error.UnexpectedStructure,
+    };
+    try std.testing.expect(first_nominal.item_index != second_nominal.item_index);
+}
+
+test "canonical type query interns structural arrays callables and C aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const i32_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.i32));
+    const c_int_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CInt");
+    try std.testing.expect(!i32_type.eql(c_int_type));
+    switch (compiler.query.testing.canonicalTypeKey(&active, c_int_type) orelse return error.UnexpectedStructure) {
+        .c_abi_alias => |alias| try std.testing.expectEqual(compiler.types.CAbiAlias.c_int, alias),
+        else => return error.UnexpectedStructure,
+    }
+
+    const array_key = compiler.types.TypeKey{ .fixed_array = .{
+        .element = i32_type,
+        .length = 4,
+    } };
+    const array_a = try compiler.query.testing.canonicalTypeForKey(&active, array_key);
+    const array_count = compiler.query.testing.canonicalTypeCount(&active);
+    const array_b = try compiler.query.testing.canonicalTypeForKey(&active, array_key);
+    try std.testing.expect(array_a.eql(array_b));
+    try std.testing.expectEqual(array_count, compiler.query.testing.canonicalTypeCount(&active));
+
+    const params = [_]compiler.types.CallableParameter{
+        .{ .mode = .owned, .ty = i32_type },
+    };
+    const callable_key = compiler.types.TypeKey{ .callable = .{
+        .abi = .runa,
+        .parameters = &params,
+        .return_type = i32_type,
+    } };
+    const callable_a = try compiler.query.testing.canonicalTypeForKey(&active, callable_key);
+    const callable_count = compiler.query.testing.canonicalTypeCount(&active);
+    const callable_b = try compiler.query.testing.canonicalTypeForKey(&active, callable_key);
+    try std.testing.expect(callable_a.eql(callable_b));
+    try std.testing.expectEqual(callable_count, compiler.query.testing.canonicalTypeCount(&active));
+}
+
+test "canonical type query interns standard option and result families" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const option_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Option[I32]");
+    const option_key = compiler.query.testing.canonicalTypeKey(&active, option_type) orelse return error.UnexpectedStructure;
+    const i32_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "I32");
+    switch (option_key) {
+        .option => |option| try std.testing.expect(option.payload.eql(i32_type)),
+        else => return error.UnexpectedStructure,
+    }
+    const option_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = option_type,
+        .target_name = compiler.target.hostName(),
+        .family = .c,
+    });
+    try std.testing.expect(!option_abi.safe);
+    try std.testing.expect(!option_abi.passable);
+    try std.testing.expect(!option_abi.returnable);
+
+    const result_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Result[I32, Bool]");
+    const result_key = compiler.query.testing.canonicalTypeKey(&active, result_type) orelse return error.UnexpectedStructure;
+    const bool_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Bool");
+    switch (result_key) {
+        .result => |result| {
+            try std.testing.expect(result.ok.eql(i32_type));
+            try std.testing.expect(result.err.eql(bool_type));
+        },
+        else => return error.UnexpectedStructure,
+    }
+    const result_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = result_type,
+        .target_name = compiler.target.hostName(),
+        .family = .c,
+    });
+    try std.testing.expect(!result_abi.safe);
+    try std.testing.expect(!result_abi.passable);
+    try std.testing.expect(!result_abi.returnable);
+}
+
+test "canonical type query marks capability handles as handle families" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
+        \\fn main(take handle: Handle) -> Unit:
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const handle_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Handle");
+    const handle_key = compiler.query.testing.canonicalTypeKey(&active, handle_type) orelse return error.UnexpectedStructure;
+    const target_type = switch (handle_key) {
+        .handle => |handle| handle.target,
+        else => return error.UnexpectedStructure,
+    };
+    switch (compiler.query.testing.canonicalTypeKey(&active, target_type) orelse return error.UnexpectedStructure) {
+        .nominal => |nominal| try std.testing.expect(nominal.item_index == compiler.query.testing.findItemIdByName(&active, "Handle").?.index),
+        else => return error.UnexpectedStructure,
+    }
+}
+
+test "type aliases canonicalize to targets without nominal identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\type Count = I32
+        \\type Word = CUInt
+        \\
+        \\fn main() -> Count:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const count_id = compiler.query.testing.findItemIdByName(&active, "Count").?;
+    const count_signature = try compiler.query.checkedSignature(&active, count_id);
+    const alias = switch (count_signature.facts) {
+        .type_alias => |value| value,
+        else => return error.UnexpectedStructure,
+    };
+    try std.testing.expect(alias.target_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
+    try std.testing.expect(count_signature.surface.nominal_item_id == null);
+
+    const count_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Count");
+    const i32_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "I32");
+    try std.testing.expect(count_type.eql(i32_type));
+
+    const word_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Word");
+    const c_uint_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CUInt");
+    try std.testing.expect(word_type.eql(c_uint_type));
+
+    const main_signature = try compiler.query.checkedSignature(&active, compiler.query.testing.findItemIdByName(&active, "main").?);
+    const function = switch (main_signature.facts) {
+        .function => |value| value,
+        else => return error.UnexpectedStructure,
+    };
+    try std.testing.expect(function.return_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
+}
+
+test "type aliases reject cycles and impl ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\type A = B
+        \\type B = A
+        \\
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\type AliasBox = Box
+        \\
+        \\impl AliasBox:
+        \\    fn get(take self) -> I32:
+        \\        return self.value
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try compiler.query.finalizeSemanticChecks(&active);
+
+    var saw_cycle = false;
+    var saw_impl = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.alias.cycle")) saw_cycle = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.alias.impl")) saw_impl = true;
+    }
+    try std.testing.expect(saw_cycle);
+    try std.testing.expect(saw_impl);
+}
+
+test "Eq and Hash contracts have first-wave structural satisfaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\type Count = I32
+        \\
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "I32", "Eq", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "I32", "Hash", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "Str", "Eq", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "Str", "Hash", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "[I32; 4]", "Eq", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "Result[I32, Bool]", "Hash", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "Count", "Eq", &.{})).satisfied);
+    try std.testing.expect(!(try satisfiesTraitForTest(&active, module_id, "Box", "Eq", &.{})).satisfied);
+    try std.testing.expect(!(try satisfiesTraitForTest(&active, module_id, "Box", "Hash", &.{})).satisfied);
+}
+
+test "Map key types must satisfy Eq and Hash" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\struct Box:
+        \\    value: I32
+        \\
+        \\struct Table:
+        \\    bad: Map[Box, I32]
+        \\    good: Map[I32, Box]
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_eq = false;
+    var saw_hash = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.map.key_eq")) saw_eq = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.map.key_hash")) saw_hash = true;
+    }
+    try std.testing.expect(saw_eq);
+    try std.testing.expect(saw_hash);
+}
+
+test "Eq does not expand builtin equality syntax" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn same(read left: Str, read right: Str) -> Bool:
+        \\    return left == right
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_compare = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.expr.compare")) saw_compare = true;
+    }
+    try std.testing.expect(saw_compare);
+}
+
+test "checked signatures expose declared repr and abi surface facts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#repr[c]
+        \\struct Point:
+        \\    x: I32
+        \\
+        \\#repr[c, I32]
+        \\enum Status:
+        \\    Ok = 0
+        \\    Err = 1
+        \\
+        \\opaque type Token
+        \\
+        \\#unsafe
+        \\extern["c"] fn puts(value: I32) -> I32
+        \\
+        \\#export[name = "runa_ping"]
+        \\fn ping() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const point_id = compiler.query.testing.findItemIdByName(&active, "Point").?;
+    const point = try compiler.query.checkedSignature(&active, point_id);
+    try std.testing.expectEqual(point_id.index, point.surface.nominal_item_id.?.index);
+    switch (point.surface.declared_repr) {
+        .c => {},
+        else => return error.UnexpectedStructure,
+    }
+
+    const status_id = compiler.query.testing.findItemIdByName(&active, "Status").?;
+    const status = try compiler.query.checkedSignature(&active, status_id);
+    const status_repr = switch (status.surface.declared_repr) {
+        .c_enum => |repr_type| repr_type,
+        else => return error.UnexpectedStructure,
+    };
+    switch (compiler.query.testing.canonicalTypeKey(&active, status_repr) orelse return error.UnexpectedStructure) {
+        .builtin_scalar => |scalar| try std.testing.expectEqual(compiler.types.BuiltinScalar.i32, scalar),
+        else => return error.UnexpectedStructure,
+    }
+
+    const token_id = compiler.query.testing.findItemIdByName(&active, "Token").?;
+    const token = try compiler.query.checkedSignature(&active, token_id);
+    try std.testing.expect(token.surface.opaque_incomplete);
+    try std.testing.expectEqual(token_id.index, token.surface.nominal_item_id.?.index);
+
+    const puts_id = compiler.query.testing.findItemIdByName(&active, "puts").?;
+    const puts = try compiler.query.checkedSignature(&active, puts_id);
+    try std.testing.expectEqual(compiler.query.AbiSurfaceRole.foreign_import, puts.surface.abi_role);
+    try std.testing.expectEqualStrings("c", puts.surface.foreign_convention.?);
+    try std.testing.expect(puts.surface.unsafe_required);
+
+    const ping_id = compiler.query.testing.findItemIdByName(&active, "ping").?;
+    const ping = try compiler.query.checkedSignature(&active, ping_id);
+    try std.testing.expectEqual(compiler.query.AbiSurfaceRole.foreign_export, ping.surface.abi_role);
+    try std.testing.expect(ping.surface.foreign_convention == null);
+}
+
+test "layout query caches target-aware results and explicit unsupported targets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const i32_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.i32));
+    const host_key = compiler.layout.LayoutKey{
+        .type_id = i32_type,
+        .target_name = compiler.target.hostName(),
+        .repr_context = .default,
+    };
+    const host_layout = try compiler.query.layoutForKey(&active, host_key);
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, host_layout.status);
+    try std.testing.expectEqual(compiler.layout.Lowerability.lowerable, host_layout.lowerability);
+    try std.testing.expectEqual(@as(u64, 4), host_layout.size.?);
+    try std.testing.expectEqual(@as(u32, 4), host_layout.@"align".?);
+
+    const cached_count = compiler.query.testing.layoutCacheCount(&active);
+    _ = try compiler.query.layoutForKey(&active, host_key);
+    try std.testing.expectEqual(cached_count, compiler.query.testing.layoutCacheCount(&active));
+
+    const other_layout = try compiler.query.layoutForKey(&active, .{
+        .type_id = i32_type,
+        .target_name = "stage0-test-target",
+        .repr_context = .default,
+    });
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.unsupported, other_layout.status);
+    try std.testing.expectEqualStrings("unsupported layout target", other_layout.unsupported_reason.?);
+    try std.testing.expectEqual(cached_count + 1, compiler.query.testing.layoutCacheCount(&active));
+}
+
+test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#repr[c]
+        \\struct Point:
+        \\    x: I32
+        \\    y: U32
+        \\
+        \\struct Plain:
+        \\    value: I32
+        \\
+        \\#repr[c]
+        \\union NumberBits:
+        \\    i: I32
+        \\    u: U32
+        \\
+        \\#repr[c, I32]
+        \\enum Status:
+        \\    Ok = 0
+        \\    Err = 1
+        \\
+        \\opaque type Token
+        \\
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const target_name = compiler.target.hostName();
+    const i32_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.i32));
+    const unit_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.unit));
+    const unit_layout = try compiler.query.layoutForCanonicalType(&active, unit_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.zero_sized, unit_layout.storage);
+    try std.testing.expectEqual(@as(u64, 0), unit_layout.size.?);
+
+    const array_type = try compiler.query.testing.canonicalTypeForKey(&active, .{ .fixed_array = .{
+        .element = i32_type,
+        .length = 3,
+    } });
+    const array_layout = try compiler.query.layoutForCanonicalType(&active, array_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.array, array_layout.storage);
+    try std.testing.expectEqual(@as(u64, 12), array_layout.size.?);
+    try std.testing.expectEqual(@as(u32, 4), array_layout.@"align".?);
+
+    const pointer_type = try compiler.query.testing.canonicalTypeForKey(&active, .{ .raw_pointer = .{
+        .access = .read,
+        .pointee = i32_type,
+    } });
+    const pointer_layout = try compiler.query.layoutForCanonicalType(&active, pointer_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.pointer, pointer_layout.storage);
+    try std.testing.expectEqual(@as(u64, 8), pointer_layout.size.?);
+    try std.testing.expect(pointer_layout.foreign_stable);
+
+    const point_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Point");
+    const point_layout = try compiler.query.layoutForCanonicalType(&active, point_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"struct", point_layout.storage);
+    try std.testing.expect(point_layout.foreign_stable);
+    try std.testing.expectEqual(@as(u64, 8), point_layout.size.?);
+    try std.testing.expectEqual(@as(usize, 2), point_layout.fields.len);
+    try std.testing.expectEqual(@as(u64, 0), point_layout.fields[0].offset);
+    try std.testing.expectEqual(@as(u64, 4), point_layout.fields[1].offset);
+
+    const plain_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Plain");
+    const plain_layout = try compiler.query.layoutForCanonicalType(&active, plain_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"struct", plain_layout.storage);
+    try std.testing.expect(!plain_layout.foreign_stable);
+
+    const union_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "NumberBits");
+    const union_layout = try compiler.query.layoutForCanonicalType(&active, union_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"union", union_layout.storage);
+    try std.testing.expect(union_layout.foreign_stable);
+    try std.testing.expectEqual(@as(u64, 4), union_layout.size.?);
+
+    const status_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Status");
+    const status_layout = try compiler.query.layoutForCanonicalType(&active, status_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"enum", status_layout.storage);
+    try std.testing.expect(status_layout.foreign_stable);
+    try std.testing.expectEqual(@as(u64, 4), status_layout.size.?);
+    try std.testing.expectEqual(@as(usize, 2), status_layout.variants.len);
+    try std.testing.expectEqual(@as(i128, 0), status_layout.variants[0].tag_value);
+    try std.testing.expectEqual(@as(i128, 1), status_layout.variants[1].tag_value);
+
+    const token_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Token");
+    const token_layout = try compiler.query.layoutForCanonicalType(&active, token_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.unsized, token_layout.status);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"opaque", token_layout.storage);
+    try std.testing.expectEqualStrings("opaque type has no transparent layout", token_layout.unsupported_reason.?);
+}
+
+test "abi query skeleton is canonical layout backed and typed free" {
+    const abi_root = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "compiler/abi/root.zig", std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(abi_root);
+    const abi_c = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "compiler/abi/c/root.zig", std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(abi_c);
+    try std.testing.expect(std.mem.indexOf(u8, abi_root, "../typed/root.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, abi_root, "typed.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, abi_c, "../../typed/root.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, abi_c, "typed.") == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const i32_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.i32));
+    const result = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = i32_type,
+        .target_name = compiler.target.hostName(),
+        .family = .c,
+    });
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, result.layout_status);
+    try std.testing.expectEqual(compiler.layout.StorageShape.scalar, result.layout_storage);
+    try std.testing.expect(result.safe);
+    try std.testing.expect(result.passable);
+    try std.testing.expect(result.returnable);
+    try std.testing.expectEqual(compiler.abi.PassMode.direct, result.pass_mode);
+    try std.testing.expect(result.reason == null);
+
+    const cached_count = compiler.query.testing.abiTypeCacheCount(&active);
+    _ = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = i32_type,
+        .target_name = compiler.target.hostName(),
+        .family = .c,
+    });
+    try std.testing.expectEqual(cached_count, compiler.query.testing.abiTypeCacheCount(&active));
+}
+
+test "c and system abi classification covers first wave stage0 surfaces" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#repr[c]
+        \\struct Point:
+        \\    x: CInt
+        \\    y: CInt
+        \\
+        \\struct Plain:
+        \\    value: I32
+        \\
+        \\#link[name = "msvcrt"]
+        \\#unsafe
+        \\extern["c"] fn puts(value: CInt) -> CInt
+        \\
+        \\#unsafe
+        \\extern["c"] fn read_text(text: *read CChar) -> CVoid
+        \\
+        \\#unsafe
+        \\extern["c"] fn bad(value: Bool) -> Unit
+        \\
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const target_name = compiler.target.hostName();
+    const c_int_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CInt");
+    const c_int_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = c_int_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(c_int_abi.safe);
+    try std.testing.expect(c_int_abi.passable);
+    try std.testing.expect(c_int_abi.returnable);
+
+    const c_callback_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, .{
+        .named = "extern[\"c\"] fn(CInt, CInt) -> CInt",
+    });
+    switch (compiler.query.testing.canonicalTypeKey(&active, c_callback_type) orelse return error.UnexpectedStructure) {
+        .callable => |callable| {
+            try std.testing.expectEqual(compiler.types.CallableAbi.c, callable.abi);
+            try std.testing.expectEqual(@as(usize, 2), callable.parameters.len);
+        },
+        else => return error.UnexpectedStructure,
+    }
+    const c_callback_layout = try compiler.query.layoutForCanonicalType(&active, c_callback_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, c_callback_layout.status);
+    try std.testing.expectEqual(compiler.layout.StorageShape.pointer, c_callback_layout.storage);
+    try std.testing.expect(c_callback_layout.foreign_stable);
+    const c_callback_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = c_callback_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(c_callback_abi.safe);
+    try std.testing.expect(c_callback_abi.passable);
+    try std.testing.expect(c_callback_abi.returnable);
+    const c_callback_mismatch = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = c_callback_type,
+        .target_name = target_name,
+        .family = .system,
+    });
+    try std.testing.expect(!c_callback_mismatch.safe);
+    try std.testing.expectEqualStrings("foreign function pointer convention does not match ABI family", c_callback_mismatch.reason.?);
+    const c_callback_surface = try compiler.query.abiCallableForKey(&active, .{
+        .subject = .{ .structural_type = c_callback_type },
+        .target_name = target_name,
+        .family = .c,
+        .role = .callback,
+    });
+    try std.testing.expect(c_callback_surface.callable_safe);
+    try std.testing.expect(c_callback_surface.callback);
+
+    const system_callback_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, .{
+        .named = "extern[\"system\"] fn(*read CVoid) -> CVoid",
+    });
+    const system_callback_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = system_callback_type,
+        .target_name = target_name,
+        .family = .system,
+    });
+    try std.testing.expect(system_callback_abi.safe);
+    try std.testing.expect(system_callback_abi.passable);
+    try std.testing.expect(system_callback_abi.returnable);
+
+    const bool_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.bool));
+    const bool_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = bool_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(!bool_abi.safe);
+    try std.testing.expectEqualStrings("Bool is not C ABI-safe; use CBool for foreign layout", bool_abi.reason.?);
+
+    const unit_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.unit));
+    const unit_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = unit_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(!unit_abi.returnable);
+
+    const array_type = try compiler.query.testing.canonicalTypeForKey(&active, .{ .fixed_array = .{
+        .element = c_int_type,
+        .length = 4,
+    } });
+    const array_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = array_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(array_abi.safe);
+    try std.testing.expect(!array_abi.passable);
+    try std.testing.expect(!array_abi.returnable);
+
+    const c_char_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CChar");
+    const read_c_char_type = try compiler.query.testing.canonicalTypeForKey(&active, .{ .raw_pointer = .{
+        .access = .read,
+        .pointee = c_char_type,
+    } });
+    const read_c_char_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = read_c_char_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(read_c_char_abi.safe);
+    try std.testing.expect(read_c_char_abi.passable);
+    try std.testing.expect(read_c_char_abi.returnable);
+
+    const point_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Point");
+    const point_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = point_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(point_abi.safe);
+    try std.testing.expect(point_abi.passable);
+
+    const plain_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Plain");
+    const plain_abi = try compiler.query.abiTypeForKey(&active, .{
+        .type_id = plain_type,
+        .target_name = target_name,
+        .family = .c,
+    });
+    try std.testing.expect(!plain_abi.safe);
+    try std.testing.expectEqualStrings("nominal type is not foreign-stable", plain_abi.reason.?);
+
+    const puts_id = compiler.query.testing.findItemIdByName(&active, "puts").?;
+    const puts_abi = try compiler.query.abiCallableForKey(&active, .{
+        .subject = .{ .item = puts_id },
+        .target_name = target_name,
+        .family = .c,
+        .role = .foreign_import,
+    });
+    try std.testing.expect(puts_abi.callable_safe);
+    try std.testing.expectEqual(@as(usize, 1), puts_abi.params.len);
+    try std.testing.expect(puts_abi.params[0].passable);
+    try std.testing.expect(puts_abi.return_value.?.returnable);
+
+    const read_text_id = compiler.query.testing.findItemIdByName(&active, "read_text").?;
+    const read_text_abi = try compiler.query.abiCallableForKey(&active, .{
+        .subject = .{ .item = read_text_id },
+        .target_name = target_name,
+        .family = .c,
+        .role = .foreign_import,
+    });
+    try std.testing.expect(read_text_abi.callable_safe);
+    try std.testing.expect(read_text_abi.params[0].passable);
+    try std.testing.expect(read_text_abi.return_value.?.returnable);
+
+    const bad_id = compiler.query.testing.findItemIdByName(&active, "bad").?;
+    const bad_abi = try compiler.query.abiCallableForKey(&active, .{
+        .subject = .{ .item = bad_id },
+        .target_name = target_name,
+        .family = .c,
+        .role = .foreign_import,
+    });
+    try std.testing.expect(!bad_abi.callable_safe);
+    var saw_param_type = false;
+    var saw_return = false;
+    for (bad_abi.diagnostics) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.param_type")) saw_param_type = true;
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.return")) saw_return = true;
+    }
+    try std.testing.expect(saw_param_type);
+    try std.testing.expect(saw_return);
+}
+
+test "backend contract lowered module query skeleton is target keyed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#repr[c]
+        \\struct Point:
+        \\    x: CInt
+        \\    y: CInt
+        \\
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
+        \\const VALUE: I32 = 1
+        \\
+        \\#link[name = "msvcrt"]
+        \\#unsafe
+        \\extern["c"] fn puts(value: CInt) -> CInt
+        \\
+        \\#export[name = "runa_ping"]
+        \\fn ping() -> I32:
+        \\    return VALUE
+        \\
+        \\#boundary[api]
+        \\pub suspend fn boundary_ping(take handle: Handle) -> I32:
+        \\    return 1
+        \\
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const lowered = try compiler.query.loweredBackendModuleForKey(&active, .{
+        .module_id = module_id,
+        .target_name = compiler.target.hostName(),
+        .output_kind = .bin,
+    });
+    try std.testing.expectEqual(module_id.index, lowered.key.module_id.index);
+    try std.testing.expectEqualStrings(compiler.target.hostName(), lowered.key.target_name);
+    try std.testing.expectEqual(compiler.backend_contract.OutputKind.bin, lowered.key.output_kind);
+    try std.testing.expect(lowered.program != null);
+    try std.testing.expect(lowered.storage.len >= 1);
+    try std.testing.expect(lowered.aggregates.len >= 1);
+    try std.testing.expect(lowered.callables.len >= 3);
+    try std.testing.expect(lowered.bodies.len >= 2);
+    try std.testing.expect(lowered.bodies[0].program_checked);
+    try std.testing.expect(lowered.bodies[0].statements_checked);
+    try std.testing.expect(lowered.bodies[0].expressions_checked);
+    try std.testing.expect(lowered.bodies[0].ownership_checked);
+    try std.testing.expect(lowered.bodies[0].borrow_checked);
+    try std.testing.expect(lowered.bodies[0].lifetimes_checked);
+    try std.testing.expect(lowered.bodies[0].regions_checked);
+    try std.testing.expectEqual(@as(usize, 1), lowered.imports.len);
+    try std.testing.expectEqualStrings("puts", lowered.imports[0].name);
+    try std.testing.expectEqualStrings("msvcrt", lowered.imports[0].link_name.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.exports.len);
+    try std.testing.expectEqualStrings("runa_ping", lowered.exports[0].name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.boundary_surfaces.len);
+    try std.testing.expectEqualStrings("boundary_ping", lowered.boundary_surfaces[0].name);
+    try std.testing.expect(lowered.boundary_surfaces[0].is_suspend);
+    try std.testing.expectEqual(compiler.backend_contract.BoundaryTransportFamily.direct_api, lowered.boundary_surfaces[0].transport);
+    try std.testing.expectEqual(compiler.backend_contract.BoundaryInvocationShape.typed_stub, lowered.boundary_surfaces[0].invocation_shape);
+    try std.testing.expectEqual(compiler.backend_contract.BoundaryFailureSurface.none, lowered.boundary_surfaces[0].failure_surface);
+    try std.testing.expectEqualStrings("Handle", lowered.boundary_surfaces[0].input_type_name);
+    try std.testing.expectEqualStrings("I32", lowered.boundary_surfaces[0].output_type_name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.boundary_surfaces[0].capability_families.len);
+    try std.testing.expectEqualStrings("Handle", lowered.boundary_surfaces[0].capability_families[0]);
+    try std.testing.expectEqual(@as(usize, 1), lowered.consts.len);
+    try std.testing.expectEqual(@as(usize, 5), lowered.runtime_requirements.len);
+    try std.testing.expect(requirementByKind(lowered.runtime_requirements, .entry_adapter).?.required);
+    try std.testing.expect(requirementByKind(lowered.runtime_requirements, .fatal_abort).?.required);
+    try std.testing.expect(lowered.unsupported.len >= 1);
+
+    const cached_count = compiler.query.testing.loweredBackendModuleCacheCount(&active);
+    _ = try compiler.query.loweredBackendModuleForKey(&active, .{
+        .module_id = module_id,
+        .target_name = compiler.target.hostName(),
+        .output_kind = .bin,
+    });
+    try std.testing.expectEqual(cached_count, compiler.query.testing.loweredBackendModuleCacheCount(&active));
+}
+
+test "backend program type descriptors consume canonical facts only" {
+    const query_root = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "compiler/query/root.zig", std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(query_root);
+
+    const forbidden = [_][]const u8{
+        "backendValueTypeFromTypeRef",
+        "backendValueTypeFromTypeExpression",
+        "backendValueTypeFromCheckedType",
+        "backendValueTypesFromCheckedTypes",
+        "backendCallableValueType",
+        "backendOrdinaryCallableValueType",
+        "backendValueTypeFromExpr",
+        "backendBindingValueType",
+        "backendValueTypeFromCanonicalType(active, try canonicalTypeFromTypeRef",
+        "BackendTypedFunctionTypeFacts",
+        "buildBackendTypedFunctionTypeFacts",
+        "lowerExecutableMethodForBackendControlFlow",
+        "lowerTypedBackendBlock",
+        "lowerTypedBackendStatement",
+        "lowerTypedSelectData",
+        "programTypedFunctionLinkage",
+    };
+    for (forbidden) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, query_root, needle) == null);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "const BackendProgramTypeFacts = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "fn buildBackendProgramTypeFacts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "fn backendCallReturnCanonicalType") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "fn backendValueTypeFromCanonicalType") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "const CheckedExecutableMethodFacts = struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "fn buildCheckedExecutableMethodFacts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_root, "fn lowerExecutableMethodFromCheckedFacts") != null);
+}
+
+test "runtime requirement query declares entry abort and unsupported hooks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const result = try compiler.query.runtimeRequirements(&active, module_id, compiler.target.hostName(), .bin);
+    try std.testing.expectEqual(@as(usize, 5), result.requirements.len);
+    const entry = requirementByKind(result.requirements, .entry_adapter).?;
+    try std.testing.expect(entry.required);
+    try std.testing.expectEqual(compiler.runtime.target.hostLeaf().supported_stage0, entry.supported);
+    const abort = requirementByKind(result.requirements, .fatal_abort).?;
+    try std.testing.expect(abort.required);
+    try std.testing.expectEqual(compiler.runtime.target.hostLeaf().supported_stage0, abort.supported);
+    const observability = requirementByKind(result.requirements, .observability_hooks).?;
+    try std.testing.expect(!observability.required);
+    try std.testing.expect(!observability.supported);
+
+    const cdylib = try compiler.query.runtimeRequirements(&active, module_id, compiler.target.hostName(), .cdylib);
+    try std.testing.expect(!requirementByKind(cdylib.requirements, .entry_adapter).?.required);
+
+    const unsupported = try compiler.query.runtimeRequirements(&active, module_id, "stage0-test-target", .bin);
+    var saw_entry = false;
+    var saw_abort = false;
+    for (unsupported.unsupported) |item| {
+        if (std.mem.eql(u8, item.code, "runtime.entry_adapter.unsupported")) saw_entry = true;
+        if (std.mem.eql(u8, item.code, "runtime.fatal_abort.unsupported")) saw_abort = true;
+    }
+    try std.testing.expect(saw_entry);
+    try std.testing.expect(saw_abort);
+
+    const cached_count = compiler.query.testing.runtimeRequirementCacheCount(&active);
+    _ = try compiler.query.runtimeRequirements(&active, module_id, "stage0-test-target", .bin);
+    try std.testing.expectEqual(cached_count, compiler.query.testing.runtimeRequirementCacheCount(&active));
+}
+
+fn requirementByKind(
+    requirements: []const compiler.backend_contract.RuntimeRequirementDescriptor,
+    kind: compiler.backend_contract.RuntimeRequirementKind,
+) ?compiler.backend_contract.RuntimeRequirementDescriptor {
+    for (requirements) |requirement| {
+        if (requirement.kind == kind) return requirement;
+    }
+    return null;
 }
 
 test "query cycle failures cache by family key without repeated diagnostics" {
@@ -3078,6 +4164,76 @@ test "stage0 check rejects direct suspend calls from ordinary functions" {
     try std.testing.expect(found_suspend_context);
 }
 
+test "stage0 check rejects standalone await expressions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\suspend fn later() -> I32:
+        \\    return 1
+        \\
+        \\suspend fn worker() -> I32:
+        \\    return await later :: :: call
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+    const pipeline = &active.pipeline;
+
+    var found_standalone_await = false;
+    for (pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.await.standalone")) {
+            found_standalone_await = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_standalone_await);
+}
+
+test "stage0 check rejects await invocation qualifier" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\suspend fn later() -> I32:
+        \\    return 1
+        \\
+        \\suspend fn worker() -> I32:
+        \\    return later :: :: await
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+    const pipeline = &active.pipeline;
+
+    var found_await_qualifier = false;
+    for (pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.await.qualifier")) {
+            found_await_qualifier = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_await_qualifier);
+}
+
 test "stage0 check accepts generic, lifetime, trait, and impl where headers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3958,6 +5114,557 @@ test "c abi validation accepts imported unsafe c declarations" {
     try std.testing.expectEqual(@as(usize, 0), pipeline.diagnostics.errorCount());
 }
 
+test "stage0 build lowers explicit extern c exports with bodies" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "cdylib"
+        \\name = "demo_native"
+        \\root = "lib.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib.rna",
+        .data =
+        \\#unsafe
+        \\extern["c"] fn imported(text: *read CChar) -> CVoid
+        \\
+        \\#export[name = "runa_add"]
+        \\extern["c"] fn add(a: I32, b: I32) -> I32:
+        \\    return a + b
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    var saw_import_no_unwind = false;
+    var saw_export_abort_policy = false;
+    for (result.pipeline.modules.items) |module_pipeline| {
+        if (module_pipeline.backend_contract) |lowered| {
+            for (lowered.imports) |import_desc| {
+                if (std.mem.eql(u8, import_desc.name, "imported") and import_desc.no_unwind) {
+                    saw_import_no_unwind = true;
+                }
+            }
+            for (lowered.exports) |export_desc| {
+                if (std.mem.eql(u8, export_desc.name, "runa_add") and
+                    export_desc.no_unwind and
+                    export_desc.failure_policy == .abort_untranslated_failure)
+                {
+                    saw_export_abort_policy = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(saw_import_no_unwind);
+    try std.testing.expect(saw_export_abort_policy);
+
+    for (result.artifacts.items) |artifact| {
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "extern void imported(const char* text);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "RUNA_EXPORT int32_t runa_add(int32_t a, int32_t b);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "RUNA_EXPORT int32_t runa_add(int32_t a, int32_t b) {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "return (a + b);") != null);
+    }
+}
+
+test "stage0 build lowers c variadic imports and exports" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "cdylib"
+        \\name = "demo_native"
+        \\root = "lib.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib.rna",
+        .data =
+        \\#unsafe
+        \\extern["c"] fn printf(format: *read CChar, ...args: CVaList) -> CInt
+        \\
+        \\#unsafe
+        \\#export[name = "sum_ints"]
+        \\extern["c"] fn sum_ints(count: CInt, ...args: CVaList) -> CInt:
+        \\    return count
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "extern int printf(const char* format, ...);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "RUNA_EXPORT int sum_ints(int count, ...);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "RUNA_EXPORT int sum_ints(int count, ...) {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "return count;") != null);
+    }
+}
+
+test "stage0 build accepts c variadic call-site trailing arguments" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "cdylib"
+        \\name = "demo_native"
+        \\root = "lib.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib.rna",
+        .data =
+        \\#unsafe
+        \\#export[name = "sink"]
+        \\extern["c"] fn sink(count: I32, ...args: CVaList) -> I32:
+        \\    return count
+        \\
+        \\#export[name = "call_sink"]
+        \\extern["c"] fn call_sink() -> I32:
+        \\    return #unsafe sink :: 1, 2, 3 :: call
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "RUNA_EXPORT int32_t sink(int32_t count, ...);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "return sink(1, 2, 3);") != null);
+    }
+}
+
+test "stage0 check rejects non c abi-safe variadic call-site arguments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#unsafe
+        \\extern["c"] fn sink(count: I32, ...args: CVaList) -> I32
+        \\
+        \\fn main() -> I32:
+        \\    return #unsafe sink :: 1, false :: call
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_variadic_arg = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.variadic.arg")) {
+            found_variadic_arg = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_variadic_arg);
+}
+
+test "stage0 build lowers CVaList copy next and finish operations" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "cdylib"
+        \\name = "demo_native"
+        \\root = "lib.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib.rna",
+        .data =
+        \\#unsafe
+        \\#export[name = "first_copy"]
+        \\extern["c"] fn first_copy(count: CInt, ...args: CVaList) -> CInt:
+        \\    let copy: CVaList = args.copy :: :: method
+        \\    let value: CInt = copy.next[CInt] :: :: method
+        \\    copy.finish :: :: method
+        \\    args.finish :: :: method
+        \\    return value
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "#include <stdarg.h>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "va_list args;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "va_start(args, count);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "va_list copy;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "va_copy(copy, args);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "int value = va_arg(copy, int);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "va_end(copy);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "va_end(args);") != null);
+    }
+}
+
+test "stage0 check rejects unsupported CVaList next type arguments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#unsafe
+        \\#export[name = "bad"]
+        \\extern["c"] fn bad(count: CInt, ...args: CVaList) -> CInt:
+        \\    let value: Bool = args.next[Bool] :: :: method
+        \\    args.finish :: :: method
+        \\    return count
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_next_type = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.valist.next_type")) {
+            found_next_type = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_next_type);
+}
+
+test "stage0 build lowers c foreign function pointer values calls and equality" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "cdylib"
+        \\name = "demo_native"
+        \\root = "lib.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib.rna",
+        .data =
+        \\#export[name = "forty_one"]
+        \\extern["c"] fn forty_one() -> I32:
+        \\    return 41
+        \\
+        \\#export[name = "call_ptr"]
+        \\extern["c"] fn call_ptr() -> I32:
+        \\    let cb: extern["c"] fn() -> I32 = forty_one
+        \\    let same: Bool = cb == cb
+        \\    return #unsafe cb :: :: call
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "int32_t (*cb)(void) = forty_one;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "bool same = (cb == cb);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "return cb();") != null);
+    }
+}
+
+test "query dynamic library public surface is Result typed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main(lib: DynamicLibrary) -> Unit:
+        \\    let opened: Result[DynamicLibrary, DynamicLibraryError] = open_library :: "demo_native.dll" :: call
+        \\    let looked: Result[extern["c"] fn() -> I32, SymbolLookupError] = #unsafe lookup_symbol :: lib, "forty_one" :: call
+        \\    let closed: Result[Unit, DynamicLibraryError] = #unsafe close_library :: lib :: call
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const lowered = try compiler.query.loweredBackendModuleForKey(&active, .{
+        .module_id = .{ .index = 0 },
+        .target_name = compiler.target.hostName(),
+        .output_kind = .bin,
+    });
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    var saw_dynamic_requirement = false;
+    for (lowered.runtime_requirements) |requirement| {
+        if (requirement.kind == .dynamic_library_hooks and requirement.required and requirement.supported) {
+            saw_dynamic_requirement = true;
+        }
+    }
+    try std.testing.expect(saw_dynamic_requirement);
+}
+
+test "query dynamic library diagnoses known symbol use after close" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main(lib: DynamicLibrary) -> I32:
+        \\    let cb: extern["c"] fn() -> I32 = #unsafe lookup_symbol :: lib, "forty_one" :: call
+        \\    #unsafe close_library :: lib :: call
+        \\    return #unsafe cb :: :: call
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_invalidated = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "runtime.dynamic.close.invalidated")) saw_invalidated = true;
+    }
+    try std.testing.expect(saw_invalidated);
+}
+
+test "stage0 check rejects unsafe or untyped dynamic symbol lookup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main(lib: DynamicLibrary) -> I32:
+        \\    let bad: I32 = lookup_symbol :: lib, "forty_one" :: call
+        \\    return bad
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_unsafe = false;
+    var saw_type = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "runtime.dynamic.lookup.unsafe")) saw_unsafe = true;
+        if (std.mem.eql(u8, diagnostic.code, "runtime.dynamic.lookup.type")) saw_type = true;
+    }
+    try std.testing.expect(saw_unsafe);
+    try std.testing.expect(saw_type);
+}
+
+test "stage0 build lowers first-wave raw pointer operations" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "bin"
+        \\name = "demo_app"
+        \\root = "main.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    let value: I32 = 7
+        \\    let read_ptr: *read I32 = #unsafe &raw read value
+        \\    let edit_ptr: *edit I32 = #unsafe &raw edit value
+        \\    let null_ptr: *read I32 = null
+        \\    let missing: Bool = read_ptr == null_ptr
+        \\    let same: Bool = edit_ptr == read_ptr
+        \\    let loaded: I32 = #unsafe read_ptr.load :: :: method
+        \\    let moved: *read I32 = #unsafe read_ptr.offset :: 1 :: method
+        \\    let as_void: *read CVoid = #unsafe read_ptr.cast[CVoid] :: :: method
+        \\    #unsafe edit_ptr.store :: loaded :: method
+        \\    return loaded
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        if (artifact.kind != .bin) continue;
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "const int32_t* read_ptr = (&value);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "int32_t* edit_ptr = (&value);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "const int32_t* null_ptr = NULL;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "bool missing = (read_ptr == null_ptr);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "int32_t loaded = (*read_ptr);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "const int32_t* moved = (read_ptr + 1);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "const void* as_void = ((const void*)read_ptr);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "(*edit_ptr = loaded);") != null);
+    }
+}
+
+test "stage0 check rejects raw pointer unsafe and non pointer null" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    let value: CInt = 7
+        \\    let pointer: *read CInt = &raw read value
+        \\    let bad: I32 = null
+        \\    return value
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_unsafe = false;
+    var saw_null = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.raw_pointer.formation.unsafe")) saw_unsafe = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.raw_pointer.null")) saw_null = true;
+    }
+    try std.testing.expect(saw_unsafe);
+    try std.testing.expect(saw_null);
+}
+
 test "c abi validation rejects unsupported conventions and types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4030,7 +5737,66 @@ test "query signature validation owns item shape and const mismatch diagnostics"
     try std.testing.expect(saw_const_mismatch);
 }
 
-test "query signature validation rejects unsupported stage0 foreign signature types" {
+test "query validates export and link attribute shapes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#export[name = "first"]
+        \\#export[name = "second"]
+        \\extern["c"] fn repeated() -> CInt:
+        \\    return 1
+        \\
+        \\#export[name = "one", name = "two"]
+        \\extern["c"] fn duplicate_key() -> CInt:
+        \\    return 1
+        \\
+        \\#link[path = "msvcrt"]
+        \\#unsafe
+        \\extern["c"] fn puts(value: CInt) -> CInt
+        \\
+        \\#link[name = "bad"]
+        \\fn local() -> Unit:
+        \\    return
+        \\
+        \\#link[name = "conflict"]
+        \\#export[name = "also"]
+        \\#unsafe
+        \\extern["c"] fn both(value: CInt) -> CInt
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_duplicate_attr = false;
+    var saw_duplicate_key = false;
+    var saw_unknown_key = false;
+    var saw_link_target = false;
+    var saw_conflict = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.duplicate")) saw_duplicate_attr = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.key_duplicate")) saw_duplicate_key = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.key")) saw_unknown_key = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.link.target")) saw_link_target = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.conflict")) saw_conflict = true;
+    }
+    try std.testing.expect(saw_duplicate_attr);
+    try std.testing.expect(saw_duplicate_key);
+    try std.testing.expect(saw_unknown_key);
+    try std.testing.expect(saw_link_target);
+    try std.testing.expect(saw_conflict);
+}
+
+test "query ABI validation rejects unsupported stage0 foreign signature types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4057,11 +5823,43 @@ test "query signature validation rejects unsupported stage0 foreign signature ty
     var saw_return = false;
     var saw_param = false;
     for (active.pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.stage0.return")) saw_return = true;
-        if (std.mem.eql(u8, diagnostic.code, "type.stage0.param_type")) saw_param = true;
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.return")) saw_return = true;
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.param_type")) saw_param = true;
     }
     try std.testing.expect(saw_return);
     try std.testing.expect(saw_param);
+}
+
+test "query c abi rejects exported Result failure across foreign boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#export[name = "bad"]
+        \\extern["c"] fn bad() -> Result[I32, ConvertError]:
+        \\    return 1 as may[I32]
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_export_failure = false;
+    var saw_return = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.export.failure")) saw_export_failure = true;
+        if (std.mem.eql(u8, diagnostic.code, "abi.c.return")) saw_return = true;
+    }
+    try std.testing.expect(saw_export_failure);
+    try std.testing.expect(saw_return);
 }
 
 test "query module signature validation rejects duplicate imported bindings and methods" {
@@ -4370,10 +6168,12 @@ test "global store publishes built artifact entries" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "lib.rna",
         .data =
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
         \\#reflect
         \\#boundary[api]
-        \\#export[name = "demo_ping"]
-        \\pub fn ping() -> I32:
+        \\pub fn ping(take handle: Handle) -> I32:
         \\    return 123
         ,
     });
@@ -5223,10 +7023,12 @@ test "packaged metadata renders reflection and boundary surfaces" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "lib.rna",
         .data =
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
         \\#reflect
         \\#boundary[api]
-        \\#export[name = "demo_ping"]
-        \\pub fn ping() -> I32:
+        \\pub fn ping(take handle: Handle) -> I32:
         \\    return 123
         ,
     });
@@ -5255,8 +7057,10 @@ test "packaged metadata renders reflection and boundary surfaces" {
     try std.testing.expectEqual(@as(usize, 1), metadata.reflection.len);
     try std.testing.expectEqual(@as(usize, 1), metadata.boundary_apis.len);
     try std.testing.expectEqualStrings("demo::demo_native::ping", metadata.boundary_apis[0].canonical_identity);
-    try std.testing.expectEqualStrings("Unit", metadata.boundary_apis[0].input_type);
+    try std.testing.expectEqualStrings("Handle", metadata.boundary_apis[0].input_type);
     try std.testing.expectEqualStrings("I32", metadata.boundary_apis[0].output_type);
+    try std.testing.expectEqual(@as(usize, 1), metadata.boundary_apis[0].referenced_capability_families.len);
+    try std.testing.expectEqualStrings("Handle", metadata.boundary_apis[0].referenced_capability_families[0]);
 
     const rendered = try compiler.metadata.renderDocument(std.testing.allocator, &metadata);
     defer std.testing.allocator.free(rendered);
@@ -5264,6 +7068,7 @@ test "packaged metadata renders reflection and boundary surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[[reflection]]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[[boundary_apis]]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "canonical_identity = \"demo::demo_native::ping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "referenced_capability_families = [\"Handle\"]") != null);
 
     var parsed = try libraries.std.reflect.parseMetadata(std.testing.allocator, rendered);
     defer parsed.deinit();
@@ -5272,6 +7077,8 @@ test "packaged metadata renders reflection and boundary surfaces" {
     try std.testing.expectEqual(@as(usize, 1), parsed.reflection.items.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.boundary_apis.items.len);
     try std.testing.expectEqualStrings("demo::demo_native::ping", parsed.boundary_apis.items[0].canonical_identity);
+    try std.testing.expectEqual(@as(usize, 1), parsed.boundary_apis.items[0].referenced_capability_families.len);
+    try std.testing.expectEqualStrings("Handle", parsed.boundary_apis.items[0].referenced_capability_families[0]);
 }
 
 test "module boundary API metadata is a cached query result" {
@@ -6292,7 +8099,7 @@ test "stage0 build emits bitwise and shift compound assignment" {
     }
 }
 
-test "stage0 check rejects tuple expressions with explicit diagnostic" {
+test "stage0 check accepts tuple expressions and projection" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6303,7 +8110,9 @@ test "stage0 check rejects tuple expressions with explicit diagnostic" {
         .sub_path = "main.rna",
         .data =
         \\fn main() -> Unit:
-        \\    let value = (1, 2)
+        \\    let pair: (I32, Bool) = (1, true)
+        \\    let first: I32 = pair.0
+        \\    let second: Bool = pair.1
         \\    return
         ,
     });
@@ -6311,21 +8120,32 @@ test "stage0 check rejects tuple expressions with explicit diagnostic" {
     const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
     defer std.testing.allocator.free(main_path);
 
-    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
     defer active.deinit();
-    const pipeline = &active.pipeline;
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const body = try compiler.query.checkedBody(&active, body_id);
 
     var found_tuple = false;
-    var found_grouping = false;
-    for (pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.expr.tuple.stage0")) found_tuple = true;
-        if (std.mem.eql(u8, diagnostic.code, "parse.expr.grouping")) found_grouping = true;
+    var found_first_projection = false;
+    var found_second_projection = false;
+    for (body.expression_sites) |site| {
+        if (site.kind == .tuple and site.ty.isNamed("(I32, Bool)")) found_tuple = true;
+        if (site.kind == .field and site.field_name != null and std.mem.eql(u8, site.field_name.?, "0") and site.ty.eql(compiler.types.TypeRef.fromBuiltin(.i32))) {
+            found_first_projection = true;
+        }
+        if (site.kind == .field and site.field_name != null and std.mem.eql(u8, site.field_name.?, "1") and site.ty.eql(compiler.types.TypeRef.fromBuiltin(.bool))) {
+            found_second_projection = true;
+        }
     }
     try std.testing.expect(found_tuple);
-    try std.testing.expect(!found_grouping);
+    try std.testing.expect(found_first_projection);
+    try std.testing.expect(found_second_projection);
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
 }
 
-test "semantic rejects array literals without fixed-array context" {
+test "semantic infers fixed-array element literals without context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6337,6 +8157,53 @@ test "semantic rejects array literals without fixed-array context" {
         .data =
         \\fn main() -> Unit:
         \\    let value = [1, 2]
+        \\    let item: I32 = value[1]
+        \\    value[0] = 9
+        \\    let repeated = [7; 3]
+        \\    let repeated_item: I32 = repeated[2]
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const body_id = active.semantic_index.itemEntry(main_id).body_id.?;
+    const body = try compiler.query.checkedBody(&active, body_id);
+
+    var found_array = false;
+    var found_repeat = false;
+    var found_index = false;
+    for (body.expression_sites) |site| {
+        if (site.kind == .array and site.ty.isNamed("[I32; 2]")) found_array = true;
+        if (site.kind == .array_repeat and site.ty.isNamed("[I32; 3]")) found_repeat = true;
+        if (site.kind == .index and site.ty.eql(compiler.types.TypeRef.fromBuiltin(.i32))) found_index = true;
+    }
+    try std.testing.expect(found_array);
+    try std.testing.expect(found_repeat);
+    try std.testing.expect(found_index);
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+}
+
+test "semantic rejects array literal mismatches length and bounds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> Unit:
+        \\    let mixed = [1, true]
+        \\    let short: [I32; 3] = [1, 2]
+        \\    let values: [I32; 2] = [1, 2]
+        \\    let bad = values[2]
         \\    return
         ,
     });
@@ -6346,16 +8213,18 @@ test "semantic rejects array literals without fixed-array context" {
 
     var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
     defer active.deinit();
-    const pipeline = &active.pipeline;
 
-    var found_array = false;
-    var found_primary = false;
-    for (pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.expr.array.type")) found_array = true;
-        if (std.mem.eql(u8, diagnostic.code, "parse.expr.primary")) found_primary = true;
+    var found_element = false;
+    var found_length = false;
+    var found_bounds = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.expr.array.element")) found_element = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.expr.array.length")) found_length = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.expr.keyed_access.bounds")) found_bounds = true;
     }
-    try std.testing.expect(found_array);
-    try std.testing.expect(!found_primary);
+    try std.testing.expect(found_element);
+    try std.testing.expect(found_length);
+    try std.testing.expect(found_bounds);
 }
 
 test "semantic rejects keyed access on non-array values" {
@@ -6392,7 +8261,7 @@ test "semantic rejects keyed access on non-array values" {
     try std.testing.expect(!found_primary);
 }
 
-test "stage0 check rejects tuple projection with explicit diagnostic" {
+test "stage0 check rejects invalid tuple projection with explicit diagnostic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -6403,8 +8272,8 @@ test "stage0 check rejects tuple projection with explicit diagnostic" {
         .sub_path = "main.rna",
         .data =
         \\fn main() -> Unit:
-        \\    let value: I32 = 1
-        \\    let item = value.0
+        \\    let value: (I32, Bool) = (1, true)
+        \\    let item = value.2
         \\    return
         ,
     });
@@ -6419,11 +8288,45 @@ test "stage0 check rejects tuple projection with explicit diagnostic" {
     var found_projection = false;
     var found_field_syntax = false;
     for (pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.expr.tuple_projection.stage0")) found_projection = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.tuple.projection")) found_projection = true;
         if (std.mem.eql(u8, diagnostic.code, "type.field.syntax")) found_field_syntax = true;
     }
     try std.testing.expect(found_projection);
     try std.testing.expect(!found_field_syntax);
+}
+
+test "stage0 check rejects tuple singleton and field assignment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> Unit:
+        \\    let single = (1,)
+        \\    let pair: (I32, Bool) = (1, true)
+        \\    pair.0 = 2
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_arity = false;
+    var found_assign = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.tuple.arity")) found_arity = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.tuple.assign")) found_assign = true;
+    }
+    try std.testing.expect(found_arity);
+    try std.testing.expect(found_assign);
 }
 
 test "stage0 check rejects comparison chaining" {
@@ -7778,6 +9681,41 @@ test "trait solver satisfies builtin Send from where environment" {
     try std.testing.expect(result.satisfied);
 }
 
+test "trait solver covers first-wave Send base and rejected families" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\type Count = CInt
+        \\
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const main_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const module_id = active.semantic_index.itemEntry(main_id).module_id;
+
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "CInt", "Send", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "Count", "Send", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "Char", "Send", &.{})).satisfied);
+    try std.testing.expect((try satisfiesTraitForTest(&active, module_id, "IndexRange", "Send", &.{})).satisfied);
+    try std.testing.expect(!(try satisfiesTraitForTest(&active, module_id, "CVoid", "Send", &.{})).satisfied);
+    try std.testing.expect(!(try satisfiesTraitForTest(&active, module_id, "*read I32", "Send", &.{})).satisfied);
+    try std.testing.expect(!(try satisfiesTraitForTest(&active, module_id, "Task[I32]", "Send", &.{})).satisfied);
+}
+
 test "trait solver reports cycles through shared query diagnostics" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8654,7 +10592,7 @@ test "stage0 check rejects refutable repeat iteration patterns without generic s
     try std.testing.expect(!found_generic_statement);
 }
 
-test "stage0 check uses spec diagnostics for tuple subject patterns" {
+test "stage0 check accepts exact tuple subject patterns" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8665,7 +10603,7 @@ test "stage0 check uses spec diagnostics for tuple subject patterns" {
         .sub_path = "main.rna",
         .data =
         \\fn main() -> Unit:
-        \\    let value: I32 = 1
+        \\    let value: (I32, Bool) = (1, true)
         \\    select value:
         \\        when (left, right) => return
         \\    return
@@ -8678,13 +10616,47 @@ test "stage0 check uses spec diagnostics for tuple subject patterns" {
     var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
     defer active.deinit();
 
-    var found_tuple_subject = false;
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+
+    const main_item_id = compiler.query.testing.findItemIdByName(&active, "main").?;
+    const main_body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
+    const pattern_result = try compiler.query.patternsByBody(&active, main_body_id);
+    try std.testing.expectEqual(@as(usize, 1), pattern_result.summary.checked_subject_pattern_count);
+    try std.testing.expectEqual(@as(usize, 1), pattern_result.summary.irrefutable_subject_pattern_count);
+}
+
+test "stage0 check rejects tuple subject patterns with wrong arity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> Unit:
+        \\    let value: (I32, Bool) = (1, true)
+        \\    select value:
+        \\        when (left, right, extra) => return
+        \\        else => return
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var found_tuple_arity = false;
     var found_pattern_stage0 = false;
     for (active.pipeline.diagnostics.items.items) |diagnostic| {
-        if (std.mem.eql(u8, diagnostic.code, "type.pattern.tuple_subject")) found_tuple_subject = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.pattern.tuple_arity")) found_tuple_arity = true;
         if (std.mem.eql(u8, diagnostic.code, "type.pattern.stage0")) found_pattern_stage0 = true;
     }
-    try std.testing.expect(found_tuple_subject);
+    try std.testing.expect(found_tuple_arity);
     try std.testing.expect(!found_pattern_stage0);
 }
 
@@ -8940,6 +10912,109 @@ test "ownership query rejects use after take call" {
     const body_id = active.semantic_index.itemEntry(main_item_id).body_id.?;
     const ownership_result = try compiler.query.ownershipByBody(&active, body_id);
     try std.testing.expectEqual(@as(usize, 1), ownership_result.summary.move_after_take);
+}
+
+test "ownership query moves capability handles through owned positions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
+        \\fn observe(read handle: Handle) -> I32:
+        \\    return 1
+        \\
+        \\fn take_owned(handle: Handle) -> Unit:
+        \\    return
+        \\
+        \\fn move_binding(take handle: Handle) -> I32:
+        \\    let moved: Handle = handle
+        \\    return observe :: handle :: call
+        \\
+        \\fn move_call(take handle: Handle) -> Unit:
+        \\    take_owned :: handle :: call
+        \\    take_owned :: handle :: call
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const binding_id = compiler.query.testing.findItemIdByName(&active, "move_binding").?;
+    const binding_body = active.semantic_index.itemEntry(binding_id).body_id.?;
+    const binding_ownership = try compiler.query.ownershipByBody(&active, binding_body);
+    try std.testing.expectEqual(@as(usize, 1), binding_ownership.summary.move_only_moves);
+    try std.testing.expectEqual(@as(usize, 1), binding_ownership.summary.move_after_take);
+
+    const call_id = compiler.query.testing.findItemIdByName(&active, "move_call").?;
+    const call_body = active.semantic_index.itemEntry(call_id).body_id.?;
+    const call_ownership = try compiler.query.ownershipByBody(&active, call_body);
+    try std.testing.expectEqual(@as(usize, 1), call_ownership.summary.move_after_take);
+
+    var move_after_take: usize = 0;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "ownership.move_after_take")) move_after_take += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), move_after_take);
+}
+
+test "ownership query rejects implicit capability handle duplication in aggregates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
+        \\fn tuple_dup(take handle: Handle) -> Unit:
+        \\    let pair: (Handle, Handle) = (handle, handle)
+        \\    return
+        \\
+        \\fn array_repeat(take handle: Handle) -> Unit:
+        \\    let values: [Handle; 2] = [handle; 2]
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const tuple_id = compiler.query.testing.findItemIdByName(&active, "tuple_dup").?;
+    const tuple_body = active.semantic_index.itemEntry(tuple_id).body_id.?;
+    const tuple_ownership = try compiler.query.ownershipByBody(&active, tuple_body);
+    try std.testing.expectEqual(@as(usize, 1), tuple_ownership.summary.move_after_take);
+
+    const array_id = compiler.query.testing.findItemIdByName(&active, "array_repeat").?;
+    const array_body = active.semantic_index.itemEntry(array_id).body_id.?;
+    const array_ownership = try compiler.query.ownershipByBody(&active, array_body);
+    try std.testing.expectEqual(@as(usize, 1), array_ownership.summary.rejected_implicit_copies);
+
+    var saw_move_after_take = false;
+    var saw_repeat_copy = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "ownership.move_after_take")) saw_move_after_take = true;
+        if (std.mem.eql(u8, diagnostic.code, "ownership.move_only.repeat")) saw_repeat_copy = true;
+    }
+    try std.testing.expect(saw_move_after_take);
+    try std.testing.expect(saw_repeat_copy);
 }
 
 test "ownership query keeps mutually exclusive select-arm states independent" {
@@ -10539,6 +12614,114 @@ test "stage0 check uses enum signature facts for subject-select exhaustiveness" 
             break;
         }
     }
+    try std.testing.expect(saw_non_exhaustive);
+}
+
+test "stage0 check accepts standard option and result variants patterns and helpers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn some() -> Option[I32]:
+        \\    return Option.Some :: 7 :: call
+        \\
+        \\fn none() -> Option[I32]:
+        \\    return Option.None
+        \\
+        \\fn ok() -> Result[I32, Bool]:
+        \\    return Result.Ok :: 9 :: call
+        \\
+        \\fn err() -> Result[I32, Bool]:
+        \\    return Result.Err :: false :: call
+        \\
+        \\fn read_option(take value: Option[I32]) -> I32:
+        \\    let a: Bool = value.is_some :: :: method
+        \\    let b: Bool = value.is_none :: :: method
+        \\    select value:
+        \\        when Option.None => return 0
+        \\        when Option.Some(found) => return found
+        \\    return 0
+        \\
+        \\fn read_result(take value: Result[I32, Bool]) -> I32:
+        \\    let a: Bool = value.is_ok :: :: method
+        \\    let b: Bool = value.is_err :: :: method
+        \\    select value:
+        \\        when Result.Ok(found) => return found
+        \\        when Result.Err(flag) => return 0
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const function_names = [_][]const u8{ "some", "none", "ok", "err", "read_option", "read_result" };
+    for (function_names) |name| {
+        const item_id = compiler.query.testing.findItemIdByName(&active, name).?;
+        const body_id = active.semantic_index.itemEntry(item_id).body_id.?;
+        _ = try compiler.query.checkedBody(&active, body_id);
+        _ = try compiler.query.patternsByBody(&active, body_id);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+}
+
+test "stage0 check rejects invalid standard option/result construction and patterns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn bad_arg() -> Option[I32]:
+        \\    return Option.Some :: true :: call
+        \\
+        \\fn missing_context() -> I32:
+        \\    let value = Option.None
+        \\    return 0
+        \\
+        \\fn incomplete(take value: Option[I32]) -> I32:
+        \\    select value:
+        \\        when Option.Some(found) => return found
+        \\    return 0
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const function_names = [_][]const u8{ "bad_arg", "missing_context", "incomplete" };
+    for (function_names) |name| {
+        const item_id = compiler.query.testing.findItemIdByName(&active, name).?;
+        const body_id = active.semantic_index.itemEntry(item_id).body_id.?;
+        _ = compiler.query.checkedBody(&active, body_id) catch {};
+        _ = compiler.query.patternsByBody(&active, body_id) catch {};
+    }
+
+    var saw_arg = false;
+    var saw_context = false;
+    var saw_non_exhaustive = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.enum.ctor.arg")) saw_arg = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.standard.variant_context")) saw_context = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.select.non_exhaustive")) saw_non_exhaustive = true;
+    }
+    try std.testing.expect(saw_arg);
+    try std.testing.expect(saw_context);
     try std.testing.expect(saw_non_exhaustive);
 }
 

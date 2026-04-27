@@ -1,6 +1,8 @@
 const callee_helpers = @import("callee_helpers.zig");
 const callable_types = @import("callable_types.zig");
 const const_ir = @import("const_ir.zig");
+const c_va_list = @import("../abi/c/va_list.zig");
+const foreign_callable_types = @import("foreign_callable_types.zig");
 const source = @import("../source/root.zig");
 const std = @import("std");
 const typed = @import("../typed/root.zig");
@@ -219,6 +221,7 @@ pub const StatementSite = struct {
     binding_span: ?source.Span = null,
     binding_expr: ?*const typed.Expr = null,
     assign_name: ?[]const u8 = null,
+    assign_owns_name: bool = false,
     assign_ty: types.TypeRef = .unsupported,
     assign_op: ?typed.BinaryOp = null,
     assign_expr: ?*const typed.Expr = null,
@@ -304,6 +307,7 @@ pub const ExpressionKind = enum {
     constructor,
     method_target,
     field,
+    tuple,
     array,
     array_repeat,
     index,
@@ -421,7 +425,7 @@ pub fn buildFacts(
         }
         try builder.addPlace(.{
             .kind = .parameter,
-            .name = parameter.name,
+            .name = c_va_list.localName(parameter.name),
             .ty = parameter.ty,
             .mutable = parameter.mode != .read,
             .parameter_index = parameter_index,
@@ -734,6 +738,7 @@ const Builder = struct {
             .assign_stmt => |assign| {
                 site.kind = .assign_stmt;
                 site.assign_name = assign.name;
+                site.assign_owns_name = assign.owns_name;
                 site.assign_ty = assign.ty;
                 site.assign_op = assign.op;
                 site.assign_expr = assign.expr;
@@ -977,6 +982,9 @@ const Builder = struct {
             },
             .method_target => |target| try self.visitExpr(callable_resolver, statement_index, span, target.base),
             .field => |field| try self.visitExpr(callable_resolver, statement_index, span, field.base),
+            .tuple => |tuple| {
+                for (tuple.items) |item| try self.visitExpr(callable_resolver, statement_index, span, item);
+            },
             .array => |array| {
                 for (array.items) |item| try self.visitExpr(callable_resolver, statement_index, span, item);
             },
@@ -1126,6 +1134,12 @@ const Builder = struct {
                 .ty = expr.ty,
                 .field_name = field.field_name,
             },
+            .tuple => ExpressionSite{
+                .id = .{ .index = self.expression_sites.items.len },
+                .statement_index = statement_index,
+                .kind = .tuple,
+                .ty = expr.ty,
+            },
             .array => ExpressionSite{
                 .id = .{ .index = self.expression_sites.items.len },
                 .statement_index = statement_index,
@@ -1185,6 +1199,10 @@ const Builder = struct {
         for (call.args, 0..) |arg, index| arg_types[index] = arg.ty;
         switch (local_type) {
             .named => |type_name| {
+                if (foreign_callable_types.startsForeignCallableType(type_name)) {
+                    self.allocator.free(arg_types);
+                    return;
+                }
                 if (try callable_types.parseCallableTypeName(type_name, self.allocator)) |callable| {
                     self.summary.callable_dispatch_count += 1;
                     try self.callable_dispatch_sites.append(.{

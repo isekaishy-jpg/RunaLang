@@ -73,6 +73,7 @@ pub const Expr = struct {
         call: Call,
         constructor: Constructor,
         field: Field,
+        tuple: Tuple,
         array: Array,
         array_repeat: ArrayRepeat,
         index: Index,
@@ -108,6 +109,10 @@ pub const Expr = struct {
     pub const Field = struct {
         base: *Expr,
         field_name: []const u8,
+    };
+
+    pub const Tuple = struct {
+        items: []*Expr,
     };
 
     pub const Array = struct {
@@ -169,6 +174,13 @@ pub const Expr = struct {
             .field => |field| {
                 field.base.deinit(allocator);
                 allocator.destroy(field.base);
+            },
+            .tuple => |tuple| {
+                for (tuple.items) |item| {
+                    item.deinit(allocator);
+                    allocator.destroy(item);
+                }
+                allocator.free(tuple.items);
             },
             .array => |array| {
                 for (array.items) |item| {
@@ -480,7 +492,7 @@ pub const Module = struct {
     module_path: []const u8,
     items: array_list.Managed(Item),
     imports: array_list.Managed(ImportedBinding),
-    retained_checked_functions: []*typed.FunctionData = &.{},
+    retained_checked_functions: []*typed.CheckedFunctionData = &.{},
 
     pub fn init(allocator: Allocator, file_id: source.FileId, module_path: []const u8) Module {
         return .{
@@ -491,11 +503,11 @@ pub const Module = struct {
         };
     }
 
-    pub fn appendRetainedCheckedFunction(self: *Module, function: *typed.FunctionData) !void {
+    pub fn appendRetainedCheckedFunction(self: *Module, function: *typed.CheckedFunctionData) !void {
         const allocator = self.items.allocator;
         const next_len = self.retained_checked_functions.len + 1;
         self.retained_checked_functions = if (self.retained_checked_functions.len == 0)
-            try allocator.alloc(*typed.FunctionData, next_len)
+            try allocator.alloc(*typed.CheckedFunctionData, next_len)
         else
             try allocator.realloc(self.retained_checked_functions, next_len);
         self.retained_checked_functions[next_len - 1] = function;
@@ -645,6 +657,7 @@ fn lowerModuleWithFacts(
             .opaque_type => {
                 mir_item.payload = .{ .opaque_type = .{} };
             },
+            .type_alias => continue,
             .union_type, .trait_type, .impl_block, .none => {},
         }
 
@@ -675,154 +688,11 @@ pub fn lowerModuleFromCheckedFacts(
     return lowerModuleWithFacts(allocator, module, checked_signatures, checked_bodies);
 }
 
-pub fn lowerTypedFunctionItem(
-    allocator: Allocator,
-    name: []const u8,
-    symbol_name: []const u8,
-    span: source.Span,
-    function: *const typed.FunctionData,
-    is_entry_candidate: bool,
-) !Item {
-    const owned_name = try allocator.dupe(u8, name);
-    errdefer allocator.free(owned_name);
-    const owned_symbol_name = try allocator.dupe(u8, symbol_name);
-    errdefer allocator.free(owned_symbol_name);
-
-    const params = try allocator.alloc(Parameter, function.parameters.items.len);
-    errdefer allocator.free(params);
-    for (function.parameters.items, 0..) |parameter, index| {
-        params[index] = .{
-            .name = parameter.name,
-            .mode = parameter.mode,
-            .ty = parameter.ty,
-        };
-    }
-
-    var body = try lowerTypedBlock(allocator, &function.body);
-    errdefer body.deinit(allocator);
-
-    return .{
-        .name = owned_name,
-        .owned_name = owned_name,
-        .symbol_name = owned_symbol_name,
-        .owned_symbol_name = owned_symbol_name,
-        .kind = .value,
-        .is_entry_candidate = is_entry_candidate,
-        .span = span,
-        .payload = .{ .function = .{
-            .return_type = function.return_type,
-            .parameters = params,
-            .body = body,
-            .export_name = function.export_name,
-            .is_suspend = function.is_suspend,
-            .foreign = function.foreign,
-        } },
-    };
-}
-
 fn findCheckedBodyByItemId(checked_bodies: []const query_types.CheckedBody, item_id: @import("../session/ids.zig").ItemId) ?query_types.CheckedBody {
     for (checked_bodies) |body| {
         if (body.item_id.index == item_id.index) return body;
     }
     return null;
-}
-
-fn lowerTypedBlock(allocator: Allocator, block: *const typed.Block) anyerror!Block {
-    var lowered = Block.init(allocator);
-    errdefer lowered.deinit(allocator);
-    for (block.statements.items) |statement| {
-        try lowered.statements.append(try lowerTypedStatement(allocator, statement));
-    }
-    return lowered;
-}
-
-fn lowerTypedStatement(allocator: Allocator, statement: typed.Statement) anyerror!Statement {
-    return switch (statement) {
-        .placeholder => .placeholder,
-        .let_decl => |binding| .{ .let_decl = .{
-            .name = binding.name,
-            .ty = binding.ty,
-            .expr = try cloneTypedExpr(allocator, binding.expr),
-        } },
-        .const_decl => |binding| .{ .const_decl = .{
-            .name = binding.name,
-            .ty = binding.ty,
-            .expr = try cloneTypedExpr(allocator, binding.expr),
-        } },
-        .assign_stmt => |assign| .{ .assign_stmt = .{
-            .name = assign.name,
-            .ty = assign.ty,
-            .op = assign.op,
-            .expr = try cloneTypedExpr(allocator, assign.expr),
-        } },
-        .select_stmt => |select_data| blk: {
-            var arms = try allocator.alloc(Statement.SelectArm, select_data.arms.len);
-            errdefer allocator.free(arms);
-            for (select_data.arms, 0..) |arm, index| {
-                const arm_body = try allocator.create(Block);
-                errdefer allocator.destroy(arm_body);
-                arm_body.* = try lowerTypedBlock(allocator, arm.body);
-                errdefer arm_body.deinit(allocator);
-
-                const bindings = try allocator.alloc(Statement.SelectBinding, arm.bindings.len);
-                errdefer allocator.free(bindings);
-                for (arm.bindings, 0..) |binding, binding_index| {
-                    bindings[binding_index] = .{
-                        .name = binding.name,
-                        .ty = binding.ty,
-                        .expr = try cloneTypedExpr(allocator, binding.expr),
-                    };
-                }
-                arms[index] = .{
-                    .condition = try cloneTypedExpr(allocator, arm.condition),
-                    .bindings = bindings,
-                    .body = arm_body,
-                };
-            }
-
-            var else_body: ?*Block = null;
-            if (select_data.else_body) |body| {
-                const lowered_else = try allocator.create(Block);
-                errdefer allocator.destroy(lowered_else);
-                lowered_else.* = try lowerTypedBlock(allocator, body);
-                else_body = lowered_else;
-            }
-
-            const result = try allocator.create(Statement.SelectData);
-            errdefer allocator.destroy(result);
-            result.* = .{
-                .subject = if (select_data.subject) |subject| try cloneTypedExpr(allocator, subject) else null,
-                .subject_temp_name = if (select_data.subject_temp_name) |value| try allocator.dupe(u8, value) else null,
-                .arms = arms,
-                .else_body = else_body,
-            };
-            break :blk .{ .select_stmt = result };
-        },
-        .loop_stmt => |loop_data| blk: {
-            const lowered_body = try allocator.create(Block);
-            errdefer allocator.destroy(lowered_body);
-            lowered_body.* = try lowerTypedBlock(allocator, loop_data.body);
-
-            const result = try allocator.create(Statement.LoopData);
-            errdefer allocator.destroy(result);
-            result.* = .{
-                .condition = if (loop_data.condition) |condition| try cloneTypedExpr(allocator, condition) else null,
-                .body = lowered_body,
-            };
-            break :blk .{ .loop_stmt = result };
-        },
-        .unsafe_block => |body| blk: {
-            const lowered_body = try allocator.create(Block);
-            errdefer allocator.destroy(lowered_body);
-            lowered_body.* = try lowerTypedBlock(allocator, body);
-            break :blk .{ .unsafe_block = lowered_body };
-        },
-        .defer_stmt => |expr| .{ .defer_stmt = try cloneTypedExpr(allocator, expr) },
-        .break_stmt => .break_stmt,
-        .continue_stmt => .continue_stmt,
-        .return_stmt => |maybe_expr| .{ .return_stmt = if (maybe_expr) |expr| try cloneTypedExpr(allocator, expr) else null },
-        .expr_stmt => |expr| .{ .expr_stmt = try cloneTypedExpr(allocator, expr) },
-    };
 }
 
 pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Module {
@@ -1124,7 +994,7 @@ fn lowerCheckedStatement(
     };
 }
 
-fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
+pub fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
     const result = try allocator.create(Expr);
     errdefer allocator.destroy(result);
 
@@ -1195,6 +1065,14 @@ fn cloneTypedExpr(allocator: Allocator, expr: *const typed.Expr) !*Expr {
             .base = try cloneTypedExpr(allocator, field.base),
             .field_name = field.field_name,
         } },
+        .tuple => |tuple| blk: {
+            const items = try allocator.alloc(*Expr, tuple.items.len);
+            errdefer allocator.free(items);
+            for (tuple.items, 0..) |item, index| {
+                items[index] = try cloneTypedExpr(allocator, item);
+            }
+            break :blk .{ .tuple = .{ .items = items } };
+        },
         .array => |array| blk: {
             const items = try allocator.alloc(*Expr, array.items.len);
             errdefer allocator.free(items);
@@ -1290,6 +1168,14 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
             .base = try cloneExpr(allocator, field.base),
             .field_name = field.field_name,
         } },
+        .tuple => |tuple| blk: {
+            const items = try allocator.alloc(*Expr, tuple.items.len);
+            errdefer allocator.free(items);
+            for (tuple.items, 0..) |item, index| {
+                items[index] = try cloneExpr(allocator, item);
+            }
+            break :blk .{ .tuple = .{ .items = items } };
+        },
         .array => |array| blk: {
             const items = try allocator.alloc(*Expr, array.items.len);
             errdefer allocator.free(items);

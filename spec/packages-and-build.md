@@ -28,6 +28,10 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 - Dependencies are explicit.
 - Cross-package use requires a declared dependency edge.
 - External item resolution goes through the resolved dependency graph, not ambient global lookup.
+- Dependency version matching is exact in v1.
+- Ordinary package dependency resolution selects source package identities.
+- Ordinary non-path dependency resolution consumes those identities from the
+  global store, not directly from local registry roots.
 - Dependency selection must be reproducible.
 - Hidden fallback resolution is not part of the model.
 
@@ -38,6 +42,7 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 - Workspace resolution must be deterministic under the same inputs.
 - Shared dependency graph state is an intentional build artifact, not an implicit runtime global.
 - The resolved graph may contain multiple package versions when the dependency graph requires them.
+- Different exact calendar versions are distinct package identities in that graph.
 - Graph membership is determined by the resolver, not by local import-site fallback behavior.
 
 ## Lockfile And Reproducibility
@@ -45,6 +50,7 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 - Lockfile-controlled reproducibility is part of the toolchain model.
 - The resolved dependency graph must be recordable and replayable.
 - Rebuilding the same workspace with the same locked graph must not silently drift to different dependency versions.
+- Exact dependency resolution law is defined in `spec/dependency-resolution.md`.
 - Fallback dependency substitution is not part of the model.
 
 ## Incremental Build
@@ -117,12 +123,17 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 
 - This spec defines package identity, dependency resolution discipline, workspace behavior, lockfile expectations, and incremental build law.
 - Managed package lifecycle is defined in `spec/package-management.md`.
+- Dependency resolution and version law are defined in
+  `spec/dependency-resolution.md`.
 - Registry identity is defined in `spec/registry-model.md`.
+- Local registry, vendoring, and exchange law is defined in
+  `spec/local-registries-vendoring-and-exchange.md`.
 - Lockfile structure and provenance are defined in `spec/lockfile.md`.
 - Publication flow is defined in `spec/publication.md`.
 - Product kinds are defined in `spec/product-kinds.md`.
 - Manifest and product declaration surface is defined in `spec/manifest-and-products.md`.
-- This spec does not define registry protocol details.
+- This spec does not define local registry import, vendoring, or exchange
+  details.
 - Module tree and visibility are defined in `spec/modules-and-visibility.md`.
 
 ## Diagnostics

@@ -9,6 +9,8 @@ Runa uses a workspace lockfile to pin the exact managed dependency graph and its
 - The lockfile records the exact resolved managed graph.
 - The lockfile is authoritative for reproducible builds in locked mode.
 - The lockfile records source-versus-artifact provenance explicitly.
+- The lockfile records exact calendar package-version identities, not version
+  ranges.
 
 ## Locked Entries
 
@@ -55,6 +57,7 @@ A locked artifact entry records at least:
 - The lockfile pins exact entries that are then satisfied from the global managed dependency store.
 - The global store is shared substrate; the lockfile is workspace truth.
 - Missing locked entries may be fetched or built, but the resulting managed entry must match the locked identity and `SHA-256` checksum expectations.
+- Global store validity and promotion law are defined in `spec/global-store.md`.
 
 ## DLL / Shared-Library Artifacts
 
@@ -66,11 +69,17 @@ A locked artifact entry records at least:
 
 - The lockfile does not replace manifest dependency declarations.
 - The manifest declares dependency intent; the lockfile records exact managed resolution.
+- The manifest and dependency-resolution specs define how exact versions are
+  chosen before locking.
 - Build reproducibility under `spec/packages-and-build.md` depends on lockfile fidelity.
 
 ## Relationship To Other Specs
 
 - Managed package lifecycle is defined in `spec/package-management.md`.
+- Dependency resolution and version law are defined in
+  `spec/dependency-resolution.md`.
+- Global store structure and integrity law are defined in
+  `spec/global-store.md`.
 - Registry identity and immutable entries are defined in `spec/registry-model.md`.
 - Publication is defined in `spec/publication.md`.
 - Workspace and build reproducibility law are defined in `spec/packages-and-build.md`.
@@ -83,6 +92,7 @@ The toolchain must reject:
 - lock replay that silently substitutes source for artifact
 - lock replay that silently substitutes artifact for source
 - lock replay that silently switches registry identity
+- lock replay that silently widens or reinterprets one exact dependency version
 - `SHA-256` checksum mismatch for a locked entry
 - target mismatch for a locked artifact entry
 - ambiguous locked provenance

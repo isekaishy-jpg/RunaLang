@@ -1,0 +1,1155 @@
+const std = @import("std");
+const array_list = std.array_list;
+const const_ir = @import("../query/const_ir.zig");
+const source = @import("../source/root.zig");
+const types = @import("../types/root.zig");
+const Allocator = std.mem.Allocator;
+
+pub const summary = "Backend-contract lowered program descriptors.";
+pub const requires_ownership_validation = true;
+
+pub const ConstExpr = const_ir.Expr;
+pub const ConstValue = const_ir.Value;
+
+pub const BinaryOp = enum {
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    shl,
+    shr,
+    eq,
+    ne,
+    lt,
+    lte,
+    gt,
+    gte,
+    bit_and,
+    bit_xor,
+    bit_or,
+    bool_and,
+    bool_or,
+};
+
+pub const UnaryOp = enum {
+    bool_not,
+    negate,
+    bit_not,
+};
+
+pub const ConversionMode = enum {
+    explicit_infallible,
+    explicit_checked,
+};
+
+pub const ItemCategory = enum {
+    value,
+    type_decl,
+    trait_decl,
+    impl_block,
+    foreign_decl,
+    module_decl,
+    import_binding,
+};
+
+pub const ParameterMode = types.ParameterMode;
+
+pub const TypeKind = enum {
+    builtin,
+    c_abi_alias,
+    nominal,
+    raw_pointer,
+    callable,
+    foreign_callable,
+    dynamic_library,
+    c_va_list,
+    tuple,
+    unsupported,
+};
+
+pub const CallableType = struct {
+    parameters: []ValueType = &.{},
+    return_type: *ValueType,
+    variadic: bool = false,
+
+    fn deinit(self: *CallableType, allocator: Allocator) void {
+        for (self.parameters) |*parameter| parameter.deinit(allocator);
+        if (self.parameters.len != 0) allocator.free(self.parameters);
+        self.return_type.deinit(allocator);
+        allocator.destroy(self.return_type);
+        self.* = undefined;
+    }
+};
+
+pub const ValueType = struct {
+    type_id: types.CanonicalTypeId,
+    c_name: []const u8,
+    owned_c_name: ?[]u8 = null,
+    kind: TypeKind = .unsupported,
+    builtin: ?types.Builtin = null,
+    callable: ?CallableType = null,
+
+    pub fn deinit(self: *ValueType, allocator: Allocator) void {
+        if (self.callable) |*callable| callable.deinit(allocator);
+        if (self.owned_c_name) |owned| allocator.free(owned);
+        self.* = .{
+            .type_id = .{ .index = 0 },
+            .c_name = "",
+        };
+    }
+};
+
+pub const ImportedBinding = struct {
+    local_name: []const u8,
+    target_name: []const u8,
+    target_symbol: []const u8,
+    category: ItemCategory,
+    const_type: ?ValueType = null,
+    function_return_type: ?ValueType = null,
+    function_is_suspend: bool = false,
+    function_parameter_types: ?[]ValueType = null,
+    function_parameter_type_names: ?[]const []const u8 = null,
+    function_parameter_modes: ?[]ParameterMode = null,
+
+    pub fn deinit(self: ImportedBinding, allocator: Allocator) void {
+        if (self.const_type) |value| {
+            var owned = value;
+            owned.deinit(allocator);
+        }
+        if (self.function_return_type) |value| {
+            var owned = value;
+            owned.deinit(allocator);
+        }
+        if (self.function_parameter_types) |value| {
+            for (value) |*parameter_type| parameter_type.deinit(allocator);
+            allocator.free(value);
+        }
+        if (self.function_parameter_type_names) |value| allocator.free(value);
+        if (self.function_parameter_modes) |value| allocator.free(value);
+    }
+};
+
+pub const Expr = struct {
+    ty: ValueType,
+    owned_callee: ?[]u8 = null,
+    node: Node,
+
+    pub const Node = union(enum) {
+        integer: i64,
+        bool_lit: bool,
+        string: []const u8,
+        identifier: []const u8,
+        enum_variant: EnumVariantValue,
+        enum_tag: EnumVariantValue,
+        enum_constructor_target: EnumVariantValue,
+        enum_construct: EnumConstruct,
+        call: Call,
+        constructor: Constructor,
+        field: Field,
+        tuple: Tuple,
+        array: Array,
+        array_repeat: ArrayRepeat,
+        index: Index,
+        conversion: Conversion,
+        unary: Unary,
+        binary: Binary,
+    };
+
+    pub const Call = struct {
+        callee: []const u8,
+        args: []*Expr,
+    };
+
+    pub const EnumVariantValue = struct {
+        enum_name: []const u8,
+        enum_symbol: []const u8,
+        variant_name: []const u8,
+    };
+
+    pub const EnumConstruct = struct {
+        enum_name: []const u8,
+        enum_symbol: []const u8,
+        variant_name: []const u8,
+        args: []*Expr,
+    };
+
+    pub const Constructor = struct {
+        type_name: []const u8,
+        type_symbol: []const u8,
+        args: []*Expr,
+    };
+
+    pub const Field = struct {
+        base: *Expr,
+        field_name: []const u8,
+    };
+
+    pub const Tuple = struct {
+        items: []*Expr,
+    };
+
+    pub const Array = struct {
+        items: []*Expr,
+    };
+
+    pub const ArrayRepeat = struct {
+        value: *Expr,
+        length: *Expr,
+    };
+
+    pub const Index = struct {
+        base: *Expr,
+        index: *Expr,
+    };
+
+    pub const Conversion = struct {
+        operand: *Expr,
+        mode: ConversionMode,
+        target_type: ValueType,
+        target_type_name: []const u8,
+    };
+
+    pub const Binary = struct {
+        op: BinaryOp,
+        lhs: *Expr,
+        rhs: *Expr,
+    };
+
+    pub const Unary = struct {
+        op: UnaryOp,
+        operand: *Expr,
+    };
+
+    fn deinit(self: *Expr, allocator: Allocator) void {
+        self.ty.deinit(allocator);
+        if (self.owned_callee) |owned_callee| allocator.free(owned_callee);
+        switch (self.node) {
+            .enum_construct => |construct| {
+                for (construct.args) |arg| {
+                    arg.deinit(allocator);
+                    allocator.destroy(arg);
+                }
+                allocator.free(construct.args);
+            },
+            .call => |call| {
+                for (call.args) |arg| {
+                    arg.deinit(allocator);
+                    allocator.destroy(arg);
+                }
+                allocator.free(call.args);
+            },
+            .constructor => |constructor| {
+                for (constructor.args) |arg| {
+                    arg.deinit(allocator);
+                    allocator.destroy(arg);
+                }
+                allocator.free(constructor.args);
+            },
+            .field => |field| {
+                field.base.deinit(allocator);
+                allocator.destroy(field.base);
+            },
+            .tuple => |tuple| {
+                for (tuple.items) |item| {
+                    item.deinit(allocator);
+                    allocator.destroy(item);
+                }
+                allocator.free(tuple.items);
+            },
+            .array => |array| {
+                for (array.items) |item| {
+                    item.deinit(allocator);
+                    allocator.destroy(item);
+                }
+                allocator.free(array.items);
+            },
+            .array_repeat => |array_repeat| {
+                array_repeat.value.deinit(allocator);
+                allocator.destroy(array_repeat.value);
+                array_repeat.length.deinit(allocator);
+                allocator.destroy(array_repeat.length);
+            },
+            .index => |index| {
+                index.base.deinit(allocator);
+                allocator.destroy(index.base);
+                index.index.deinit(allocator);
+                allocator.destroy(index.index);
+            },
+            .conversion => |conversion| {
+                var target_type = conversion.target_type;
+                target_type.deinit(allocator);
+                conversion.operand.deinit(allocator);
+                allocator.destroy(conversion.operand);
+            },
+            .unary => |unary| {
+                unary.operand.deinit(allocator);
+                allocator.destroy(unary.operand);
+            },
+            .binary => |binary| {
+                binary.lhs.deinit(allocator);
+                allocator.destroy(binary.lhs);
+                binary.rhs.deinit(allocator);
+                allocator.destroy(binary.rhs);
+            },
+            else => {},
+        }
+    }
+};
+
+pub const Statement = union(enum) {
+    placeholder,
+    let_decl: BindingDecl,
+    const_decl: BindingDecl,
+    assign_stmt: AssignData,
+    select_stmt: *SelectData,
+    loop_stmt: *LoopData,
+    unsafe_block: *Block,
+    defer_stmt: *Expr,
+    break_stmt,
+    continue_stmt,
+    return_stmt: ?*Expr,
+    expr_stmt: *Expr,
+
+    pub const BindingDecl = struct {
+        name: []const u8,
+        owned_name: ?[]u8 = null,
+        ty: ValueType,
+        expr: *Expr,
+    };
+
+    pub const AssignData = struct {
+        name: []const u8,
+        owned_name: ?[]u8 = null,
+        ty: ValueType,
+        op: ?BinaryOp,
+        expr: *Expr,
+    };
+
+    pub const SelectBinding = struct {
+        name: []const u8,
+        owned_name: ?[]u8 = null,
+        ty: ValueType,
+        expr: *Expr,
+
+        pub fn deinit(self: SelectBinding, allocator: Allocator) void {
+            if (self.owned_name) |name| allocator.free(name);
+            var ty = self.ty;
+            ty.deinit(allocator);
+            self.expr.deinit(allocator);
+            allocator.destroy(self.expr);
+        }
+    };
+
+    pub const SelectArm = struct {
+        condition: *Expr,
+        bindings: []SelectBinding,
+        body: *Block,
+
+        pub fn deinit(self: SelectArm, allocator: Allocator) void {
+            self.condition.deinit(allocator);
+            allocator.destroy(self.condition);
+            for (self.bindings) |binding| binding.deinit(allocator);
+            allocator.free(self.bindings);
+            self.body.deinit(allocator);
+            allocator.destroy(self.body);
+        }
+    };
+
+    pub const SelectData = struct {
+        subject: ?*Expr = null,
+        subject_temp_name: ?[]const u8 = null,
+        arms: []SelectArm,
+        else_body: ?*Block = null,
+
+        pub fn deinit(self: *SelectData, allocator: Allocator) void {
+            if (self.subject) |subject| {
+                subject.deinit(allocator);
+                allocator.destroy(subject);
+            }
+            if (self.subject_temp_name) |name| allocator.free(name);
+            for (self.arms) |arm| arm.deinit(allocator);
+            allocator.free(self.arms);
+            if (self.else_body) |body| {
+                body.deinit(allocator);
+                allocator.destroy(body);
+            }
+        }
+    };
+
+    pub const LoopData = struct {
+        condition: ?*Expr = null,
+        body: *Block,
+
+        pub fn deinit(self: *LoopData, allocator: Allocator) void {
+            if (self.condition) |condition| {
+                condition.deinit(allocator);
+                allocator.destroy(condition);
+            }
+            self.body.deinit(allocator);
+            allocator.destroy(self.body);
+        }
+    };
+
+    fn deinit(self: Statement, allocator: Allocator) void {
+        switch (self) {
+            .let_decl, .const_decl => |binding| {
+                if (binding.owned_name) |name| allocator.free(name);
+                var ty = binding.ty;
+                ty.deinit(allocator);
+                binding.expr.deinit(allocator);
+                allocator.destroy(binding.expr);
+            },
+            .assign_stmt => |assign| {
+                if (assign.owned_name) |name| allocator.free(name);
+                var ty = assign.ty;
+                ty.deinit(allocator);
+                assign.expr.deinit(allocator);
+                allocator.destroy(assign.expr);
+            },
+            .select_stmt => |select_data| {
+                select_data.deinit(allocator);
+                allocator.destroy(select_data);
+            },
+            .loop_stmt => |loop_data| {
+                loop_data.deinit(allocator);
+                allocator.destroy(loop_data);
+            },
+            .unsafe_block => |body| {
+                body.deinit(allocator);
+                allocator.destroy(body);
+            },
+            .defer_stmt => |expr| {
+                expr.deinit(allocator);
+                allocator.destroy(expr);
+            },
+            .return_stmt => |maybe_expr| if (maybe_expr) |expr| {
+                expr.deinit(allocator);
+                allocator.destroy(expr);
+            },
+            .expr_stmt => |expr| {
+                expr.deinit(allocator);
+                allocator.destroy(expr);
+            },
+            .placeholder, .break_stmt, .continue_stmt => {},
+        }
+    }
+};
+
+pub const Block = struct {
+    statements: array_list.Managed(Statement),
+
+    pub fn init(allocator: Allocator) Block {
+        return .{
+            .statements = array_list.Managed(Statement).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Block, allocator: Allocator) void {
+        for (self.statements.items) |statement| statement.deinit(allocator);
+        self.statements.deinit();
+    }
+};
+
+pub const Parameter = struct {
+    name: []const u8,
+    mode: ParameterMode,
+    ty: ValueType,
+
+    pub fn deinit(self: *Parameter, allocator: Allocator) void {
+        self.ty.deinit(allocator);
+    }
+};
+
+pub const FunctionLinkage = union(enum) {
+    internal,
+    foreign_import,
+    foreign_export: []const u8,
+};
+
+pub const FunctionData = struct {
+    return_type: ValueType,
+    parameters: []Parameter,
+    body: Block,
+    linkage: FunctionLinkage = .internal,
+    export_name: ?[]const u8,
+    is_suspend: bool,
+    foreign: bool,
+
+    fn deinit(self: *FunctionData, allocator: Allocator) void {
+        self.return_type.deinit(allocator);
+        for (self.parameters) |*parameter| parameter.deinit(allocator);
+        allocator.free(self.parameters);
+        self.body.deinit(allocator);
+    }
+};
+
+pub const ConstData = struct {
+    ty: types.Builtin,
+    type_ref: ValueType,
+    expr: *const ConstExpr,
+
+    fn deinit(self: *ConstData, allocator: Allocator) void {
+        self.type_ref.deinit(allocator);
+        const_ir.destroyExpr(allocator, self.expr);
+    }
+};
+
+pub const StructField = struct {
+    name: []const u8,
+    type_name: []const u8,
+    ty: ValueType,
+
+    pub fn deinit(self: *StructField, allocator: Allocator) void {
+        self.ty.deinit(allocator);
+    }
+};
+
+pub const TupleField = struct {
+    type_name: []const u8,
+    ty: ValueType,
+
+    pub fn deinit(self: *TupleField, allocator: Allocator) void {
+        self.ty.deinit(allocator);
+    }
+};
+
+pub const StructData = struct {
+    fields: []StructField,
+
+    fn deinit(self: *StructData, allocator: Allocator) void {
+        for (self.fields) |*field| field.deinit(allocator);
+        allocator.free(self.fields);
+    }
+};
+
+pub const EnumVariantPayload = union(enum) {
+    none,
+    tuple_fields: []TupleField,
+    named_fields: []StructField,
+
+    pub fn deinit(self: *EnumVariantPayload, allocator: Allocator) void {
+        switch (self.*) {
+            .none => {},
+            .tuple_fields => |tuple_fields| {
+                for (tuple_fields) |*field| field.deinit(allocator);
+                allocator.free(tuple_fields);
+            },
+            .named_fields => |named_fields| {
+                for (named_fields) |*field| field.deinit(allocator);
+                allocator.free(named_fields);
+            },
+        }
+    }
+};
+
+pub const EnumVariant = struct {
+    name: []const u8,
+    payload: EnumVariantPayload,
+
+    pub fn deinit(self: *EnumVariant, allocator: Allocator) void {
+        self.payload.deinit(allocator);
+    }
+};
+
+pub const EnumData = struct {
+    variants: []EnumVariant,
+
+    fn deinit(self: *EnumData, allocator: Allocator) void {
+        for (self.variants) |*variant| variant.deinit(allocator);
+        allocator.free(self.variants);
+    }
+};
+
+pub const OpaqueData = struct {
+    fn deinit(self: *OpaqueData, allocator: Allocator) void {
+        _ = self;
+        _ = allocator;
+    }
+};
+
+pub const Payload = union(enum) {
+    none,
+    function: FunctionData,
+    const_item: ConstData,
+    struct_type: StructData,
+    enum_type: EnumData,
+    opaque_type: OpaqueData,
+
+    fn deinit(self: *Payload, allocator: Allocator) void {
+        switch (self.*) {
+            .function => |*function| function.deinit(allocator),
+            .const_item => |*const_item| const_item.deinit(allocator),
+            .struct_type => |*struct_type| struct_type.deinit(allocator),
+            .enum_type => |*enum_type| enum_type.deinit(allocator),
+            .opaque_type => |*opaque_type| opaque_type.deinit(allocator),
+            .none => {},
+        }
+    }
+};
+
+pub const Item = struct {
+    name: []const u8,
+    owned_name: ?[]u8 = null,
+    symbol_name: []const u8,
+    owned_symbol_name: ?[]u8 = null,
+    kind: ItemCategory,
+    is_entry_candidate: bool,
+    span: source.Span,
+    payload: Payload = .none,
+
+    pub fn deinit(self: *Item, allocator: Allocator) void {
+        if (self.owned_name) |owned_name| allocator.free(owned_name);
+        if (self.owned_symbol_name) |owned_symbol_name| allocator.free(owned_symbol_name);
+        self.payload.deinit(allocator);
+    }
+};
+
+pub const Module = struct {
+    file_id: source.FileId,
+    module_path: []const u8,
+    items: array_list.Managed(Item),
+    imports: array_list.Managed(ImportedBinding),
+
+    pub fn init(allocator: Allocator, file_id: source.FileId, module_path: []const u8) Module {
+        return .{
+            .file_id = file_id,
+            .module_path = module_path,
+            .items = array_list.Managed(Item).init(allocator),
+            .imports = array_list.Managed(ImportedBinding).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Module) void {
+        for (self.items.items) |*item| item.deinit(self.items.allocator);
+        self.items.deinit();
+        for (self.imports.items) |binding| binding.deinit(self.items.allocator);
+        self.imports.deinit();
+        self.items.allocator.free(self.module_path);
+    }
+};
+
+pub fn nominalTypeSymbol(module: *const Module, raw_name: []const u8) ?[]const u8 {
+    const wanted = baseTypeName(raw_name);
+    for (module.items.items) |*item| {
+        switch (item.payload) {
+            .struct_type, .enum_type, .opaque_type => {
+                if (std.mem.eql(u8, item.name, wanted)) return item.symbol_name;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn baseTypeName(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (std.mem.indexOfScalar(u8, trimmed, '[')) |open_index| {
+        return std.mem.trim(u8, trimmed[0..open_index], " \t");
+    }
+    return trimmed;
+}
+
+pub fn cloneValueType(allocator: Allocator, value: ValueType) Allocator.Error!ValueType {
+    var cloned = ValueType{
+        .type_id = value.type_id,
+        .c_name = value.c_name,
+        .kind = value.kind,
+        .builtin = value.builtin,
+    };
+    errdefer cloned.deinit(allocator);
+
+    if (value.owned_c_name != null or value.c_name.len != 0) {
+        cloned.owned_c_name = try allocator.dupe(u8, value.c_name);
+        cloned.c_name = cloned.owned_c_name.?;
+    }
+    if (value.callable) |callable| {
+        cloned.callable = try cloneCallableType(allocator, callable);
+    }
+    return cloned;
+}
+
+fn cloneCallableType(allocator: Allocator, callable: CallableType) Allocator.Error!CallableType {
+    const return_type = try allocator.create(ValueType);
+    errdefer allocator.destroy(return_type);
+    return_type.* = try cloneValueType(allocator, callable.return_type.*);
+    errdefer return_type.deinit(allocator);
+
+    const parameters = try cloneValueTypeSlice(allocator, callable.parameters);
+    errdefer {
+        for (parameters) |*parameter| parameter.deinit(allocator);
+        if (parameters.len != 0) allocator.free(parameters);
+    }
+
+    return .{
+        .parameters = parameters,
+        .return_type = return_type,
+        .variadic = callable.variadic,
+    };
+}
+
+fn cloneValueTypeSlice(allocator: Allocator, values: []const ValueType) Allocator.Error![]ValueType {
+    const cloned = try allocator.alloc(ValueType, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*value| value.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (values, 0..) |value, index| {
+        cloned[index] = try cloneValueType(allocator, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Module {
+    var merged = Module.init(allocator, if (modules.len != 0) modules[0].file_id else 0, if (modules.len != 0) try allocator.dupe(u8, modules[0].module_path) else try allocator.dupe(u8, ""));
+    errdefer merged.deinit();
+
+    for (modules) |module| {
+        for (module.imports.items) |binding| {
+            try merged.imports.append(.{
+                .local_name = binding.local_name,
+                .target_name = binding.target_name,
+                .target_symbol = binding.target_symbol,
+                .category = binding.category,
+                .const_type = if (binding.const_type) |value| try cloneValueType(allocator, value) else null,
+                .function_return_type = if (binding.function_return_type) |value| try cloneValueType(allocator, value) else null,
+                .function_is_suspend = binding.function_is_suspend,
+                .function_parameter_types = if (binding.function_parameter_types) |values| try cloneValueTypeSlice(allocator, values) else null,
+                .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
+                .function_parameter_modes = if (binding.function_parameter_modes) |values| try allocator.dupe(ParameterMode, values) else null,
+            });
+        }
+
+        for (module.items.items) |item| {
+            var merged_item = Item{
+                .name = item.name,
+                .symbol_name = item.symbol_name,
+                .kind = item.kind,
+                .is_entry_candidate = item.is_entry_candidate,
+                .span = item.span,
+                .payload = .none,
+            };
+            errdefer merged_item.deinit(allocator);
+
+            switch (item.payload) {
+                .function => |function| {
+                    const params = try allocator.alloc(Parameter, function.parameters.len);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (params[0..initialized]) |*parameter| parameter.deinit(allocator);
+                        allocator.free(params);
+                    }
+                    for (function.parameters, 0..) |parameter, parameter_index| {
+                        params[parameter_index] = .{
+                            .name = parameter.name,
+                            .mode = parameter.mode,
+                            .ty = try cloneValueType(allocator, parameter.ty),
+                        };
+                        initialized += 1;
+                    }
+
+                    const body = try cloneBlock(allocator, &function.body);
+
+                    merged_item.payload = .{ .function = .{
+                        .return_type = try cloneValueType(allocator, function.return_type),
+                        .parameters = params,
+                        .body = body,
+                        .linkage = function.linkage,
+                        .export_name = function.export_name,
+                        .is_suspend = function.is_suspend,
+                        .foreign = function.foreign,
+                    } };
+                },
+                .const_item => |const_item| {
+                    merged_item.payload = .{ .const_item = .{
+                        .ty = const_item.ty,
+                        .type_ref = try cloneValueType(allocator, const_item.type_ref),
+                        .expr = try cloneConstExpr(allocator, const_item.expr),
+                    } };
+                },
+                .struct_type => |struct_type| {
+                    const fields = try allocator.alloc(StructField, struct_type.fields.len);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (fields[0..initialized]) |*field| field.deinit(allocator);
+                        allocator.free(fields);
+                    }
+                    for (struct_type.fields, 0..) |field, field_index| {
+                        fields[field_index] = .{
+                            .name = field.name,
+                            .type_name = field.type_name,
+                            .ty = try cloneValueType(allocator, field.ty),
+                        };
+                        initialized += 1;
+                    }
+                    merged_item.payload = .{ .struct_type = .{ .fields = fields } };
+                },
+                .enum_type => |enum_type| {
+                    const variants = try allocator.alloc(EnumVariant, enum_type.variants.len);
+                    errdefer allocator.free(variants);
+                    for (enum_type.variants, 0..) |variant, variant_index| {
+                        variants[variant_index] = .{
+                            .name = variant.name,
+                            .payload = switch (variant.payload) {
+                                .none => .none,
+                                .tuple_fields => |tuple_fields| blk: {
+                                    const fields = try allocator.alloc(TupleField, tuple_fields.len);
+                                    var initialized: usize = 0;
+                                    errdefer {
+                                        for (fields[0..initialized]) |*field| field.deinit(allocator);
+                                        allocator.free(fields);
+                                    }
+                                    for (tuple_fields, 0..) |field, field_index| {
+                                        fields[field_index] = .{
+                                            .type_name = field.type_name,
+                                            .ty = try cloneValueType(allocator, field.ty),
+                                        };
+                                        initialized += 1;
+                                    }
+                                    break :blk .{ .tuple_fields = fields };
+                                },
+                                .named_fields => |named_fields| blk: {
+                                    const fields = try allocator.alloc(StructField, named_fields.len);
+                                    var initialized: usize = 0;
+                                    errdefer {
+                                        for (fields[0..initialized]) |*field| field.deinit(allocator);
+                                        allocator.free(fields);
+                                    }
+                                    for (named_fields, 0..) |field, field_index| {
+                                        fields[field_index] = .{
+                                            .name = field.name,
+                                            .type_name = field.type_name,
+                                            .ty = try cloneValueType(allocator, field.ty),
+                                        };
+                                        initialized += 1;
+                                    }
+                                    break :blk .{ .named_fields = fields };
+                                },
+                            },
+                        };
+                    }
+                    merged_item.payload = .{ .enum_type = .{ .variants = variants } };
+                },
+                .opaque_type => {
+                    merged_item.payload = .{ .opaque_type = .{} };
+                },
+                .none => {},
+            }
+
+            try merged.items.append(merged_item);
+        }
+    }
+
+    return merged;
+}
+
+fn cloneBlock(allocator: Allocator, block: *const Block) anyerror!Block {
+    var cloned = Block.init(allocator);
+    errdefer cloned.deinit(allocator);
+    for (block.statements.items) |statement| {
+        try cloned.statements.append(try cloneStatement(allocator, statement));
+    }
+    return cloned;
+}
+
+fn cloneStatement(allocator: Allocator, statement: Statement) anyerror!Statement {
+    return switch (statement) {
+        .placeholder => .placeholder,
+        .let_decl => |binding| blk: {
+            const cloned_name = try cloneMaybeOwnedName(allocator, binding.name, binding.owned_name);
+            break :blk .{ .let_decl = .{
+                .name = cloned_name.name,
+                .owned_name = cloned_name.owned_name,
+            .ty = try cloneValueType(allocator, binding.ty),
+            .expr = try cloneExpr(allocator, binding.expr),
+            } };
+        },
+        .const_decl => |binding| blk: {
+            const cloned_name = try cloneMaybeOwnedName(allocator, binding.name, binding.owned_name);
+            break :blk .{ .const_decl = .{
+                .name = cloned_name.name,
+                .owned_name = cloned_name.owned_name,
+            .ty = try cloneValueType(allocator, binding.ty),
+            .expr = try cloneExpr(allocator, binding.expr),
+            } };
+        },
+        .assign_stmt => |assign| blk: {
+            const cloned_name = try cloneMaybeOwnedName(allocator, assign.name, assign.owned_name);
+            break :blk .{ .assign_stmt = .{
+                .name = cloned_name.name,
+                .owned_name = cloned_name.owned_name,
+            .ty = try cloneValueType(allocator, assign.ty),
+            .op = assign.op,
+            .expr = try cloneExpr(allocator, assign.expr),
+            } };
+        },
+        .select_stmt => |select_data| blk: {
+            var arms = try allocator.alloc(Statement.SelectArm, select_data.arms.len);
+            errdefer allocator.free(arms);
+            for (select_data.arms, 0..) |arm, index| {
+                const body = try allocator.create(Block);
+                errdefer allocator.destroy(body);
+                body.* = try cloneBlock(allocator, arm.body);
+                const bindings = try allocator.alloc(Statement.SelectBinding, arm.bindings.len);
+                errdefer allocator.free(bindings);
+                for (arm.bindings, 0..) |binding, binding_index| {
+                    const cloned_name = try cloneMaybeOwnedName(allocator, binding.name, binding.owned_name);
+                    bindings[binding_index] = .{
+                        .name = cloned_name.name,
+                        .owned_name = cloned_name.owned_name,
+                        .ty = try cloneValueType(allocator, binding.ty),
+                        .expr = try cloneExpr(allocator, binding.expr),
+                    };
+                }
+                arms[index] = .{
+                    .condition = try cloneExpr(allocator, arm.condition),
+                    .bindings = bindings,
+                    .body = body,
+                };
+            }
+
+            const cloned = try allocator.create(Statement.SelectData);
+            errdefer allocator.destroy(cloned);
+            cloned.* = .{
+                .subject = if (select_data.subject) |subject| try cloneExpr(allocator, subject) else null,
+                .subject_temp_name = if (select_data.subject_temp_name) |name| try allocator.dupe(u8, name) else null,
+                .arms = arms,
+                .else_body = if (select_data.else_body) |body| blk_body: {
+                    const cloned_body = try allocator.create(Block);
+                    errdefer allocator.destroy(cloned_body);
+                    cloned_body.* = try cloneBlock(allocator, body);
+                    break :blk_body cloned_body;
+                } else null,
+            };
+            break :blk .{ .select_stmt = cloned };
+        },
+        .loop_stmt => |loop_data| blk: {
+            const cloned = try allocator.create(Statement.LoopData);
+            errdefer allocator.destroy(cloned);
+            const body = try allocator.create(Block);
+            errdefer allocator.destroy(body);
+            body.* = try cloneBlock(allocator, loop_data.body);
+            cloned.* = .{
+                .condition = if (loop_data.condition) |condition| try cloneExpr(allocator, condition) else null,
+                .body = body,
+            };
+            break :blk .{ .loop_stmt = cloned };
+        },
+        .unsafe_block => |body| blk: {
+            const cloned = try allocator.create(Block);
+            errdefer allocator.destroy(cloned);
+            cloned.* = try cloneBlock(allocator, body);
+            break :blk .{ .unsafe_block = cloned };
+        },
+        .defer_stmt => |expr| .{ .defer_stmt = try cloneExpr(allocator, expr) },
+        .break_stmt => .break_stmt,
+        .continue_stmt => .continue_stmt,
+        .return_stmt => |maybe_expr| .{ .return_stmt = if (maybe_expr) |expr| try cloneExpr(allocator, expr) else null },
+        .expr_stmt => |expr| .{ .expr_stmt = try cloneExpr(allocator, expr) },
+    };
+}
+
+const ClonedName = struct {
+    name: []const u8,
+    owned_name: ?[]u8 = null,
+};
+
+fn cloneMaybeOwnedName(allocator: Allocator, name: []const u8, owned_name: ?[]u8) !ClonedName {
+    if (owned_name == null) return .{ .name = name };
+    const cloned = try allocator.dupe(u8, name);
+    return .{ .name = cloned, .owned_name = cloned };
+}
+
+fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
+    const result = try allocator.create(Expr);
+    errdefer allocator.destroy(result);
+
+    result.ty = try cloneValueType(allocator, expr.ty);
+    var owned_callee: ?[]u8 = null;
+    result.node = switch (expr.node) {
+        .integer => |value| .{ .integer = value },
+        .bool_lit => |value| .{ .bool_lit = value },
+        .string => |value| .{ .string = value },
+        .identifier => |value| .{ .identifier = value },
+        .enum_variant => |value| .{ .enum_variant = value },
+        .enum_tag => |value| .{ .enum_tag = value },
+        .enum_constructor_target => |value| .{ .enum_constructor_target = value },
+        .enum_construct => |construct| blk: {
+            const args = try allocator.alloc(*Expr, construct.args.len);
+            errdefer allocator.free(args);
+            for (construct.args, 0..) |arg, index| {
+                args[index] = try cloneExpr(allocator, arg);
+            }
+            break :blk .{ .enum_construct = .{
+                .enum_name = construct.enum_name,
+                .enum_symbol = construct.enum_symbol,
+                .variant_name = construct.variant_name,
+                .args = args,
+            } };
+        },
+        .call => |call| blk: {
+            const args = try allocator.alloc(*Expr, call.args.len);
+            errdefer allocator.free(args);
+            for (call.args, 0..) |arg, index| {
+                args[index] = try cloneExpr(allocator, arg);
+            }
+            owned_callee = try allocator.dupe(u8, call.callee);
+            errdefer {
+                if (owned_callee) |value| allocator.free(value);
+            }
+            break :blk .{ .call = .{
+                .callee = owned_callee.?,
+                .args = args,
+            } };
+        },
+        .constructor => |constructor| blk: {
+            const args = try allocator.alloc(*Expr, constructor.args.len);
+            errdefer allocator.free(args);
+            for (constructor.args, 0..) |arg, index| {
+                args[index] = try cloneExpr(allocator, arg);
+            }
+            break :blk .{ .constructor = .{
+                .type_name = constructor.type_name,
+                .type_symbol = constructor.type_symbol,
+                .args = args,
+            } };
+        },
+        .field => |field| .{ .field = .{
+            .base = try cloneExpr(allocator, field.base),
+            .field_name = field.field_name,
+        } },
+        .tuple => |tuple| blk: {
+            const items = try allocator.alloc(*Expr, tuple.items.len);
+            errdefer allocator.free(items);
+            for (tuple.items, 0..) |item, index| {
+                items[index] = try cloneExpr(allocator, item);
+            }
+            break :blk .{ .tuple = .{ .items = items } };
+        },
+        .array => |array| blk: {
+            const items = try allocator.alloc(*Expr, array.items.len);
+            errdefer allocator.free(items);
+            for (array.items, 0..) |item, index| {
+                items[index] = try cloneExpr(allocator, item);
+            }
+            break :blk .{ .array = .{ .items = items } };
+        },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneExpr(allocator, array_repeat.value),
+            .length = try cloneExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneExpr(allocator, index.base),
+            .index = try cloneExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = try cloneValueType(allocator, conversion.target_type),
+            .target_type_name = conversion.target_type_name,
+        } },
+        .unary => |unary| .{ .unary = .{
+            .op = unary.op,
+            .operand = try cloneExpr(allocator, unary.operand),
+        } },
+        .binary => |binary| .{ .binary = .{
+            .op = binary.op,
+            .lhs = try cloneExpr(allocator, binary.lhs),
+            .rhs = try cloneExpr(allocator, binary.rhs),
+        } },
+    };
+    result.owned_callee = owned_callee;
+
+    return result;
+}
+
+pub fn cloneConstExpr(allocator: Allocator, expr: *const ConstExpr) anyerror!*ConstExpr {
+    const result = try allocator.create(ConstExpr);
+    var initialized = false;
+    errdefer {
+        if (initialized) {
+            const_ir.destroyExpr(allocator, result);
+        } else {
+            allocator.destroy(result);
+        }
+    }
+
+    result.result_type = expr.result_type;
+    result.node = switch (expr.node) {
+        .literal => |value| .{ .literal = try const_ir.cloneValue(allocator, value) },
+        .const_ref => |name| .{ .const_ref = name },
+        .associated_const_ref => |ref| .{ .associated_const_ref = .{
+            .owner_name = ref.owner_name,
+            .const_name = ref.const_name,
+        } },
+        .enum_variant => |variant| .{ .enum_variant = .{
+            .enum_name = variant.enum_name,
+            .variant_name = variant.variant_name,
+        } },
+        .enum_tag => |variant| .{ .enum_tag = .{
+            .enum_name = variant.enum_name,
+            .variant_name = variant.variant_name,
+        } },
+        .enum_construct => |construct| .{ .enum_construct = .{
+            .enum_name = construct.enum_name,
+            .variant_name = construct.variant_name,
+            .args = try cloneConstExprSlice(allocator, construct.args),
+        } },
+        .constructor => |constructor| .{ .constructor = .{
+            .type_name = constructor.type_name,
+            .args = try cloneConstExprSlice(allocator, constructor.args),
+        } },
+        .field => |field| .{ .field = .{
+            .base = try cloneConstExpr(allocator, field.base),
+            .field_name = field.field_name,
+        } },
+        .array => |array| .{ .array = .{
+            .items = try cloneConstExprSlice(allocator, array.items),
+        } },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneConstExpr(allocator, array_repeat.value),
+            .length = try cloneConstExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneConstExpr(allocator, index.base),
+            .index = try cloneConstExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneConstExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = conversion.target_type,
+        } },
+        .unary => |unary| .{ .unary = .{
+            .op = unary.op,
+            .operand = try cloneConstExpr(allocator, unary.operand),
+        } },
+        .binary => |binary| blk: {
+            const lhs = try cloneConstExpr(allocator, binary.lhs);
+            errdefer const_ir.destroyExpr(allocator, lhs);
+            const rhs = try cloneConstExpr(allocator, binary.rhs);
+            break :blk .{ .binary = .{
+                .op = binary.op,
+                .lhs = lhs,
+                .rhs = rhs,
+            } };
+        },
+    };
+    initialized = true;
+    return result;
+}
+
+fn cloneConstExprSlice(allocator: Allocator, exprs: []*ConstExpr) anyerror![]*ConstExpr {
+    const cloned = try allocator.alloc(*ConstExpr, exprs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |expr| const_ir.destroyExpr(allocator, expr);
+        allocator.free(cloned);
+    }
+    for (exprs, 0..) |expr, index| {
+        cloned[index] = try cloneConstExpr(allocator, expr);
+        initialized += 1;
+    }
+    return cloned;
+}

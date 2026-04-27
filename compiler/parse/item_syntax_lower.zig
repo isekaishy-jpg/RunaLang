@@ -36,6 +36,14 @@ pub fn lowerItemSyntax(
                     null,
             },
         },
+        .type_alias_item => .{
+            .type_alias = .{
+                .name = spanTextForChildKind(file, tokens, tree, signature_node, .item_name),
+                .generic_params = spanTextForChildKind(file, tokens, tree, signature_node, .generic_param_list),
+                .target = spanTextForChildKind(file, tokens, tree, signature_node, .type_alias_value),
+                .where_clauses = where_clauses,
+            },
+        },
         .module_item, .struct_item, .enum_item, .union_item, .trait_item, .opaque_type_item => .{
             .named_decl = .{
                 .name = spanTextForChildKind(file, tokens, tree, signature_node, .item_name),

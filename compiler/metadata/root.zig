@@ -106,7 +106,7 @@ pub fn collectPackagedMetadataFromSession(
             .input_type = try renderPackedInputType(allocator, api.parameters),
             .output_type = try allocator.dupe(u8, typeName(api.return_type)),
             .export_name = if (api.export_name) |value| try allocator.dupe(u8, value) else null,
-            .referenced_capability_families = try allocator.alloc([]const u8, 0),
+            .referenced_capability_families = try duplicateStringSlice(allocator, api.referenced_capability_families),
         });
     }
 
@@ -208,4 +208,13 @@ fn appendStringArray(out: *array_list.Managed(u8), key: []const u8, values: []co
         try out.appendSlice("\"");
     }
     try out.appendSlice("]\n");
+}
+
+fn duplicateStringSlice(allocator: Allocator, values: []const []const u8) ![][]const u8 {
+    const duplicated = try allocator.alloc([]const u8, values.len);
+    errdefer allocator.free(duplicated);
+    for (values, 0..) |value, index| {
+        duplicated[index] = try allocator.dupe(u8, value);
+    }
+    return duplicated;
 }

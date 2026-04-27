@@ -28,6 +28,11 @@ pub const Expr = struct {
         operand: *Expr,
     };
 
+    pub const RawPointer = struct {
+        mode: SpanText,
+        place: *Expr,
+    };
+
     pub const Binary = struct {
         operator: SpanText,
         lhs: *Expr,
@@ -63,6 +68,7 @@ pub const Expr = struct {
         tuple: []*Expr,
         array: []*Expr,
         array_repeat: ArrayRepeat,
+        raw_pointer: RawPointer,
         unary: Unary,
         binary: Binary,
         field: Field,
@@ -89,6 +95,10 @@ pub const Expr = struct {
                 .array_repeat => |array_repeat| .{ .array_repeat = .{
                     .value = try array_repeat.value.clone(allocator),
                     .length = try array_repeat.length.clone(allocator),
+                } },
+                .raw_pointer => |raw_pointer| .{ .raw_pointer = .{
+                    .mode = raw_pointer.mode,
+                    .place = try raw_pointer.place.clone(allocator),
                 } },
                 .unary => |unary| .{ .unary = .{
                     .operator = unary.operator,
@@ -130,6 +140,7 @@ pub const Expr = struct {
                 destroyExpr(allocator, array_repeat.value);
                 destroyExpr(allocator, array_repeat.length);
             },
+            .raw_pointer => |raw_pointer| destroyExpr(allocator, raw_pointer.place),
             .unary => |unary| destroyExpr(allocator, unary.operand),
             .binary => |binary| {
                 destroyExpr(allocator, binary.lhs);

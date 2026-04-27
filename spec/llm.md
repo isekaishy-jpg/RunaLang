@@ -19,9 +19,18 @@ Dynamic-library law is defined in `spec/dynamic-libraries.md`.
 Module and visibility law is defined in `spec/modules-and-visibility.md`.
 Package and build law is defined in `spec/packages-and-build.md`.
 Package-management law is defined in `spec/package-management.md`.
+Package-command law is defined in `spec/package-commands.md`.
+Dependency-resolution law is defined in `spec/dependency-resolution.md`.
+Global-store law is defined in `spec/global-store.md`.
+Package-format law is defined in `spec/package-formats.md`.
 Registry-model law is defined in `spec/registry-model.md`.
+Local-registry, vendoring, and exchange law is defined in `spec/local-registries-vendoring-and-exchange.md`.
 Lockfile law is defined in `spec/lockfile.md`.
 Publication law is defined in `spec/publication.md`.
+CLI and driver law is defined in `spec/cli-and-driver.md`.
+Formatting law is defined in `spec/formatting.md`.
+Check and test law is defined in `spec/check-and-test.md`.
+Build law is defined in `spec/build.md`.
 Invocation law is defined in `spec/invocation.md`.
 Function-declaration law is defined in `spec/functions.md`.
 Const law is defined in `spec/consts.md`.
@@ -39,6 +48,8 @@ Layout and repr law is defined in `spec/layout-and-repr.md`.
 Toolchain C translation and discovery law is defined in `spec/c-translation-and-discovery.md`.
 Backend lowering contract law is defined in `spec/backend-lowering-contract.md`.
 Runtime leaf and observability law is defined in `spec/runtime-leaf-and-observability.md`.
+Platform and target-support law is defined in `spec/platform-and-target-support.md`.
+Bootstrap and self-host gate law is defined in `spec/bootstrap-and-self-host-gates.md`.
 Async and concurrency law is defined in `spec/async-and-concurrency.md`.
 Async runtime-surface law is defined in `spec/async-runtime-surface.md`.
 Incremental frontend law is defined in `spec/incremental-frontend.md`.

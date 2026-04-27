@@ -1,14 +1,20 @@
 const std = @import("std");
 const array_list = std.array_list;
+const c_va_list = @import("../abi/c/va_list.zig");
 const ast = @import("../ast/root.zig");
 const callable_types = @import("callable_types.zig");
+const dynamic_library = @import("../runtime/dynamic_library/root.zig");
+const foreign_callable_types = @import("foreign_callable_types.zig");
+const raw_pointer = @import("../raw_pointer/root.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const typed_expr = @import("../typed/expr.zig");
 const signatures = @import("signatures.zig");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
+const standard_families = @import("standard_families.zig");
 const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
+const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const BinaryOp = typed_expr.BinaryOp;
@@ -23,6 +29,10 @@ const BoundaryType = type_support.BoundaryType;
 const boundaryAccessCompatible = type_support.boundaryAccessCompatible;
 const boundaryInnerTypeCompatible = type_support.boundaryInnerTypeCompatible;
 const callArgumentTypeCompatible = type_support.callArgumentTypeCompatible;
+const cVariadicArgumentTypeSupported = type_support.cVariadicArgumentTypeSupported;
+const cVariadicCallArityValid = type_support.cVariadicCallArityValid;
+const cVariadicFixedParameterCount = type_support.cVariadicFixedParameterCount;
+const cVariadicTailIndex = type_support.cVariadicTailIndex;
 const findEnumPrototype = type_support.findEnumPrototype;
 const findEnumVariant = type_support.findEnumVariant;
 const findMethodPrototype = type_support.findMethodPrototype;
@@ -91,6 +101,27 @@ fn validateBorrowArgumentExpr(
                 }
             },
             else => try self.diagnostics.add(.@"error", "type.call.borrow_arg", self.span, "borrow argument {d} to '{s}' must be a plain local or one field projection in stage0", .{
+                arg_index,
+                callee_name,
+            }),
+        },
+        .index => |index| switch (index.base.node) {
+            .identifier => |base_name| {
+                if (self.scope.get(base_name) == null) {
+                    try self.diagnostics.add(.@"error", "type.call.borrow_arg", self.span, "borrow argument {d} to '{s}' must come from a local place in stage0", .{
+                        arg_index,
+                        callee_name,
+                    });
+                    return;
+                }
+                if (require_mutable and !self.scope.isMutable(base_name)) {
+                    try self.diagnostics.add(.@"error", "type.call.borrow_mut", self.span, "edit borrow argument {d} to '{s}' requires a mutable local place in stage0", .{
+                        arg_index,
+                        callee_name,
+                    });
+                }
+            },
+            else => try self.diagnostics.add(.@"error", "type.call.borrow_arg", self.span, "borrow argument {d} to '{s}' must be a plain local, field, or array element place in stage0", .{
                 arg_index,
                 callee_name,
             }),
@@ -300,6 +331,69 @@ fn hasBorrowingParameters(parameter_modes: []const ParameterMode) bool {
     return false;
 }
 
+fn validateDirectCallArguments(
+    self: anytype,
+    callee_name: []const u8,
+    args: []const *Expr,
+    parameter_types: []const types.TypeRef,
+    parameter_type_names: []const []const u8,
+    parameter_modes: []const ParameterMode,
+    generic_params: []const GenericParam,
+    where_predicates: []const WherePredicate,
+) !void {
+    if (!cVariadicCallArityValid(args.len, parameter_types.len, parameter_type_names)) {
+        try self.diagnostics.add(.@"error", "type.call.arity", self.span, "call to '{s}' has wrong arity", .{callee_name});
+        return;
+    }
+
+    const fixed_count = cVariadicFixedParameterCount(parameter_types.len, parameter_type_names);
+    for (args[0..@min(args.len, fixed_count)], 0..) |arg, index| {
+        const expected = parameter_types[index];
+        const expected_type_name = if (index < parameter_type_names.len) parameter_type_names[index] else expected.displayName();
+        if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
+            !callArgumentTypeCompatible(arg.ty, expected, expected_type_name, generic_params, false))
+        {
+            try self.diagnostics.add(.@"error", "type.call.arg", self.span, "call to '{s}' argument {d} has wrong type", .{
+                callee_name,
+                index + 1,
+            });
+        }
+    }
+
+    if (cVariadicTailIndex(parameter_type_names) != null) {
+        for (args[fixed_count..], fixed_count..) |arg, index| {
+            if (!arg.ty.isUnsupported() and !cVariadicArgumentTypeSupported(arg.ty)) {
+                try self.diagnostics.add(.@"error", "abi.c.variadic.arg", self.span, "variadic argument {d} to '{s}' is not C ABI-safe", .{
+                    index + 1,
+                    callee_name,
+                });
+            }
+        }
+    }
+
+    try validateBorrowArguments(self, parameter_modes, args, callee_name);
+    try validateRetainedCallArguments(
+        self,
+        parameter_type_names,
+        generic_params,
+        where_predicates,
+        args,
+        callee_name,
+    );
+}
+
+fn foreignCallablePrototypeCompatible(syntax: foreign_callable_types.Syntax, prototype: anytype) bool {
+    if (syntax.variadic_tail != null) return false;
+    if (syntax.parameters.len != prototype.parameter_type_names.len) return false;
+    for (prototype.parameter_modes) |mode| {
+        if (mode != .owned and mode != .take) return false;
+    }
+    for (syntax.parameters, prototype.parameter_type_names) |expected, actual| {
+        if (!std.mem.eql(u8, std.mem.trim(u8, expected, " \t\r\n"), std.mem.trim(u8, actual, " \t\r\n"))) return false;
+    }
+    return std.mem.eql(u8, std.mem.trim(u8, syntax.return_type, " \t\r\n"), prototype.return_type.displayName());
+}
+
 fn ExprParser(
     comptime ScopeType: type,
     comptime FunctionPrototypeSlice: type,
@@ -464,14 +558,17 @@ fn ExprParser(
                     else => return expr,
                 };
                 _ = self.advance();
+                const previous_expected = self.expected_type;
+                if (expr.ty == .named and raw_pointer.parse(expr.ty.named) != null) self.expected_type = expr.ty;
                 const rhs = try self.parseOrdering();
+                self.expected_type = previous_expected;
                 const comparison_chain = isComparisonExpr(expr);
                 if (comparison_chain) {
                     try self.diagnostics.add(.@"error", "type.expr.compare_chain", self.span, "comparison chaining requires explicit grouping", .{});
                 }
                 const lhs_ty = expr.ty;
                 const rhs_ty = rhs.ty;
-                if (!comparison_chain and !lhs_ty.eql(rhs_ty) and !lhs_ty.isUnsupported() and !rhs_ty.isUnsupported()) {
+                if (!comparison_chain and !typesEqualityComparable(lhs_ty, rhs_ty) and !lhs_ty.isUnsupported() and !rhs_ty.isUnsupported()) {
                     try self.diagnostics.add(.@"error", "type.expr.compare", self.span, "comparison operands must have matching types", .{});
                 }
                 expr = try self.makeBinary(op, expr, rhs, types.TypeRef.fromBuiltin(.bool));
@@ -496,8 +593,10 @@ fn ExprParser(
                 }
                 const lhs_ty = expr.ty;
                 const rhs_ty = rhs.ty;
-                if (!comparison_chain and !lhs_ty.eql(rhs_ty) and !lhs_ty.isUnsupported() and !rhs_ty.isUnsupported()) {
-                    try self.diagnostics.add(.@"error", "type.expr.compare", self.span, "comparison operands must have matching types", .{});
+                if (!comparison_chain and (typeIsRawPointer(lhs_ty) or typeIsRawPointer(rhs_ty))) {
+                    try self.diagnostics.add(.@"error", "type.raw_pointer.ordering", self.span, "raw pointers support equality but not ordering", .{});
+                } else if (!comparison_chain and !typesOrderingComparable(lhs_ty, rhs_ty) and !lhs_ty.isUnsupported() and !rhs_ty.isUnsupported()) {
+                    try self.diagnostics.add(.@"error", "type.expr.compare", self.span, "comparison operands must be in a builtin ordered domain", .{});
                 }
                 expr = try self.makeBinary(op, expr, rhs, types.TypeRef.fromBuiltin(.bool));
             }
@@ -621,8 +720,42 @@ fn ExprParser(
                         .operand = operand,
                     } });
                 },
+                .amp => self.parseRawPointerFormation(),
                 else => self.parsePostfix(),
             };
+        }
+
+        fn parseRawPointerFormation(self: *@This()) anyerror!*Expr {
+            _ = self.advance();
+            const raw_token = self.advance();
+            const mode_token = self.advance();
+            if (raw_token.kind != .identifier or !std.mem.eql(u8, raw_token.lexeme, "raw") or
+                mode_token.kind != .identifier or
+                (!std.mem.eql(u8, mode_token.lexeme, "read") and !std.mem.eql(u8, mode_token.lexeme, "edit")))
+            {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.formation.syntax", self.span, "raw pointer formation requires '&raw read place' or '&raw edit place'", .{});
+                return makeUnsupportedExpr(self.allocator);
+            }
+            if (!self.unsafe_context) {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.formation.unsafe", self.span, "raw pointer formation requires #unsafe", .{});
+            }
+
+            const place = try self.parsePostfix();
+            if (!isAddressablePlace(place)) {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.formation.place", self.span, "raw pointer formation requires an addressable local or field place", .{});
+            }
+            const pointee_name = type_support.typeRefRawName(place.ty);
+            const access = if (std.mem.eql(u8, mode_token.lexeme, "read")) raw_pointer.Access.read else .edit;
+            const type_name = try raw_pointer.makeTypeName(self.allocator, access, pointee_name);
+            const callee = if (access == .read) raw_pointer.address_read_callee else raw_pointer.address_edit_callee;
+            const args = try self.allocator.alloc(*Expr, 1);
+            args[0] = place;
+            const expr = try self.makeExpr(.{ .named = type_name }, .{ .call = .{
+                .callee = callee,
+                .args = args,
+            } });
+            expr.owned_type_name = @constCast(type_name);
+            return expr;
         }
 
         fn parsePrimary(self: *@This()) anyerror!*Expr {
@@ -630,16 +763,29 @@ fn ExprParser(
             switch (token.kind) {
                 .integer => {
                     const value = std.fmt.parseInt(i64, token.lexeme, 10) catch 0;
-                    const integer_type = if (self.expected_type.isNumeric()) self.expected_type else types.TypeRef.fromBuiltin(.i32);
+                    const integer_type = contextualIntegerLiteralType(self.expected_type);
                     return self.makeExpr(integer_type, .{ .integer = value });
                 },
                 .string => return self.makeExpr(types.TypeRef.fromBuiltin(.str), .{ .string = token.lexeme }),
                 .identifier => {
                     if (std.mem.eql(u8, token.lexeme, "true")) return self.makeExpr(types.TypeRef.fromBuiltin(.bool), .{ .bool_lit = true });
                     if (std.mem.eql(u8, token.lexeme, "false")) return self.makeExpr(types.TypeRef.fromBuiltin(.bool), .{ .bool_lit = false });
+                    if (std.mem.eql(u8, token.lexeme, "null")) {
+                        if (self.expected_type == .named and raw_pointer.parse(self.expected_type.named) != null) {
+                            return self.makeExpr(self.expected_type, .{ .identifier = "NULL" });
+                        }
+                        try self.diagnostics.add(.@"error", "type.raw_pointer.null", self.span, "null is valid only where a raw pointer type is expected", .{});
+                        return makeUnsupportedExpr(self.allocator);
+                    }
+                    if (std.mem.eql(u8, token.lexeme, "await")) {
+                        try self.diagnostics.add(.@"error", "type.await.standalone", self.span, "standalone await expressions are not part of v1; use the Task.await method surface", .{});
+                        return makeUnsupportedExpr(self.allocator);
+                    }
 
                     const value_type = self.scope.get(token.lexeme) orelse .unsupported;
                     if (value_type.isUnsupported() and
+                        !dynamic_library.isPublicCallee(token.lexeme) and
+                        standard_families.familyFromName(token.lexeme) == null and
                         findPrototype(self.prototypes, token.lexeme) == null and
                         findStructPrototype(self.struct_prototypes, token.lexeme) == null and
                         findEnumPrototype(self.enum_prototypes, token.lexeme) == null)
@@ -696,6 +842,11 @@ fn ExprParser(
                 .named => |type_name| try parseCallableTypeName(type_name, self.allocator),
                 else => null,
             };
+            var foreign_callable = switch (callee_expr.ty) {
+                .named => |type_name| try foreign_callable_types.parseSyntax(self.allocator, type_name),
+                else => null,
+            };
+            defer if (foreign_callable) |*syntax| syntax.deinit(self.allocator);
 
             var args = array_list.Managed(*Expr).init(self.allocator);
             defer args.deinit();
@@ -729,7 +880,11 @@ fn ExprParser(
             const is_call = qualifier.kind == .identifier and std.mem.eql(u8, qualifier.lexeme, "call");
             const is_method = qualifier.kind == .identifier and std.mem.eql(u8, qualifier.lexeme, "method");
             if (!is_call and !is_method) {
-                try self.diagnostics.add(.@"error", "type.call.qualifier", self.span, "stage0 supports only ':: call' and ':: method' invocation qualifiers", .{});
+                if (qualifier.kind == .identifier and std.mem.eql(u8, qualifier.lexeme, "await")) {
+                    try self.diagnostics.add(.@"error", "type.await.qualifier", self.span, "await is not an invocation qualifier; use the Task.await method surface", .{});
+                } else {
+                    try self.diagnostics.add(.@"error", "type.call.qualifier", self.span, "stage0 supports only ':: call' and ':: method' invocation qualifiers", .{});
+                }
             }
 
             if (method_target) |target| {
@@ -742,6 +897,10 @@ fn ExprParser(
                         .args = try args.toOwnedSlice(),
                     } });
                 }
+
+                if (try self.parseStandardFamilyMethodInvocation(callee_expr, target, args.items)) |expr| return expr;
+                if (try self.parseCVaListMethodInvocation(callee_expr, target, args.items)) |expr| return expr;
+                if (try self.parseRawPointerMethodInvocation(callee_expr, target, args.items)) |expr| return expr;
 
                 const prototype_method = findMethodPrototype(self.method_prototypes, target.target_type, target.method_name) orelse {
                     callee_expr.deinit(self.allocator);
@@ -809,6 +968,8 @@ fn ExprParser(
             self.allocator.destroy(callee_expr);
 
             if (enum_constructor_target) |target| {
+                if (try self.parseStandardEnumConstructorInvocation(target, args.items)) |expr| return expr;
+
                 const prototype_enum = findEnumPrototype(self.enum_prototypes, target.enum_name) orelse {
                     try self.diagnostics.add(.@"error", "type.enum.variant_unknown", self.span, "unknown enum '{s}' in constructor target", .{target.enum_name});
                     return self.makeExpr(.unsupported, .{ .identifier = target.variant_name });
@@ -922,6 +1083,8 @@ fn ExprParser(
                     .type_symbol = value.symbol_name,
                     .args = try args.toOwnedSlice(),
                 } });
+            } else if (try self.parseDynamicLibraryInvocation(callee_name, args.items, is_call)) |expr| {
+                return expr;
             } else if (prototype) |value| {
                 const return_type = value.return_type;
                 if (value.unsafe_required and !self.unsafe_context) {
@@ -933,31 +1096,44 @@ fn ExprParser(
                 if (value.is_suspend and hasBorrowingParameters(value.parameter_modes)) {
                     try self.diagnostics.add(.@"error", "type.call.suspend_borrow", self.span, "stage0 does not yet permit suspend calls that borrow arguments", .{});
                 }
-                if (value.parameter_types.len != args.items.len) {
-                    try self.diagnostics.add(.@"error", "type.call.arity", self.span, "call to '{s}' has wrong arity", .{callee_name});
+                try validateDirectCallArguments(
+                    self,
+                    callee_name,
+                    args.items,
+                    value.parameter_types,
+                    value.parameter_type_names,
+                    value.parameter_modes,
+                    value.generic_params,
+                    value.where_predicates,
+                );
+                return self.makeExpr(return_type, .{ .call = .{
+                    .callee = callee_name,
+                    .args = try args.toOwnedSlice(),
+                } });
+            } else if (foreign_callable) |syntax| {
+                if (!is_call) {
+                    try self.diagnostics.add(.@"error", "type.call.qualifier", self.span, "foreign function pointer values must use ':: call'", .{});
+                }
+                if (!self.unsafe_context) {
+                    try self.diagnostics.add(.@"error", "abi.c.fnptr.unsafe", self.span, "calling a foreign function pointer requires #unsafe", .{});
+                }
+                if (syntax.variadic_tail != null) {
+                    try self.diagnostics.add(.@"error", "abi.c.fnptr.variadic", self.span, "variadic foreign function pointer calls are not implemented in stage0", .{});
+                }
+                if (syntax.parameters.len != args.items.len) {
+                    try self.diagnostics.add(.@"error", "abi.c.fnptr.arity", self.span, "foreign function pointer call has wrong arity", .{});
                 } else {
-                    for (args.items, value.parameter_types, 0..) |arg, expected, index| {
-                        const expected_type_name = if (index < value.parameter_type_names.len) value.parameter_type_names[index] else expected.displayName();
+                    for (args.items, syntax.parameters, 0..) |arg, expected_type_name, index| {
+                        const expected = shallowTypeRefFromName(expected_type_name);
                         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
-                            !callArgumentTypeCompatible(arg.ty, expected, expected_type_name, value.generic_params, false))
+                            !callArgumentTypeCompatible(arg.ty, expected, expected_type_name, &.{}, false))
                         {
-                            try self.diagnostics.add(.@"error", "type.call.arg", self.span, "call to '{s}' argument {d} has wrong type", .{
-                                callee_name,
-                                index + 1,
-                            });
+                            try self.diagnostics.add(.@"error", "abi.c.fnptr.arg", self.span, "foreign function pointer argument {d} has wrong type", .{index + 1});
                         }
                     }
-                    try validateBorrowArguments(self, value.parameter_modes, args.items, callee_name);
-                    try validateRetainedCallArguments(
-                        self,
-                        value.parameter_type_names,
-                        value.generic_params,
-                        value.where_predicates,
-                        args.items,
-                        callee_name,
-                    );
                 }
-                return self.makeExpr(return_type, .{ .call = .{
+
+                return self.makeExpr(shallowTypeRefFromName(syntax.return_type), .{ .call = .{
                     .callee = callee_name,
                     .args = try args.toOwnedSlice(),
                 } });
@@ -981,14 +1157,363 @@ fn ExprParser(
             }
         }
 
+        fn parseDynamicLibraryInvocation(
+            self: *@This(),
+            callee_name: []const u8,
+            args: []const *Expr,
+            is_call: bool,
+        ) anyerror!?*Expr {
+            if (!dynamic_library.isPublicCallee(callee_name)) return null;
+            if (!is_call) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.qualifier", self.span, "dynamic-library operations must use ':: call'", .{});
+            }
+
+            if (std.mem.eql(u8, callee_name, dynamic_library.open_name)) {
+                try self.validateDynamicOpenArgs(args);
+                return self.makeExpr(.{ .named = dynamic_library.open_result_type_name }, .{ .call = .{
+                    .callee = dynamic_library.open_callee,
+                    .args = try self.cloneArgSlice(args),
+                } });
+            }
+            if (std.mem.eql(u8, callee_name, dynamic_library.lookup_name)) {
+                if (!self.unsafe_context) {
+                    try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.unsafe", self.span, "dynamic-library symbol lookup requires #unsafe", .{});
+                }
+                try self.validateDynamicLookupArgs(args);
+                const result_type_name = try self.dynamicLookupResultTypeName();
+                const expr = try self.makeExpr(.{ .named = result_type_name }, .{ .call = .{
+                    .callee = dynamic_library.lookup_callee,
+                    .args = try self.cloneArgSlice(args),
+                } });
+                expr.owned_type_name = @constCast(result_type_name);
+                return expr;
+            }
+            if (std.mem.eql(u8, callee_name, dynamic_library.close_name)) {
+                if (!self.unsafe_context) {
+                    try self.diagnostics.add(.@"error", "runtime.dynamic.close.unsafe", self.span, "dynamic-library close requires #unsafe", .{});
+                }
+                try self.validateDynamicCloseArgs(args);
+                return self.makeExpr(.{ .named = dynamic_library.close_result_type_name }, .{ .call = .{
+                    .callee = dynamic_library.close_callee,
+                    .args = try self.cloneArgSlice(args),
+                } });
+            }
+            return null;
+        }
+
+        fn cloneArgSlice(self: *@This(), args: []const *Expr) ![]*Expr {
+            const owned = try self.allocator.alloc(*Expr, args.len);
+            for (args, 0..) |arg, index| owned[index] = arg;
+            return owned;
+        }
+
+        fn validateDynamicOpenArgs(self: *@This(), args: []const *Expr) !void {
+            if (args.len != 1) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.open.arity", self.span, "open_library expects exactly one path argument", .{});
+                return;
+            }
+            if (!args[0].ty.isUnsupported() and !args[0].ty.eql(types.TypeRef.fromBuiltin(.str))) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.open.path", self.span, "open_library path must be Str", .{});
+            }
+        }
+
+        fn validateDynamicLookupArgs(self: *@This(), args: []const *Expr) !void {
+            if (args.len != 2) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.arity", self.span, "lookup_symbol expects a DynamicLibrary and symbol name", .{});
+                return;
+            }
+            if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.library", self.span, "lookup_symbol first argument must be DynamicLibrary", .{});
+            }
+            if (!args[1].ty.isUnsupported() and !args[1].ty.eql(types.TypeRef.fromBuiltin(.str))) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.name", self.span, "lookup_symbol name must be Str", .{});
+            }
+        }
+
+        fn validateDynamicCloseArgs(self: *@This(), args: []const *Expr) !void {
+            if (args.len != 1) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.close.arity", self.span, "close_library expects exactly one DynamicLibrary argument", .{});
+                return;
+            }
+            if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+                try self.diagnostics.add(.@"error", "runtime.dynamic.close.library", self.span, "close_library argument must be DynamicLibrary", .{});
+            }
+        }
+
+        fn dynamicLookupResultTypeName(self: *@This()) ![]const u8 {
+            switch (self.expected_type) {
+                .named => |name| {
+                    if (try dynamicLookupResultOkType(self.allocator, name)) |ok_type| {
+                        return try std.fmt.allocPrint(self.allocator, "Result[{s}, {s}]", .{ ok_type, dynamic_library.lookup_error_type_name });
+                    }
+                },
+                else => {},
+            }
+            try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.type", self.span, "lookup_symbol requires contextual type Result[T, SymbolLookupError] where T is a foreign function pointer or raw pointer", .{});
+            return try self.allocator.dupe(u8, "Result[Unsupported, SymbolLookupError]");
+        }
+
+        fn parseStandardFamilyMethodInvocation(
+            self: *@This(),
+            callee_expr: *Expr,
+            target: Expr.MethodTarget,
+            explicit_args: []const *Expr,
+        ) anyerror!?*Expr {
+            const variant_name = standard_families.helperVariant(target.target_type, target.method_name) orelse return null;
+            if (explicit_args.len != 0) {
+                try self.diagnostics.add(.@"error", "type.standard.helper_arity", self.span, "standard helper '{s}.{s}' does not take explicit arguments", .{
+                    baseTypeName(target.target_type),
+                    target.method_name,
+                });
+            }
+
+            const tag_expr = try self.makeExpr(types.TypeRef.fromBuiltin(.i32), .{ .field = .{
+                .base = target.base,
+                .field_name = "tag",
+            } });
+            const variant_expr = try self.makeExpr(types.TypeRef.fromBuiltin(.i32), .{ .enum_tag = .{
+                .enum_name = target.target_type,
+                .enum_symbol = baseTypeName(target.target_type),
+                .variant_name = variant_name,
+            } });
+
+            self.allocator.destroy(callee_expr);
+            return self.makeExpr(types.TypeRef.fromBuiltin(.bool), .{ .binary = .{
+                .op = .eq,
+                .lhs = tag_expr,
+                .rhs = variant_expr,
+            } });
+        }
+
+        fn parseStandardEnumConstructorInvocation(
+            self: *@This(),
+            target: Expr.EnumVariantValue,
+            args: []const *Expr,
+        ) anyerror!?*Expr {
+            const maybe_variant = try standard_families.variantForConcrete(self.allocator, target.enum_name, target.enum_symbol, target.variant_name);
+            const variant = maybe_variant orelse return null;
+            const payload_type_name = variant.payload_type_name orelse {
+                if (args.len != 0) {
+                    try self.diagnostics.add(.@"error", "type.enum.ctor.arity", self.span, "unit variant '{s}.{s}' does not take constructor args", .{
+                        variant.family_name,
+                        variant.variant_name,
+                    });
+                    return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_construct = .{
+                        .enum_name = variant.concrete_type_name,
+                        .enum_symbol = variant.family_name,
+                        .variant_name = variant.variant_name,
+                        .args = try self.allocator.dupe(*Expr, args),
+                    } });
+                }
+                return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_variant = .{
+                    .enum_name = variant.concrete_type_name,
+                    .enum_symbol = variant.family_name,
+                    .variant_name = variant.variant_name,
+                } });
+            };
+            const expected = standard_families.typeRefFromName(payload_type_name);
+            if (args.len != 1) {
+                try self.diagnostics.add(.@"error", "type.enum.ctor.arity", self.span, "constructor call to '{s}.{s}' has wrong arity", .{
+                    variant.family_name,
+                    variant.variant_name,
+                });
+            } else if (!args[0].ty.isUnsupported() and !expected.isUnsupported() and
+                !callArgumentTypeCompatible(args[0].ty, expected, payload_type_name, &.{}, false))
+            {
+                try self.diagnostics.add(.@"error", "type.enum.ctor.arg", self.span, "constructor call to '{s}.{s}' argument 1 has wrong type", .{
+                    variant.family_name,
+                    variant.variant_name,
+                });
+            }
+            return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_construct = .{
+                .enum_name = variant.concrete_type_name,
+                .enum_symbol = variant.family_name,
+                .variant_name = variant.variant_name,
+                .args = try self.allocator.dupe(*Expr, args),
+            } });
+        }
+
+        fn parseCVaListMethodInvocation(
+            self: *@This(),
+            callee_expr: *Expr,
+            target: Expr.MethodTarget,
+            explicit_args: []const *Expr,
+        ) anyerror!?*Expr {
+            if (!c_va_list.isTypeName(target.target_type)) return null;
+
+            if (!self.unsafe_context) {
+                try self.diagnostics.add(.@"error", "abi.c.valist.unsafe", self.span, "CVaList operations require #unsafe", .{});
+            }
+            if (explicit_args.len != 0) {
+                try self.diagnostics.add(.@"error", "abi.c.valist.arity", self.span, "CVaList operation '{s}' does not take explicit arguments", .{target.method_name});
+            }
+
+            const Operation = struct {
+                result_type: types.TypeRef,
+                callee: []const u8,
+            };
+            const operation: Operation = if (std.mem.eql(u8, target.method_name, "copy")) .{
+                .result_type = .{ .named = c_va_list.type_name },
+                .callee = c_va_list.copy_callee,
+            } else if (std.mem.eql(u8, target.method_name, "finish")) .{
+                .result_type = types.TypeRef.fromBuiltin(.unit),
+                .callee = c_va_list.finish_callee,
+            } else if (std.mem.eql(u8, target.method_name, "next")) blk: {
+                const type_arg = target.type_arg_name orelse {
+                    try self.diagnostics.add(.@"error", "abi.c.valist.next_type", self.span, "CVaList.next requires a type argument", .{});
+                    break :blk .{
+                        .result_type = types.TypeRef.unsupported,
+                        .callee = c_va_list.next_callee,
+                    };
+                };
+                if (!c_va_list.variadicValueTypeNameSupported(type_arg)) {
+                    try self.diagnostics.add(.@"error", "abi.c.valist.next_type", self.span, "CVaList.next type '{s}' is not C ABI-safe after promotion", .{type_arg});
+                }
+                break :blk .{
+                    .result_type = shallowTypeRefFromName(type_arg),
+                    .callee = c_va_list.next_callee,
+                };
+            } else return null;
+
+            if (!std.mem.eql(u8, target.method_name, "next") and target.type_arg_name != null) {
+                try self.diagnostics.add(.@"error", "abi.c.valist.type_arg", self.span, "only CVaList.next accepts a type argument", .{});
+            }
+
+            const combined_args = try self.allocator.alloc(*Expr, 1 + explicit_args.len);
+            combined_args[0] = target.base;
+            for (explicit_args, 0..) |arg, index| combined_args[index + 1] = arg;
+
+            self.allocator.destroy(callee_expr);
+            return self.makeExpr(operation.result_type, .{ .call = .{
+                .callee = operation.callee,
+                .args = combined_args,
+            } });
+        }
+
+        fn parseRawPointerMethodInvocation(
+            self: *@This(),
+            callee_expr: *Expr,
+            target: Expr.MethodTarget,
+            explicit_args: []const *Expr,
+        ) anyerror!?*Expr {
+            const pointer = raw_pointer.parse(target.target_type) orelse return null;
+            const method_name = target.method_name;
+            const unsafe_required = !std.mem.eql(u8, method_name, "is_null");
+            if (unsafe_required and !self.unsafe_context) {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.operation.unsafe", self.span, "raw-pointer operation '{s}' requires #unsafe", .{method_name});
+            }
+
+            const Operation = struct {
+                result_type: types.TypeRef,
+                callee: []const u8,
+                expected_args: usize,
+            };
+            const operation: Operation = if (std.mem.eql(u8, method_name, "is_null")) .{
+                .result_type = types.TypeRef.fromBuiltin(.bool),
+                .callee = raw_pointer.is_null_callee,
+                .expected_args = 0,
+            } else if (std.mem.eql(u8, method_name, "cast")) blk: {
+                const target_type = target.type_arg_name orelse {
+                    try self.diagnostics.add(.@"error", "type.raw_pointer.cast.type", self.span, "raw-pointer cast requires a target type", .{});
+                    break :blk .{
+                        .result_type = types.TypeRef.unsupported,
+                        .callee = raw_pointer.cast_callee,
+                        .expected_args = 0,
+                    };
+                };
+                const type_name = try raw_pointer.makeTypeName(self.allocator, pointer.access, target_type);
+                break :blk .{
+                    .result_type = .{ .named = type_name },
+                    .callee = raw_pointer.cast_callee,
+                    .expected_args = 0,
+                };
+            } else if (std.mem.eql(u8, method_name, "offset")) .{
+                .result_type = .{ .named = target.target_type },
+                .callee = raw_pointer.offset_callee,
+                .expected_args = 1,
+            } else if (std.mem.eql(u8, method_name, "load")) blk: {
+                if (!raw_pointer.isMemorySafePointeeName(pointer.pointee)) {
+                    try self.diagnostics.add(.@"error", "type.raw_pointer.load.pointee", self.span, "raw-pointer load requires a raw-memory-safe pointee type", .{});
+                }
+                break :blk .{
+                    .result_type = shallowTypeRefFromName(pointer.pointee),
+                    .callee = raw_pointer.load_callee,
+                    .expected_args = 0,
+                };
+            } else if (std.mem.eql(u8, method_name, "store")) blk: {
+                if (pointer.access != .edit) {
+                    try self.diagnostics.add(.@"error", "type.raw_pointer.store.access", self.span, "raw-pointer store requires *edit T", .{});
+                }
+                if (!raw_pointer.isMemorySafePointeeName(pointer.pointee)) {
+                    try self.diagnostics.add(.@"error", "type.raw_pointer.store.pointee", self.span, "raw-pointer store requires a raw-memory-safe pointee type", .{});
+                }
+                break :blk .{
+                    .result_type = types.TypeRef.fromBuiltin(.unit),
+                    .callee = raw_pointer.store_callee,
+                    .expected_args = 1,
+                };
+            } else return null;
+
+            if (!std.mem.eql(u8, method_name, "cast") and target.type_arg_name != null) {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.type_arg", self.span, "only raw-pointer cast accepts a type argument", .{});
+            }
+            if (explicit_args.len != operation.expected_args) {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.arity", self.span, "raw-pointer operation '{s}' has wrong arity", .{method_name});
+            }
+            if (std.mem.eql(u8, method_name, "offset") and explicit_args.len == 1 and
+                !explicit_args[0].ty.isUnsupported() and !explicit_args[0].ty.eql(types.TypeRef.fromBuiltin(.isize)))
+            {
+                if (explicit_args[0].node == .integer and explicit_args[0].ty.eql(types.TypeRef.fromBuiltin(.i32))) {
+                    explicit_args[0].ty = types.TypeRef.fromBuiltin(.isize);
+                } else {
+                    try self.diagnostics.add(.@"error", "type.raw_pointer.offset.count", self.span, "raw-pointer offset count must be ISize", .{});
+                }
+            }
+            if (std.mem.eql(u8, method_name, "store") and explicit_args.len == 1 and
+                !explicit_args[0].ty.isUnsupported() and !callArgumentTypeCompatible(explicit_args[0].ty, shallowTypeRefFromName(pointer.pointee), pointer.pointee, &.{}, false))
+            {
+                try self.diagnostics.add(.@"error", "type.raw_pointer.store.value", self.span, "raw-pointer store value has the wrong type", .{});
+            }
+
+            const combined_args = try self.allocator.alloc(*Expr, 1 + explicit_args.len);
+            combined_args[0] = target.base;
+            for (explicit_args, 0..) |arg, index| combined_args[index + 1] = arg;
+
+            self.allocator.destroy(callee_expr);
+            const expr = try self.makeExpr(operation.result_type, .{ .call = .{
+                .callee = operation.callee,
+                .args = combined_args,
+            } });
+            if (std.mem.eql(u8, method_name, "cast") and operation.result_type == .named) {
+                expr.owned_type_name = @constCast(operation.result_type.named);
+            }
+            return expr;
+        }
+
         fn parseFieldProjection(self: *@This(), base_expr: *Expr) anyerror!*Expr {
             _ = self.advance();
             const field_token = self.advance();
             if (field_token.kind == .integer) {
-                base_expr.deinit(self.allocator);
-                self.allocator.destroy(base_expr);
-                try self.diagnostics.add(.@"error", "type.expr.tuple_projection.stage0", self.span, "stage0 does not yet implement tuple projection", .{});
-                return makeUnsupportedExpr(self.allocator);
+                const index = tuple_types.projectionIndex(field_token.lexeme) orelse {
+                    base_expr.deinit(self.allocator);
+                    self.allocator.destroy(base_expr);
+                    try self.diagnostics.add(.@"error", "type.tuple.projection", self.span, "tuple projection must use a non-negative field index", .{});
+                    return makeUnsupportedExpr(self.allocator);
+                };
+                const tuple_name = switch (base_expr.ty) {
+                    .named => |name| name,
+                    else => "",
+                };
+                const element_type = try tuple_types.projectionElementType(self.allocator, tuple_name, index) orelse {
+                    base_expr.deinit(self.allocator);
+                    self.allocator.destroy(base_expr);
+                    try self.diagnostics.add(.@"error", "type.tuple.projection", self.span, "invalid tuple projection '.{s}'", .{field_token.lexeme});
+                    return makeUnsupportedExpr(self.allocator);
+                };
+                return self.makeExpr(element_type, .{ .field = .{
+                    .base = base_expr,
+                    .field_name = field_token.lexeme,
+                } });
             }
             if (field_token.kind != .identifier) {
                 base_expr.deinit(self.allocator);
@@ -1043,6 +1568,40 @@ fn ExprParser(
                             },
                         }
                     }
+                    if (standard_families.familyFromName(base_name) != null) {
+                        const maybe_variant = try standard_families.variantForExpected(self.allocator, self.expected_type, base_name, field_token.lexeme);
+                        const variant = maybe_variant orelse {
+                            base_expr.deinit(self.allocator);
+                            self.allocator.destroy(base_expr);
+                            try self.diagnostics.add(.@"error", "type.standard.variant_context", self.span, "standard variant '{s}.{s}' requires a matching contextual type", .{
+                                base_name,
+                                field_token.lexeme,
+                            });
+                            return makeUnsupportedExpr(self.allocator);
+                        };
+                        if (variant.payload_type_name == null) {
+                            base_expr.deinit(self.allocator);
+                            self.allocator.destroy(base_expr);
+                            return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_variant = .{
+                                .enum_name = variant.concrete_type_name,
+                                .enum_symbol = variant.family_name,
+                                .variant_name = variant.variant_name,
+                            } });
+                        }
+                        if (self.peek().kind != .colon_colon) {
+                            base_expr.deinit(self.allocator);
+                            self.allocator.destroy(base_expr);
+                            try self.diagnostics.add(.@"error", "type.enum.variant_payload.invoke", self.span, "payload enum variants require immediate constructor invocation with ':: call'", .{});
+                            return makeUnsupportedExpr(self.allocator);
+                        }
+                        base_expr.deinit(self.allocator);
+                        self.allocator.destroy(base_expr);
+                        return self.makeExpr(.unsupported, .{ .enum_constructor_target = .{
+                            .enum_name = variant.concrete_type_name,
+                            .enum_symbol = variant.family_name,
+                            .variant_name = variant.variant_name,
+                        } });
+                    }
                     if (findStructPrototype(self.struct_prototypes, base_name) != null) {
                         return self.makeExpr(self.expected_type, .{ .field = .{
                             .base = base_expr,
@@ -1061,6 +1620,7 @@ fn ExprParser(
                 },
             };
             const struct_name = baseTypeName(target_type_name);
+            const method_type_arg = try self.parseOptionalMethodTypeArgument(target_type_name, field_token.lexeme);
 
             if (findStructPrototype(self.struct_prototypes, struct_name)) |prototype| {
                 for (prototype.fields) |field| {
@@ -1076,6 +1636,7 @@ fn ExprParser(
                         .base = base_expr,
                         .target_type = target_type_name,
                         .method_name = field_token.lexeme,
+                        .type_arg_name = method_type_arg,
                     } });
                 }
                 try self.diagnostics.add(.@"error", "type.field.unknown", self.span, "unknown field '{s}' on struct '{s}'", .{
@@ -1093,6 +1654,7 @@ fn ExprParser(
                     .base = base_expr,
                     .target_type = target_type_name,
                     .method_name = field_token.lexeme,
+                    .type_arg_name = method_type_arg,
                 } });
             }
 
@@ -1101,6 +1663,25 @@ fn ExprParser(
                 .base = base_expr,
                 .field_name = field_token.lexeme,
             } });
+        }
+
+        fn parseOptionalMethodTypeArgument(self: *@This(), target_type_name: []const u8, method_name: []const u8) !?[]const u8 {
+            const is_valist_next = c_va_list.isTypeName(target_type_name) and std.mem.eql(u8, method_name, "next");
+            const is_pointer_cast = raw_pointer.parse(target_type_name) != null and std.mem.eql(u8, method_name, "cast");
+            if (!is_valist_next and !is_pointer_cast) return null;
+            if (self.peek().kind != .l_bracket) return null;
+            _ = self.advance();
+            const type_token = self.advance();
+            if (type_token.kind != .identifier) {
+                try self.diagnostics.add(.@"error", if (is_valist_next) "abi.c.valist.next_type" else "type.raw_pointer.cast.type", self.span, "method type argument must be a simple type name", .{});
+                return null;
+            }
+            if (self.peek().kind != .r_bracket) {
+                try self.diagnostics.add(.@"error", if (is_valist_next) "abi.c.valist.next_type" else "type.raw_pointer.cast.type", self.span, "stage0 method type argument must be a single type name", .{});
+                while (self.peek().kind != .r_bracket and self.peek().kind != .eof) _ = self.advance();
+            }
+            if (self.peek().kind == .r_bracket) _ = self.advance();
+            return type_token.lexeme;
         }
 
         fn parseKeyedAccess(self: *@This(), base_expr: *Expr) anyerror!*Expr {
@@ -1123,6 +1704,16 @@ fn ExprParser(
                 }
                 break :blk types.TypeRef.unsupported;
             };
+            if (fixedArrayLength(base_expr.ty)) |length| {
+                switch (index_expr.node) {
+                    .integer => |index_value| {
+                        if (index_value >= 0 and @as(usize, @intCast(index_value)) >= length) {
+                            try self.diagnostics.add(.@"error", "type.expr.keyed_access.bounds", self.span, "array index is out of bounds", .{});
+                        }
+                    },
+                    else => {},
+                }
+            }
             return self.makeExpr(element_type, .{ .index = .{
                 .base = base_expr,
                 .index = index_expr,
@@ -1130,18 +1721,82 @@ fn ExprParser(
         }
 
         fn parseTupleExpression(self: *@This()) anyerror!*Expr {
-            try self.skipDelimitedTokens(.l_paren, .r_paren, "parse.expr.tuple", "unterminated tuple expression");
-            try self.diagnostics.add(.@"error", "type.expr.tuple.stage0", self.span, "stage0 does not yet implement tuple expressions", .{});
-            return makeUnsupportedExpr(self.allocator);
+            const expected_parts = switch (self.expected_type) {
+                .named => |name| try tuple_types.splitTypeParts(self.allocator, name),
+                else => null,
+            };
+            defer if (expected_parts) |parts| self.allocator.free(parts);
+
+            var items = array_list.Managed(*Expr).init(self.allocator);
+            defer items.deinit();
+            var element_types = array_list.Managed(types.TypeRef).init(self.allocator);
+            defer element_types.deinit();
+
+            while (true) {
+                const expected_element = if (expected_parts) |parts|
+                    if (items.items.len < parts.len) tuple_types.shallowTypeRefFromName(parts[items.items.len]) else types.TypeRef.unsupported
+                else
+                    types.TypeRef.unsupported;
+                const previous_expected = self.expected_type;
+                self.expected_type = expected_element;
+                const item = try self.parseConversion();
+                self.expected_type = previous_expected;
+                try items.append(item);
+                try element_types.append(item.ty);
+
+                if (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    if (self.peek().kind == .r_paren) break;
+                    continue;
+                }
+                break;
+            }
+
+            if (self.peek().kind == .r_paren) {
+                _ = self.advance();
+            } else {
+                try self.diagnostics.add(.@"error", "parse.expr.tuple", self.span, "unterminated tuple expression", .{});
+            }
+
+            if (items.items.len < 2) {
+                try self.diagnostics.add(.@"error", "type.tuple.arity", self.span, "tuple expressions must have at least two elements", .{});
+            }
+            if (expected_parts) |parts| {
+                if (tuple_types.validTupleParts(parts) and parts.len != items.items.len) {
+                    try self.diagnostics.add(.@"error", "type.tuple.arity", self.span, "tuple expression arity does not match the expected tuple type", .{});
+                }
+                for (items.items, 0..) |item, index| {
+                    if (index >= parts.len) break;
+                    const expected = tuple_types.shallowTypeRefFromName(parts[index]);
+                    if (!item.ty.isUnsupported() and !expected.isUnsupported() and
+                        !callArgumentTypeCompatible(item.ty, expected, parts[index], &.{}, false))
+                    {
+                        try self.diagnostics.add(.@"error", "type.expr.tuple.item", self.span, "tuple element {d} has the wrong type", .{index});
+                    }
+                }
+            }
+
+            const type_name = try tuple_types.makeTypeNameFromRefs(self.allocator, element_types.items);
+            const expr = try self.makeExpr(.{ .named = type_name }, .{ .tuple = .{ .items = try items.toOwnedSlice() } });
+            expr.owned_type_name = @constCast(type_name);
+            return expr;
         }
 
         fn parseArrayLiteral(self: *@This()) anyerror!*Expr {
             const array_type = self.expected_type;
-            const element_type = fixedArrayElementType(array_type) orelse types.TypeRef.unsupported;
+            const array_shape = fixedArrayShape(array_type);
+            const element_type = if (array_shape) |shape| shape.element_type else types.TypeRef.unsupported;
             if (self.peek().kind == .r_bracket) {
                 _ = self.advance();
                 if (element_type.isUnsupported()) {
                     try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array literal requires a fixed array contextual type", .{});
+                }
+                if (array_shape) |shape| {
+                    if (shape.length) |length| {
+                        if (length != 0) {
+                            try self.diagnostics.add(.@"error", "type.expr.array.length", self.span, "empty array literal length does not match the expected array type", .{});
+                        }
+                    }
                 }
                 const items = try self.allocator.alloc(*Expr, 0);
                 return self.makeExpr(if (element_type.isUnsupported()) .unsupported else array_type, .{ .array = .{ .items = items } });
@@ -1162,7 +1817,33 @@ fn ExprParser(
                     try self.diagnostics.add(.@"error", "parse.expr.array", self.span, "unterminated array literal", .{});
                 }
                 const result_type = if (element_type.isUnsupported()) types.TypeRef.unsupported else array_type;
-                if (result_type.isUnsupported()) {
+                if (array_shape) |shape| {
+                    if (shape.length) |expected_length| {
+                        switch (length.node) {
+                            .integer => |actual_length| {
+                                if (actual_length >= 0 and @as(usize, @intCast(actual_length)) != expected_length) {
+                                    try self.diagnostics.add(.@"error", "type.expr.array.length", self.span, "array repetition length does not match the expected array type", .{});
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                if (result_type.isUnsupported() and !first.ty.isUnsupported()) {
+                    switch (length.node) {
+                        .integer => |literal_length| {
+                            if (literal_length >= 0) {
+                                const inferred_name = try makeFixedArrayTypeName(self.allocator, first.ty, @intCast(literal_length));
+                                const expr = try self.makeExpr(.{ .named = inferred_name }, .{ .array_repeat = .{
+                                    .value = first,
+                                    .length = length,
+                                } });
+                                expr.owned_type_name = @constCast(inferred_name);
+                                return expr;
+                            }
+                        },
+                        else => {},
+                    }
                     try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array repetition requires a fixed array contextual type", .{});
                 }
                 return self.makeExpr(result_type, .{ .array_repeat = .{
@@ -1174,6 +1855,8 @@ fn ExprParser(
             var items = array_list.Managed(*Expr).init(self.allocator);
             defer items.deinit();
             try items.append(first);
+            const inferred_element_type = first.ty;
+            var element_mismatch = false;
 
             while (self.peek().kind == .comma) {
                 _ = self.advance();
@@ -1181,6 +1864,12 @@ fn ExprParser(
                 self.expected_type = element_type;
                 const item = try self.parseConversion();
                 self.expected_type = previous_expected;
+                if (!inferred_element_type.isUnsupported() and !item.ty.isUnsupported() and
+                    !callArgumentTypeCompatible(item.ty, inferred_element_type, inferred_element_type.displayName(), &.{}, false))
+                {
+                    element_mismatch = true;
+                    try self.diagnostics.add(.@"error", "type.expr.array.element", self.span, "array literal elements must have one element type", .{});
+                }
                 try items.append(item);
             }
             if (self.peek().kind == .r_bracket) {
@@ -1189,7 +1878,20 @@ fn ExprParser(
                 try self.diagnostics.add(.@"error", "parse.expr.array", self.span, "unterminated array literal", .{});
             }
             const result_type = if (element_type.isUnsupported()) types.TypeRef.unsupported else array_type;
+            if (array_shape) |shape| {
+                if (shape.length) |expected_length| {
+                    if (expected_length != items.items.len) {
+                        try self.diagnostics.add(.@"error", "type.expr.array.length", self.span, "array literal length does not match the expected array type", .{});
+                    }
+                }
+            }
             if (result_type.isUnsupported()) {
+                if (!inferred_element_type.isUnsupported() and !element_mismatch) {
+                    const inferred_name = try makeFixedArrayTypeName(self.allocator, inferred_element_type, items.items.len);
+                    const expr = try self.makeExpr(.{ .named = inferred_name }, .{ .array = .{ .items = try items.toOwnedSlice() } });
+                    expr.owned_type_name = @constCast(inferred_name);
+                    return expr;
+                }
                 try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array literal requires a fixed array contextual type", .{});
             }
             return self.makeExpr(result_type, .{ .array = .{ .items = try items.toOwnedSlice() } });
@@ -1310,6 +2012,17 @@ fn ExprParser(
             if (prototype.generic_params.len != 0) {
                 return expr;
             }
+            if (self.expected_type == .named) {
+                const expected_name = self.expected_type.named;
+                if (try foreign_callable_types.parseSyntax(self.allocator, expected_name)) |syntax| {
+                    var owned_syntax = syntax;
+                    defer owned_syntax.deinit(self.allocator);
+                    if (foreignCallablePrototypeCompatible(owned_syntax, prototype)) {
+                        expr.ty = self.expected_type;
+                        return expr;
+                    }
+                }
+            }
             if (!usesOwnedPackedCallableInput(prototype.parameter_modes)) {
                 return expr;
             }
@@ -1384,6 +2097,60 @@ fn isComparisonExpr(expr: *const Expr) bool {
     };
 }
 
+fn typesEqualityComparable(lhs: types.TypeRef, rhs: types.TypeRef) bool {
+    if (lhs.eql(rhs)) return typeSupportsBuiltinEquality(lhs);
+    if (lhs == .named and rhs == .named) {
+        const lhs_pointer = raw_pointer.parse(lhs.named) orelse return false;
+        const rhs_pointer = raw_pointer.parse(rhs.named) orelse return false;
+        return std.mem.eql(u8, lhs_pointer.pointee, rhs_pointer.pointee) and
+            (lhs_pointer.access == rhs_pointer.access or lhs_pointer.access == .read or rhs_pointer.access == .read);
+    }
+    return false;
+}
+
+fn typesOrderingComparable(lhs: types.TypeRef, rhs: types.TypeRef) bool {
+    return lhs.eql(rhs) and typeSupportsBuiltinOrdering(lhs);
+}
+
+fn typeSupportsBuiltinEquality(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .builtin => |builtin| switch (builtin) {
+            .unit, .bool, .i32, .u32, .index, .isize => true,
+            .str, .unsupported => false,
+        },
+        .named => |name| blk: {
+            if (raw_pointer.parse(name) != null) break :blk true;
+            if (foreign_callable_types.startsForeignCallableType(name)) break :blk true;
+            if (types.CAbiAlias.fromName(name)) |alias| break :blk alias != .c_void;
+            if (std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "IndexRange")) break :blk true;
+            break :blk false;
+        },
+        .unsupported => false,
+    };
+}
+
+fn typeSupportsBuiltinOrdering(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .builtin => |builtin| switch (builtin) {
+            .i32, .u32, .index, .isize => true,
+            .unit, .bool, .str, .unsupported => false,
+        },
+        .named => |name| blk: {
+            if (types.CAbiAlias.fromName(name)) |alias| break :blk alias != .c_void;
+            if (std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "IndexRange")) break :blk true;
+            break :blk false;
+        },
+        .unsupported => false,
+    };
+}
+
+fn typeIsRawPointer(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .named => |name| raw_pointer.parse(name) != null,
+        else => false,
+    };
+}
+
 fn usesOwnedPackedCallableInput(parameter_modes: []const ParameterMode) bool {
     for (parameter_modes) |mode| {
         if (mode != .owned and mode != .take) return false;
@@ -1391,7 +2158,12 @@ fn usesOwnedPackedCallableInput(parameter_modes: []const ParameterMode) bool {
     return true;
 }
 
-fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
+const FixedArrayShape = struct {
+    element_type: types.TypeRef,
+    length: ?usize,
+};
+
+fn fixedArrayShape(ty: types.TypeRef) ?FixedArrayShape {
     const raw = switch (ty) {
         .named => |name| std.mem.trim(u8, name, " \t"),
         else => return null,
@@ -1402,10 +2174,74 @@ fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
     const inner = raw[1..close_index];
     const separator = findTopLevelHeaderScalar(inner, ';') orelse return null;
     const element_type = std.mem.trim(u8, inner[0..separator], " \t");
+    const length_text = std.mem.trim(u8, inner[separator + 1 ..], " \t");
     if (element_type.len == 0) return null;
     const builtin = types.Builtin.fromName(element_type);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = element_type };
+    return .{
+        .element_type = if (builtin != .unsupported) types.TypeRef.fromBuiltin(builtin) else .{ .named = element_type },
+        .length = std.fmt.parseInt(usize, length_text, 10) catch null,
+    };
+}
+
+fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
+    const shape = fixedArrayShape(ty) orelse return null;
+    return shape.element_type;
+}
+
+fn fixedArrayLength(ty: types.TypeRef) ?usize {
+    const shape = fixedArrayShape(ty) orelse return null;
+    return shape.length;
+}
+
+fn makeFixedArrayTypeName(allocator: Allocator, element_type: types.TypeRef, length: usize) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "[{s}; {d}]", .{ element_type.displayName(), length });
+}
+
+fn dynamicLookupTypeSupported(allocator: Allocator, raw_type_name: []const u8) !bool {
+    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "*read ") or std.mem.startsWith(u8, trimmed, "*edit ")) return true;
+    var syntax = try foreign_callable_types.parseSyntax(allocator, trimmed) orelse return false;
+    defer syntax.deinit(allocator);
+    return syntax.variadic_tail == null;
+}
+
+fn dynamicLookupResultOkType(allocator: Allocator, raw_type_name: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "Result[")) return null;
+    const open_index = "Result".len;
+    const close_index = findMatchingDelimiter(trimmed, open_index, '[', ']') orelse return null;
+    if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t\r\n").len != 0) return null;
+    const args = try typed_text.splitTopLevelCommaParts(allocator, trimmed[open_index + 1 .. close_index]);
+    defer allocator.free(args);
+    if (args.len != 2) return null;
+    const ok_type = std.mem.trim(u8, args[0], " \t\r\n");
+    const err_type = std.mem.trim(u8, args[1], " \t\r\n");
+    if (!std.mem.eql(u8, err_type, dynamic_library.lookup_error_type_name)) return null;
+    if (!try dynamicLookupTypeSupported(allocator, ok_type)) return null;
+    return ok_type;
+}
+
+fn isAddressablePlace(expr: *const Expr) bool {
+    return switch (expr.node) {
+        .identifier => true,
+        .field => |field| isAddressablePlace(field.base),
+        .index => |index| isAddressablePlace(index.base),
+        else => false,
+    };
+}
+
+fn contextualIntegerLiteralType(expected: types.TypeRef) types.TypeRef {
+    if (expected.isNumeric()) return expected;
+    switch (expected) {
+        .named => |name| {
+            const alias = types.CAbiAlias.fromName(name) orelse return types.TypeRef.fromBuiltin(.i32);
+            return switch (alias) {
+                .c_bool, .c_void => types.TypeRef.fromBuiltin(.i32),
+                else => expected,
+            };
+        },
+        else => return types.TypeRef.fromBuiltin(.i32),
+    }
 }
 
 const ExprTokenKind = enum {
@@ -1464,7 +2300,9 @@ pub fn parseExpressionSyntax(
     unsafe_context: bool,
 ) anyerror!*Expr {
     if (syntaxExprHasError(syntax_expr)) {
-        try diagnostics.add(.@"error", "type.expr.syntax", span, "malformed expression syntax in stage0", .{});
+        if (!try emitAwaitSyntaxDiagnostic(diagnostics, syntax_expr, span)) {
+            try diagnostics.add(.@"error", "type.expr.syntax", span, "malformed expression syntax in stage0", .{});
+        }
         return makeUnsupportedExpr(allocator);
     }
 
@@ -1498,6 +2336,90 @@ pub fn parseExpressionSyntax(
     return parser.parse();
 }
 
+fn emitAwaitSyntaxDiagnostic(diagnostics: *diag.Bag, expr: *const ast.BodyExprSyntax, span: source.Span) anyerror!bool {
+    switch (expr.node) {
+        .@"error" => |value| {
+            const text = std.mem.trim(u8, value.text, " \t\r\n");
+            if (startsWithIdentifier(text, "await")) {
+                try diagnostics.add(.@"error", "type.await.standalone", span, "standalone await expressions are not part of v1; use the Task.await method surface", .{});
+                return true;
+            }
+            if (containsAwaitInvocationQualifier(text)) {
+                try diagnostics.add(.@"error", "type.await.qualifier", span, "await is not an invocation qualifier; use the Task.await method surface", .{});
+                return true;
+            }
+            return false;
+        },
+        .group => |group| return emitAwaitSyntaxDiagnostic(diagnostics, group, span),
+        .tuple => |items| return emitAwaitSyntaxDiagnosticInSlice(diagnostics, items, span),
+        .array => |items| return emitAwaitSyntaxDiagnosticInSlice(diagnostics, items, span),
+        .array_repeat => |array_repeat| {
+            if (try emitAwaitSyntaxDiagnostic(diagnostics, array_repeat.value, span)) return true;
+            return emitAwaitSyntaxDiagnostic(diagnostics, array_repeat.length, span);
+        },
+        .raw_pointer => |raw_pointer_expr| return emitAwaitSyntaxDiagnostic(diagnostics, raw_pointer_expr.place, span),
+        .unary => |unary| return emitAwaitSyntaxDiagnostic(diagnostics, unary.operand, span),
+        .binary => |binary| {
+            if (try emitAwaitSyntaxDiagnostic(diagnostics, binary.lhs, span)) return true;
+            return emitAwaitSyntaxDiagnostic(diagnostics, binary.rhs, span);
+        },
+        .field => |field| return emitAwaitSyntaxDiagnostic(diagnostics, field.base, span),
+        .index => |index| {
+            if (try emitAwaitSyntaxDiagnostic(diagnostics, index.base, span)) return true;
+            return emitAwaitSyntaxDiagnostic(diagnostics, index.index, span);
+        },
+        .call => |call| {
+            if (try emitAwaitSyntaxDiagnostic(diagnostics, call.callee, span)) return true;
+            return emitAwaitSyntaxDiagnosticInSlice(diagnostics, call.args, span);
+        },
+        .method_call => |call| {
+            if (try emitAwaitSyntaxDiagnostic(diagnostics, call.callee, span)) return true;
+            return emitAwaitSyntaxDiagnosticInSlice(diagnostics, call.args, span);
+        },
+        .name, .integer, .string => return false,
+    }
+}
+
+fn emitAwaitSyntaxDiagnosticInSlice(diagnostics: *diag.Bag, items: []const *ast.BodyExprSyntax, span: source.Span) anyerror!bool {
+    for (items) |item| {
+        if (try emitAwaitSyntaxDiagnostic(diagnostics, item, span)) return true;
+    }
+    return false;
+}
+
+fn containsAwaitInvocationQualifier(text: []const u8) bool {
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, text, offset, "::")) |separator| {
+        const after = trimLeadingWhitespace(text[separator + "::".len ..]);
+        if (startsWithIdentifier(after, "await")) return true;
+        offset = separator + "::".len;
+    }
+    return false;
+}
+
+fn trimLeadingWhitespace(text: []const u8) []const u8 {
+    var index: usize = 0;
+    while (index < text.len and isWhitespace(text[index])) : (index += 1) {}
+    return text[index..];
+}
+
+fn isWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+fn startsWithIdentifier(text: []const u8, word: []const u8) bool {
+    if (!std.mem.startsWith(u8, text, word)) return false;
+    if (text.len == word.len) return true;
+    return !isIdentifierContinue(text[word.len]);
+}
+
+fn isIdentifierContinue(byte: u8) bool {
+    return (byte >= 'a' and byte <= 'z') or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '_';
+}
+
 fn syntaxExprHasError(expr: *const ast.BodyExprSyntax) bool {
     return switch (expr.node) {
         .@"error" => true,
@@ -1506,6 +2428,7 @@ fn syntaxExprHasError(expr: *const ast.BodyExprSyntax) bool {
         .tuple => |items| exprSliceHasError(items),
         .array => |items| exprSliceHasError(items),
         .array_repeat => |array_repeat| syntaxExprHasError(array_repeat.value) or syntaxExprHasError(array_repeat.length),
+        .raw_pointer => |raw_pointer_expr| syntaxExprHasError(raw_pointer_expr.place),
         .unary => |unary| syntaxExprHasError(unary.operand),
         .binary => |binary| syntaxExprHasError(binary.lhs) or syntaxExprHasError(binary.rhs),
         .field => |field| syntaxExprHasError(field.base),
@@ -1556,6 +2479,12 @@ fn appendExprTokens(tokens: *array_list.Managed(ExprToken), expr: *const ast.Bod
             try tokens.append(.{ .kind = .semicolon, .lexeme = ";" });
             try appendExprTokens(tokens, array_repeat.length);
             try tokens.append(.{ .kind = .r_bracket, .lexeme = "]" });
+        },
+        .raw_pointer => |raw_pointer_expr| {
+            try tokens.append(.{ .kind = .amp, .lexeme = "&" });
+            try tokens.append(.{ .kind = .identifier, .lexeme = "raw" });
+            try tokens.append(.{ .kind = .identifier, .lexeme = raw_pointer_expr.mode.text });
+            try appendExprTokens(tokens, raw_pointer_expr.place);
         },
         .unary => |unary| {
             try tokens.append(.{
@@ -1622,6 +2551,7 @@ fn unaryOperatorTokenKind(raw: []const u8) ExprTokenKind {
     if (std.mem.eql(u8, raw, "!")) return .bang;
     if (std.mem.eql(u8, raw, "-")) return .minus;
     if (std.mem.eql(u8, raw, "~")) return .tilde;
+    if (std.mem.eql(u8, raw, "&")) return .amp;
     return .identifier;
 }
 

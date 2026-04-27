@@ -4,6 +4,7 @@ const diag = @import("../diag/root.zig");
 const checked_body = @import("../query/checked_body.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
+const types = @import("../types/root.zig");
 
 pub const explicit_by_default = true;
 pub const consuming_owner = "take";
@@ -12,6 +13,8 @@ pub const stable_owner = "hold";
 pub const BodySummary = struct {
     rejected_bindings: usize = 0,
     move_after_take: usize = 0,
+    move_only_moves: usize = 0,
+    rejected_implicit_copies: usize = 0,
     borrow_conflicts: usize = 0,
     checked_place_count: usize = 0,
     cfg_edge_count: usize = 0,
@@ -36,7 +39,7 @@ pub fn validateCheckedBody(
     defer places.deinit();
     for (body.places) |place| {
         if (place.kind != .parameter) continue;
-        try places.put(place.name);
+        try places.put(place.name, place.ty);
     }
 
     var result = try validateBlock(allocator, callable_resolver, body, &places, body.root_block_id, body.item.span, diagnostics, &summary_data);
@@ -83,6 +86,7 @@ fn validateCfgFacts(
 
 const Place = struct {
     name: []const u8,
+    ty: types.TypeRef,
     consumed: bool = false,
 };
 
@@ -113,12 +117,16 @@ const PlaceSet = struct {
         replacement.* = PlaceSet.init(allocator);
     }
 
-    fn put(self: *PlaceSet, name: []const u8) !void {
+    fn put(self: *PlaceSet, name: []const u8, ty: types.TypeRef) !void {
         if (self.findIndex(name)) |index| {
+            self.places.items[index].ty = ty;
             self.places.items[index].consumed = false;
             return;
         }
-        try self.places.append(.{ .name = name });
+        try self.places.append(.{
+            .name = name,
+            .ty = ty,
+        });
     }
 
     fn contains(self: *const PlaceSet, name: []const u8) bool {
@@ -160,6 +168,11 @@ const PlaceSet = struct {
     fn isConsumed(self: *const PlaceSet, name: []const u8) bool {
         if (self.findIndex(name)) |index| return self.places.items[index].consumed;
         return false;
+    }
+
+    fn typeOf(self: *const PlaceSet, name: []const u8) ?types.TypeRef {
+        if (self.findIndex(name)) |index| return self.places.items[index].ty;
+        return null;
     }
 
     fn findIndex(self: *const PlaceSet, name: []const u8) ?usize {
@@ -272,24 +285,24 @@ fn validateStatement(
         .let_decl => {
             var next_places = try places.clone(allocator);
             defer next_places.deinit();
-            if (statement.binding_expr) |expr| try validateExpr(callable_resolver, &next_places, expr, span, diagnostics, summary_data);
-            if (statement.binding_name) |name| try next_places.put(name);
+            if (statement.binding_expr) |expr| try validateOwnedValueExpr(callable_resolver, &next_places, expr, span, diagnostics, summary_data);
+            if (statement.binding_name) |name| try next_places.put(name, statement.binding_ty);
             result.fallthrough = true;
             try result.fallthrough_state.mergeFrom(&next_places);
         },
         .const_decl => {
             var next_places = try places.clone(allocator);
             defer next_places.deinit();
-            if (statement.binding_expr) |expr| try validateExpr(callable_resolver, &next_places, expr, span, diagnostics, summary_data);
-            if (statement.binding_name) |name| try next_places.put(name);
+            if (statement.binding_expr) |expr| try validateOwnedValueExpr(callable_resolver, &next_places, expr, span, diagnostics, summary_data);
+            if (statement.binding_name) |name| try next_places.put(name, statement.binding_ty);
             result.fallthrough = true;
             try result.fallthrough_state.mergeFrom(&next_places);
         },
         .assign_stmt => {
             var next_places = try places.clone(allocator);
             defer next_places.deinit();
-            if (statement.assign_expr) |expr| try validateExpr(callable_resolver, &next_places, expr, span, diagnostics, summary_data);
-            if (statement.assign_name) |name| try next_places.put(name);
+            if (statement.assign_expr) |expr| try validateOwnedValueExpr(callable_resolver, &next_places, expr, span, diagnostics, summary_data);
+            if (statement.assign_name) |name| try next_places.put(name, statement.assign_ty);
             result.fallthrough = true;
             try result.fallthrough_state.mergeFrom(&next_places);
         },
@@ -298,7 +311,8 @@ fn validateStatement(
             defer select_places.deinit();
 
             if (statement.select_subject_temp_name) |name| {
-                try select_places.put(name);
+                const subject_ty = if (statement.select_subject) |subject| subject.ty else types.TypeRef.unsupported;
+                try select_places.put(name, subject_ty);
             }
             if (statement.select_subject) |subject| try validateExpr(callable_resolver, &select_places, subject, span, diagnostics, summary_data);
 
@@ -311,7 +325,7 @@ fn validateStatement(
 
                 try validateExpr(callable_resolver, &arm_places, arm.condition, span, diagnostics, summary_data);
                 for (arm.bindings) |binding| {
-                    try arm_places.put(binding.name);
+                    try arm_places.put(binding.name, binding.ty);
                 }
                 var arm_result = try validateBlock(allocator, callable_resolver, body, &arm_places, arm.body_block_id, span, diagnostics, summary_data);
                 defer arm_result.deinit();
@@ -406,7 +420,7 @@ fn validateStatement(
         .return_stmt => {
             var return_places = try places.clone(allocator);
             defer return_places.deinit();
-            if (statement.expr) |expr| try validateExpr(callable_resolver, &return_places, expr, span, diagnostics, summary_data);
+            if (statement.expr) |expr| try validateOwnedValueExpr(callable_resolver, &return_places, expr, span, diagnostics, summary_data);
         },
         .break_stmt => {
             result.has_break = true;
@@ -538,6 +552,9 @@ fn validateExpr(
         .enum_construct => |construct| {
             for (construct.args) |arg| try validateExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
         },
+        .tuple => |tuple| {
+            for (tuple.items) |item| try validateExpr(callable_resolver, places, item, span, diagnostics, summary_data);
+        },
         .array => |array| {
             for (array.items) |item| try validateExpr(callable_resolver, places, item, span, diagnostics, summary_data);
         },
@@ -553,12 +570,107 @@ fn validateExpr(
         .call => |call| {
             try validateCallArgumentConflicts(callable_resolver, places, call, span, diagnostics, summary_data);
             for (call.args, 0..) |arg, index| {
-                try validateExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
-                if (calleeParameterMode(callable_resolver, call.callee, index)) |mode| {
-                    if (mode == .take) markTakenPlace(places, arg);
+                const mode = calleeParameterMode(callable_resolver, call.callee, index) orelse .owned;
+                switch (mode) {
+                    .take => {
+                        try validateOwnedValueExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
+                        markTakenPlace(places, arg);
+                    },
+                    .owned => {
+                        if (try callable_resolver.isMoveOnlyType(arg.ty)) {
+                            try validateOwnedValueExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
+                        } else {
+                            try validateExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
+                        }
+                    },
+                    .read, .edit => try validateExpr(callable_resolver, places, arg, span, diagnostics, summary_data),
                 }
             }
         },
+        .unary => |unary| try validateExpr(callable_resolver, places, unary.operand, span, diagnostics, summary_data),
+        .binary => |binary| {
+            try validateExpr(callable_resolver, places, binary.lhs, span, diagnostics, summary_data);
+            try validateExpr(callable_resolver, places, binary.rhs, span, diagnostics, summary_data);
+        },
+        .integer,
+        .bool_lit,
+        .string,
+        .enum_variant,
+        .enum_tag,
+        .enum_constructor_target,
+        => {},
+    }
+}
+
+fn validateOwnedValueExpr(
+    callable_resolver: anytype,
+    places: *PlaceSet,
+    expr: *const typed.Expr,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+    summary_data: *BodySummary,
+) anyerror!void {
+    switch (expr.node) {
+        .identifier => |name| {
+            try validateUse(places, name, span, diagnostics, summary_data);
+            const ty = places.typeOf(name) orelse expr.ty;
+            if (try callable_resolver.isMoveOnlyType(ty)) {
+                places.markConsumed(name);
+                summary_data.move_only_moves += 1;
+            }
+        },
+        .field => |field| {
+            try validateExpr(callable_resolver, places, field.base, span, diagnostics, summary_data);
+            if (try callable_resolver.isMoveOnlyType(expr.ty)) {
+                markTakenPlace(places, expr);
+                summary_data.move_only_moves += 1;
+            }
+        },
+        .method_target => |target| {
+            try validateExpr(callable_resolver, places, target.base, span, diagnostics, summary_data);
+            if (try callable_resolver.isMoveOnlyType(expr.ty)) {
+                markTakenPlace(places, expr);
+                summary_data.move_only_moves += 1;
+            }
+        },
+        .constructor => |constructor| {
+            for (constructor.args) |arg| try validateOwnedValueExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
+        },
+        .enum_construct => |construct| {
+            for (construct.args) |arg| try validateOwnedValueExpr(callable_resolver, places, arg, span, diagnostics, summary_data);
+        },
+        .tuple => |tuple| {
+            for (tuple.items) |item| try validateOwnedValueExpr(callable_resolver, places, item, span, diagnostics, summary_data);
+        },
+        .array => |array| {
+            for (array.items) |item| try validateOwnedValueExpr(callable_resolver, places, item, span, diagnostics, summary_data);
+        },
+        .array_repeat => |array_repeat| {
+            if (try callable_resolver.isMoveOnlyType(array_repeat.value.ty)) {
+                switch (array_repeat.length.node) {
+                    .integer => |length| if (length > 1) {
+                        summary_data.rejected_implicit_copies += 1;
+                        try diagnostics.add(.@"error", "ownership.move_only.repeat", span, "array repetition would implicitly duplicate a move-only value", .{});
+                    },
+                    else => {
+                        summary_data.rejected_implicit_copies += 1;
+                        try diagnostics.add(.@"error", "ownership.move_only.repeat", span, "array repetition of a move-only value requires an explicit non-duplicating length", .{});
+                    },
+                }
+            }
+            try validateOwnedValueExpr(callable_resolver, places, array_repeat.value, span, diagnostics, summary_data);
+            try validateExpr(callable_resolver, places, array_repeat.length, span, diagnostics, summary_data);
+        },
+        .index => |index| {
+            try validateExpr(callable_resolver, places, index.base, span, diagnostics, summary_data);
+            try validateExpr(callable_resolver, places, index.index, span, diagnostics, summary_data);
+            if (try callable_resolver.isMoveOnlyType(expr.ty)) {
+                markTakenPlace(places, expr);
+                summary_data.move_only_moves += 1;
+            }
+        },
+        .conversion => |conversion| try validateOwnedValueExpr(callable_resolver, places, conversion.operand, span, diagnostics, summary_data),
+        .call => try validateExpr(callable_resolver, places, expr, span, diagnostics, summary_data),
         .unary => |unary| try validateExpr(callable_resolver, places, unary.operand, span, diagnostics, summary_data),
         .binary => |binary| {
             try validateExpr(callable_resolver, places, binary.lhs, span, diagnostics, summary_data);
@@ -677,6 +789,7 @@ fn markTakenPlace(places: *PlaceSet, expr: *const typed.Expr) void {
     switch (expr.node) {
         .identifier => |name| places.markConsumed(name),
         .field => |field| markTakenPlace(places, field.base),
+        .index => |index| markTakenPlace(places, index.base),
         else => {},
     }
 }

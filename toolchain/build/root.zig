@@ -152,24 +152,32 @@ pub fn buildAtPathWithOptions(
             allocator.free(metadata_path);
         };
 
-        var root_modules = array_list.Managed(*const compiler.mir.Module).init(allocator);
+        var root_modules = array_list.Managed(*const compiler.backend_contract.LoweredModule).init(allocator);
         defer root_modules.deinit();
         for (result.pipeline.modules.items) |*module_pipeline| {
             if (module_pipeline.root_index != index) continue;
-            if (module_pipeline.mir) |*module| try root_modules.append(module);
+            if (module_pipeline.backend_contract) |*lowered| try root_modules.append(lowered);
         }
         if (root_modules.items.len == 0) {
-            try result.pipeline.diagnostics.add(.@"error", "build.module.missing", null, "no lowered modules found for product '{s}'", .{product.name});
+            try result.pipeline.diagnostics.add(.@"error", "build.module.missing", null, "no lowered backend modules found for product '{s}'", .{product.name});
             continue;
         }
 
-        var merged_module = try compiler.mir.mergeModules(allocator, root_modules.items);
-        defer merged_module.deinit();
+        var lowered_module = try compiler.backend_contract.mergeLoweredModules(allocator, .{
+            .module_id = .{ .index = 0 },
+            .target_name = compiler.target.hostName(),
+            .output_kind = switch (product.kind) {
+                .bin => .bin,
+                .cdylib => .cdylib,
+                .lib => unreachable,
+            },
+        }, root_modules.items);
+        defer compiler.backend_contract.deinitLoweredModule(allocator, &lowered_module);
 
         const c_source = compiler.codegen.emitCModule(
             allocator,
             product.name,
-            &merged_module,
+            &lowered_module,
             switch (product.kind) {
                 .bin => .bin,
                 .cdylib => .cdylib,

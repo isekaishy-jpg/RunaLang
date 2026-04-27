@@ -19,6 +19,7 @@ pub fn isExpressionIssue(code: []const u8) bool {
         std.mem.startsWith(u8, code, "parse.expr.") or
         std.mem.startsWith(u8, code, "type.call.") or
         std.mem.startsWith(u8, code, "type.method.") or
+        std.mem.startsWith(u8, code, "type.await.") or
         std.mem.startsWith(u8, code, "type.ctor.") or
         std.mem.startsWith(u8, code, "type.enum.") or
         std.mem.startsWith(u8, code, "type.field.") or

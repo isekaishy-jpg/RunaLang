@@ -1,5 +1,6 @@
 const std = @import("std");
 const array_list = std.array_list;
+const backend_contract = @import("../backend_contract/root.zig");
 const diag = @import("../diag/root.zig");
 const hir = @import("../hir/root.zig");
 const lowering = @import("../lowering/root.zig");
@@ -53,8 +54,10 @@ pub const ModulePipeline = struct {
     import_binding_sites: array_list.Managed(ImportBindingSite),
     typed: typed.Module,
     mir: ?mir.Module = null,
+    backend_contract: ?backend_contract.LoweredModule = null,
 
     pub fn deinit(self: *ModulePipeline, allocator: Allocator) void {
+        if (self.backend_contract) |*lowered| backend_contract.deinitLoweredModule(allocator, lowered);
         if (self.mir) |*module| module.deinit();
         self.typed.deinit(allocator);
         self.import_binding_sites.deinit();
@@ -203,6 +206,7 @@ fn discoverSinglePackageModuleTree(
         .import_binding_sites = array_list.Managed(ImportBindingSite).init(allocator),
         .typed = lowered_typed,
         .mir = null,
+        .backend_contract = null,
     });
 
     const current_dir = std.fs.path.dirname(path) orelse ".";
@@ -522,8 +526,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
                         .unsafe_required = target.function_unsafe_required,
                     });
                 }
-                if (target.category == .type_decl) {
-                }
+                if (target.category == .type_decl) {}
                 continue;
             }
 
@@ -597,6 +600,7 @@ fn discoverGraphModuleTree(
         .import_binding_sites = array_list.Managed(ImportBindingSite).init(allocator),
         .typed = lowered_typed,
         .mir = null,
+        .backend_contract = null,
     });
 
     const current_dir = std.fs.path.dirname(path) orelse ".";
@@ -722,23 +726,22 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         .span = symbol.span,
                     });
                     try typed.addImportedBinding(allocator, &module_pipeline.typed, imported);
-                if (imported.function_parameter_types) |values| {
-                    try module_pipeline.prototypes.append(.{
-                        .name = imported.local_name,
-                        .target_name = imported.target_name,
-                        .target_symbol = imported.target_symbol,
-                        .return_type = imported.function_return_type.?,
-                        .generic_params = if (imported.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, imported.function_generic_params) else &.{},
-                        .where_predicates = if (imported.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, imported.function_where_predicates) else &.{},
-                        .is_suspend = imported.function_is_suspend,
-                        .parameter_types = try allocator.dupe(types.TypeRef, values),
-                        .parameter_type_names = if (imported.function_parameter_type_names) |type_names| try allocator.dupe([]const u8, type_names) else try allocator.alloc([]const u8, 0),
-                        .parameter_modes = if (imported.function_parameter_modes) |modes| try allocator.dupe(typed.ParameterMode, modes) else try allocator.alloc(typed.ParameterMode, 0),
-                        .unsafe_required = target.function_unsafe_required,
-                    });
-                }
-                    if (target.category == .type_decl) {
+                    if (imported.function_parameter_types) |values| {
+                        try module_pipeline.prototypes.append(.{
+                            .name = imported.local_name,
+                            .target_name = imported.target_name,
+                            .target_symbol = imported.target_symbol,
+                            .return_type = imported.function_return_type.?,
+                            .generic_params = if (imported.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, imported.function_generic_params) else &.{},
+                            .where_predicates = if (imported.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, imported.function_where_predicates) else &.{},
+                            .is_suspend = imported.function_is_suspend,
+                            .parameter_types = try allocator.dupe(types.TypeRef, values),
+                            .parameter_type_names = if (imported.function_parameter_type_names) |type_names| try allocator.dupe([]const u8, type_names) else try allocator.alloc([]const u8, 0),
+                            .parameter_modes = if (imported.function_parameter_modes) |modes| try allocator.dupe(typed.ParameterMode, modes) else try allocator.alloc(typed.ParameterMode, 0),
+                            .unsafe_required = target.function_unsafe_required,
+                        });
                     }
+                    if (target.category == .type_decl) {}
                     continue;
                 }
             } else {
@@ -783,8 +786,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                             .unsafe_required = resolved_target.function_unsafe_required,
                         });
                     }
-                    if (resolved_target.category == .type_decl) {
-                    }
+                    if (resolved_target.category == .type_decl) {}
                     continue;
                 }
             }

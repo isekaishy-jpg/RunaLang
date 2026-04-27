@@ -123,7 +123,7 @@ fn lowerGenericStatement(
     node_id: cst.NodeId,
 ) anyerror!ast.BodyStatementSyntax {
     if (firstExprChild(tree, node_id)) |expr_node| {
-        return .{ .expr_stmt = try lowerExprNode(allocator, file, tokens, tree, expr_node) };
+        return .{ .expr_stmt = try lowerExprNodeAllowingUnsafePrefix(allocator, file, tokens, tree, expr_node) };
     }
 
     const line_node = childNodeByKind(tree, node_id, .statement_line) orelse {
@@ -306,7 +306,7 @@ fn lowerReturnStatement(
     node_id: cst.NodeId,
 ) anyerror!ast.BodyStatementSyntax {
     if (firstExprChild(tree, node_id)) |expr_node| {
-        return .{ .return_stmt = try lowerExprNode(allocator, file, tokens, tree, expr_node) };
+        return .{ .return_stmt = try lowerExprNodeAllowingUnsafePrefix(allocator, file, tokens, tree, expr_node) };
     }
     return .{ .return_stmt = null };
 }
@@ -319,7 +319,7 @@ fn lowerDeferStatement(
     node_id: cst.NodeId,
 ) anyerror!ast.BodyStatementSyntax {
     if (firstExprChild(tree, node_id)) |expr_node| {
-        return .{ .defer_stmt = try lowerExprNode(allocator, file, tokens, tree, expr_node) };
+        return .{ .defer_stmt = try lowerExprNodeAllowingUnsafePrefix(allocator, file, tokens, tree, expr_node) };
     }
     return .{ .defer_stmt = try makeErrorExpr(allocator, spanTextForNode(file, tokens, tree, node_id) orelse emptySpanText(tokens)) };
 }
@@ -331,12 +331,13 @@ fn lowerUnsafeStatement(
     tree: *const cst.Tree,
     node_id: cst.NodeId,
 ) anyerror!ast.BodyStatementSyntax {
+    if (childNodeByKind(tree, node_id, .block) == null) {
+        return .{ .expr_stmt = try lowerStandaloneExprSyntax(allocator, spanTextForNode(file, tokens, tree, node_id) orelse emptySpanText(tokens)) };
+    }
+
     const body = try allocator.create(ast.BodyBlockSyntax);
     errdefer allocator.destroy(body);
-    body.* = if (childNodeByKind(tree, node_id, .block)) |block_node|
-        try lowerBlockBodySyntax(allocator, file, tokens, tree, block_node)
-    else
-        .{};
+    body.* = try lowerBlockBodySyntax(allocator, file, tokens, tree, childNodeByKind(tree, node_id, .block).?);
     errdefer body.deinit(allocator);
     return .{ .unsafe_block = body };
 }
@@ -442,6 +443,14 @@ fn lowerExprNode(
                 .length = try lowerExprNode(allocator, file, tokens, tree, length),
             } });
         },
+        .expr_raw_pointer => blk: {
+            const mode = nthTokenSpanText(file, tokens, tree, node_id, 2) orelse emptySpanText(tokens);
+            const place = nthExprChild(tree, node_id, 0) orelse break :blk try makeErrorExpr(allocator, spanTextForNode(file, tokens, tree, node_id) orelse emptySpanText(tokens));
+            break :blk makeExpr(allocator, nodeSpan(tokens, tree, node_id) orelse zeroSpan(tokens), .{ .raw_pointer = .{
+                .mode = mode,
+                .place = try lowerExprNode(allocator, file, tokens, tree, place),
+            } });
+        },
         .expr_unary => blk: {
             const operator = firstTokenSpanText(file, tokens, tree, node_id) orelse emptySpanText(tokens);
             const operand = firstExprChild(tree, node_id) orelse break :blk try makeErrorExpr(allocator, spanTextForNode(file, tokens, tree, node_id) orelse emptySpanText(tokens));
@@ -508,6 +517,20 @@ fn lowerWrappedExprNode(
     return makeErrorExpr(allocator, spanTextForNode(file, tokens, tree, node_id) orelse emptySpanText(tokens));
 }
 
+fn lowerExprNodeAllowingUnsafePrefix(
+    allocator: Allocator,
+    file: *const source.File,
+    tokens: syntax.TokenStore,
+    tree: *const cst.Tree,
+    node_id: cst.NodeId,
+) anyerror!*ast.BodyExprSyntax {
+    const text = spanTextForNode(file, tokens, tree, node_id) orelse emptySpanText(tokens);
+    if (normalizeLeadingUnsafeExpr(text).force_unsafe) {
+        return lowerStandaloneExprSyntax(allocator, text);
+    }
+    return lowerExprNode(allocator, file, tokens, tree, node_id);
+}
+
 fn lowerExprNodeSlice(
     allocator: Allocator,
     file: *const source.File,
@@ -528,6 +551,7 @@ fn lowerExprNodeSlice(
                 .expr_tuple,
                 .expr_array,
                 .expr_array_repeat,
+                .expr_raw_pointer,
                 .expr_unary,
                 .expr_binary,
                 .expr_field,
@@ -765,6 +789,7 @@ fn firstExprChild(tree: *const cst.Tree, node_id: cst.NodeId) ?cst.NodeId {
                 .expr_tuple,
                 .expr_array,
                 .expr_array_repeat,
+                .expr_raw_pointer,
                 .expr_unary,
                 .expr_binary,
                 .expr_field,
@@ -793,6 +818,7 @@ fn nthExprChild(tree: *const cst.Tree, node_id: cst.NodeId, target_index: usize)
                 .expr_tuple,
                 .expr_array,
                 .expr_array_repeat,
+                .expr_raw_pointer,
                 .expr_unary,
                 .expr_binary,
                 .expr_field,

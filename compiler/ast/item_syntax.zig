@@ -93,6 +93,27 @@ pub const NamedDecl = struct {
     }
 };
 
+pub const TypeAlias = struct {
+    name: ?SpanText = null,
+    generic_params: ?SpanText = null,
+    target: ?SpanText = null,
+    where_clauses: []SpanText = &.{},
+
+    pub fn clone(self: TypeAlias, allocator: Allocator) !TypeAlias {
+        return .{
+            .name = self.name,
+            .generic_params = self.generic_params,
+            .target = self.target,
+            .where_clauses = try cloneSlice(allocator, SpanText, self.where_clauses),
+        };
+    }
+
+    pub fn deinit(self: *TypeAlias, allocator: Allocator) void {
+        freeSlice(allocator, self.where_clauses);
+        self.* = .{};
+    }
+};
+
 pub const UseBinding = struct {
     prefix: ?SpanText = null,
     leaf: ?SpanText = null,
@@ -282,6 +303,7 @@ pub const ItemSyntax = union(enum) {
     none,
     function: FunctionSignature,
     const_item: ConstSignature,
+    type_alias: TypeAlias,
     named_decl: NamedDecl,
     use_decl: UseBinding,
     impl_block: ImplSignature,
@@ -291,6 +313,7 @@ pub const ItemSyntax = union(enum) {
             .none => .none,
             .function => |signature| .{ .function = try signature.clone(allocator) },
             .const_item => |signature| .{ .const_item = try signature.clone(allocator) },
+            .type_alias => |signature| .{ .type_alias = try signature.clone(allocator) },
             .named_decl => |signature| .{ .named_decl = try signature.clone(allocator) },
             .use_decl => |signature| .{ .use_decl = try signature.clone(allocator) },
             .impl_block => |signature| .{ .impl_block = try signature.clone(allocator) },
@@ -302,6 +325,7 @@ pub const ItemSyntax = union(enum) {
             .none => {},
             .function => |*signature| signature.deinit(allocator),
             .const_item => |*signature| signature.deinit(allocator),
+            .type_alias => |*signature| signature.deinit(allocator),
             .named_decl => |*signature| signature.deinit(allocator),
             .use_decl => |*signature| signature.deinit(allocator),
             .impl_block => |*signature| signature.deinit(allocator),

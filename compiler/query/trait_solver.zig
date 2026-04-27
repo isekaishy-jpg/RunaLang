@@ -2,6 +2,7 @@ const std = @import("std");
 const callable_types = @import("callable_types.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
+const raw_pointer = @import("../raw_pointer/root.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
 const boundary_checks = @import("boundary_checks.zig");
@@ -108,6 +109,26 @@ pub fn typeNameIsSendInEnvironment(
     where_predicates: []const typed.WherePredicate,
 ) bool {
     const result = satisfiesTrait(active, module_id, raw_type_name, "Send", where_predicates) catch return false;
+    return result.satisfied;
+}
+
+pub fn typeNameIsEqInEnvironment(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    raw_type_name: []const u8,
+    where_predicates: []const typed.WherePredicate,
+) bool {
+    const result = satisfiesTrait(active, module_id, raw_type_name, "Eq", where_predicates) catch return false;
+    return result.satisfied;
+}
+
+pub fn typeNameIsHashInEnvironment(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    raw_type_name: []const u8,
+    where_predicates: []const typed.WherePredicate,
+) bool {
+    const result = satisfiesTrait(active, module_id, raw_type_name, "Hash", where_predicates) catch return false;
     return result.satisfied;
 }
 
@@ -269,6 +290,16 @@ fn solveGoal(
             .key = key,
             .satisfied = whereEnvironmentSatisfies(active, key) or
                 solveBuiltinSend(active, key.module_id, keySelfTypeName(active, key), signature_resolver),
+        },
+        .builtin_eq => {
+            if (whereEnvironmentSatisfies(active, key) or solveBuiltinEq(active, key.module_id, keySelfTypeName(active, key), signature_resolver)) {
+                return .{ .key = key, .satisfied = true };
+            }
+        },
+        .builtin_hash => {
+            if (whereEnvironmentSatisfies(active, key) or solveBuiltinHash(active, key.module_id, keySelfTypeName(active, key), signature_resolver)) {
+                return .{ .key = key, .satisfied = true };
+            }
         },
         .opaque_name => return .{ .key = key, .satisfied = whereEnvironmentSatisfies(active, key) },
         .trait_item => {},
@@ -736,6 +767,8 @@ fn solveBuiltinSendInner(
     const base_name = baseTypeName(trimmed);
     const builtin = types.Builtin.fromName(base_name);
     if (builtin != .unsupported) return true;
+    if (types.CAbiAlias.fromName(base_name)) |alias| return alias != .c_void;
+    if (std.mem.eql(u8, base_name, "Char") or std.mem.eql(u8, base_name, "IndexRange")) return true;
     if (std.mem.eql(u8, base_name, "Task")) return false;
 
     for (visiting.items) |existing| {
@@ -770,8 +803,120 @@ fn solveBuiltinSendInner(
             }
             break :blk true;
         },
+        .type_alias => |alias| solveBuiltinSendInner(active, checked.module_id, alias.target_type_name, visiting, signature_resolver),
         .opaque_type, .union_type, .function, .const_item, .trait_type, .impl_block, .none => false,
     };
+}
+
+fn solveBuiltinEq(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8, signature_resolver: SignatureResolver) bool {
+    var visiting = std.array_list.Managed([]const u8).init(active.allocator);
+    defer visiting.deinit();
+    return solveBuiltinEqHashInner(active, module_id, raw_type_name, .eq, &visiting, signature_resolver);
+}
+
+fn solveBuiltinHash(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8, signature_resolver: SignatureResolver) bool {
+    var visiting = std.array_list.Managed([]const u8).init(active.allocator);
+    defer visiting.deinit();
+    return solveBuiltinEqHashInner(active, module_id, raw_type_name, .hash, &visiting, signature_resolver);
+}
+
+const EqHashContract = enum {
+    eq,
+    hash,
+};
+
+fn solveBuiltinEqHashInner(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    raw_type_name: []const u8,
+    contract: EqHashContract,
+    visiting: *std.array_list.Managed([]const u8),
+    signature_resolver: SignatureResolver,
+) bool {
+    const boundary = parseBoundaryType(raw_type_name);
+    if (boundary.kind != .value) return false;
+
+    const trimmed = std.mem.trim(u8, boundary.inner_type_name, " \t");
+    if (trimmed.len == 0) return false;
+    if ((parseCallableTypeName(trimmed, active.allocator) catch null) != null) return true;
+    if (raw_pointer.parse(trimmed) != null) return true;
+
+    if (std.mem.startsWith(u8, trimmed, "(") and std.mem.endsWith(u8, trimmed, ")")) {
+        const inner = trimmed[1 .. trimmed.len - 1];
+        const parts = typed_text.splitTopLevelCommaParts(active.allocator, inner) catch return false;
+        defer active.allocator.free(parts);
+        for (parts) |part| {
+            if (!solveBuiltinEqHashInner(active, module_id, part, contract, visiting, signature_resolver)) return false;
+        }
+        return true;
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "[")) {
+        const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse return false;
+        if (close_index + 1 != trimmed.len) return false;
+        const inner = trimmed[1..close_index];
+        const separator = findTopLevelHeaderScalar(inner, ';') orelse return false;
+        return solveBuiltinEqHashInner(active, module_id, std.mem.trim(u8, inner[0..separator], " \t"), contract, visiting, signature_resolver);
+    }
+
+    if (isKnownStandardEqHashFamily(active, module_id, trimmed, contract, visiting, signature_resolver)) return true;
+
+    const base_name = baseTypeName(trimmed);
+    const builtin = types.Builtin.fromName(base_name);
+    if (builtinEqHashSatisfies(builtin)) return true;
+    if (types.CAbiAlias.fromName(base_name)) |alias| return alias != .c_void;
+    if (std.mem.eql(u8, base_name, "Char") or
+        std.mem.eql(u8, base_name, "IndexRange") or
+        std.mem.eql(u8, base_name, "Bytes"))
+    {
+        return true;
+    }
+
+    for (visiting.items) |existing| {
+        if (std.mem.eql(u8, existing, base_name)) return false;
+    }
+    visiting.append(base_name) catch return false;
+    defer _ = visiting.pop();
+
+    const item_id = resolveItemByName(active, module_id, base_name) orelse return false;
+    const checked = signature_resolver(active, item_id) catch return false;
+    return switch (checked.facts) {
+        .type_alias => |alias| solveBuiltinEqHashInner(active, checked.module_id, alias.target_type_name, contract, visiting, signature_resolver),
+        else => false,
+    };
+}
+
+fn builtinEqHashSatisfies(builtin: types.Builtin) bool {
+    return switch (builtin) {
+        .unit, .bool, .i32, .u32, .index, .isize, .str => true,
+        .unsupported => false,
+    };
+}
+
+fn isKnownStandardEqHashFamily(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    raw_type_name: []const u8,
+    contract: EqHashContract,
+    visiting: *std.array_list.Managed([]const u8),
+    signature_resolver: SignatureResolver,
+) bool {
+    const base_name = baseTypeName(raw_type_name);
+    const open_index = std.mem.indexOfScalar(u8, raw_type_name, '[') orelse return false;
+    const close_index = findMatchingDelimiter(raw_type_name, open_index, '[', ']') orelse return false;
+    if (close_index + 1 != raw_type_name.len) return false;
+    const parts = typed_text.splitTopLevelCommaParts(active.allocator, raw_type_name[open_index + 1 .. close_index]) catch return false;
+    defer active.allocator.free(parts);
+
+    if (std.mem.eql(u8, base_name, "Option")) {
+        return parts.len == 1 and solveBuiltinEqHashInner(active, module_id, parts[0], contract, visiting, signature_resolver);
+    }
+    if (std.mem.eql(u8, base_name, "Result")) {
+        return parts.len == 2 and
+            solveBuiltinEqHashInner(active, module_id, parts[0], contract, visiting, signature_resolver) and
+            solveBuiltinEqHashInner(active, module_id, parts[1], contract, visiting, signature_resolver);
+    }
+    return false;
 }
 
 fn isKnownStandardSendFamily(
@@ -893,6 +1038,8 @@ fn reportTraitCycle(active: *session.Session, key: query_types.TraitGoalKey) !vo
 fn traitHeadLabel(active: *const session.Session, head: query_types.CanonicalTraitHead) []const u8 {
     return switch (head) {
         .builtin_send => "Send",
+        .builtin_eq => "Eq",
+        .builtin_hash => "Hash",
         .trait_item => |trait_id| blk: {
             const trait_entry = active.semantic_index.traitEntry(trait_id);
             break :blk active.item(trait_entry.item_id).name;
@@ -936,6 +1083,8 @@ pub fn canonicalTraitHead(
 ) !query_types.CanonicalTraitHead {
     const name = baseTypeName(raw_trait_name);
     if (std.mem.eql(u8, name, "Send")) return .builtin_send;
+    if (std.mem.eql(u8, name, "Eq")) return .builtin_eq;
+    if (std.mem.eql(u8, name, "Hash")) return .builtin_hash;
     if (findTraitIdByName(active, module_id, name)) |trait_id| return .{ .trait_item = trait_id };
     return .{ .opaque_name = try active.internName(name) };
 }
@@ -986,7 +1135,7 @@ fn traitSignatureByHead(
                 else => null,
             };
         },
-        .builtin_send, .opaque_name => null,
+        .builtin_send, .builtin_eq, .builtin_hash, .opaque_name => null,
     };
 }
 
@@ -1118,6 +1267,8 @@ pub fn traitHeadsEqual(lhs: query_types.CanonicalTraitHead, rhs: query_types.Can
     if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
     return switch (lhs) {
         .builtin_send => true,
+        .builtin_eq => true,
+        .builtin_hash => true,
         .trait_item => |trait_id| trait_id.index == rhs.trait_item.index,
         .opaque_name => |name| name == rhs.opaque_name,
     };

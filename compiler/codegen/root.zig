@@ -1,18 +1,16 @@
 const std = @import("std");
 const array_list = std.array_list;
+const c_va_list = @import("../abi/c/va_list.zig");
+const backend_contract = @import("../backend_contract/root.zig");
 const diag = @import("../diag/root.zig");
-const mir = @import("../mir/root.zig");
 const runtime = @import("../runtime/root.zig");
+const dynamic_library = runtime.dynamic_library;
+const raw_pointer = @import("../raw_pointer/root.zig");
 const source = @import("../source/root.zig");
-const callable_types = @import("../typed/callable_types.zig");
-const typed_text = @import("../typed/text.zig");
-const typed = @import("../typed/root.zig");
-const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
-const parseCallableTypeName = callable_types.parseCallableTypeName;
-const shallowTypeRefFromName = callable_types.shallowTypeRefFromName;
+const program = backend_contract.program;
 
-pub const summary = "MIR-stage lowering to the stage0 C backend.";
+pub const summary = "Backend-contract lowering to the stage0 C backend.";
 pub const backend = "c";
 
 pub const OutputKind = enum {
@@ -23,21 +21,31 @@ pub const OutputKind = enum {
 pub fn emitCModule(
     allocator: Allocator,
     product_name: []const u8,
-    module: *const mir.Module,
+    lowered_module: *const backend_contract.LoweredModule,
     kind: OutputKind,
     diagnostics: *diag.Bag,
 ) ![]const u8 {
+    const module = if (lowered_module.program) |*program_descriptors| program_descriptors else {
+        try diagnostics.add(.@"error", "codegen.contract.program", null, "backend contract is missing lowered program descriptors", .{});
+        return error.CodegenFailed;
+    };
+
     var out = array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
 
     try out.appendSlice("/* stage0 generated C backend for product: ");
     try out.appendSlice(product_name);
     try out.appendSlice(" */\n");
-    try out.appendSlice("#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <stdlib.h>\n\n");
+    try out.appendSlice("#include <stdarg.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <stdlib.h>\n\n");
     try out.appendSlice("#if defined(_WIN32)\n#define RUNA_EXPORT __declspec(dllexport)\n#else\n#define RUNA_EXPORT\n#endif\n\n");
     const abort_support = try runtime.abort.renderAbortSupport(allocator);
     defer allocator.free(abort_support);
     try out.appendSlice(abort_support);
+    if (runtimeRequirementEnabled(lowered_module, .dynamic_library_hooks)) {
+        const dynamic_support = try dynamic_library.renderSupport(allocator);
+        defer allocator.free(dynamic_support);
+        try out.appendSlice(dynamic_support);
+    }
 
     try emitNominalDefinitions(allocator, &out, module, diagnostics);
     if (hasNominalItems(module)) try out.appendSlice("\n");
@@ -52,7 +60,7 @@ pub fn emitCModule(
 
     for (module.items.items) |item| {
         switch (item.payload) {
-            .function => |function| try emitFunctionPrototype(allocator, &out, module, &item, &function, diagnostics),
+            .function => |function| try emitFunctionPrototype(allocator, &out, lowered_module, module, &item, &function, diagnostics),
             else => {},
         }
     }
@@ -61,13 +69,13 @@ pub fn emitCModule(
 
     for (module.items.items) |item| {
         switch (item.payload) {
-            .function => |function| try emitFunctionDefinition(allocator, &out, module, &item, &function, diagnostics),
+            .function => |function| try emitFunctionDefinition(allocator, &out, lowered_module, module, &item, &function, diagnostics),
             else => {},
         }
     }
 
     switch (kind) {
-        .bin => try emitMainWrapper(allocator, &out, module, diagnostics),
+        .bin => try emitMainWrapper(allocator, &out, lowered_module, module, diagnostics),
         .cdylib => {},
     }
 
@@ -77,9 +85,9 @@ pub fn emitCModule(
 fn emitConstDefinition(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    item: *const mir.Item,
-    const_item: *const mir.ConstData,
+    module: *const program.Module,
+    item: *const program.Item,
+    const_item: *const program.ConstData,
     diagnostics: *diag.Bag,
 ) !void {
     try out.appendSlice("static const ");
@@ -94,8 +102,8 @@ fn emitConstDefinition(
 fn emitConstExpr(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    expr: *const mir.ConstExpr,
+    module: *const program.Module,
+    expr: *const program.ConstExpr,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) anyerror!void {
@@ -150,7 +158,7 @@ fn emitConstExpr(
         .conversion => |conversion| {
             if (conversion.mode == .explicit_checked) return emitUnsupportedConstExpr(diagnostics, span, "checked conversion const expression");
             try out.appendSlice("((");
-            try out.appendSlice(conversion.target_type.cName());
+            try out.appendSlice(backend_contract.cBuiltinTypeName(conversion.target_type));
             try out.appendSlice(")");
             try emitConstExpr(allocator, out, module, conversion.operand, diagnostics, span);
             try out.appendSlice(")");
@@ -204,7 +212,7 @@ fn emitUnsupportedConstExpr(diagnostics: *diag.Bag, span: ?source.Span, label: [
 fn emitConstValue(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    value: mir.ConstValue,
+    value: program.ConstValue,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) anyerror!void {
@@ -241,15 +249,16 @@ fn emitConstValue(
 fn emitFunctionPrototype(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    item: *const mir.Item,
-    function: *const mir.FunctionData,
+    lowered: *const backend_contract.LoweredModule,
+    module: *const program.Module,
+    item: *const program.Item,
+    function: *const program.FunctionData,
     diagnostics: *diag.Bag,
 ) !void {
-    _ = allocator;
-    if (function.foreign) {
+    const linkage = functionLinkage(lowered, item.name);
+    if (linkage == .foreign_import) {
         try out.appendSlice("extern ");
-    } else if (function.export_name != null) {
+    } else if (linkage == .foreign_export) {
         try out.appendSlice("RUNA_EXPORT ");
     } else {
         try out.appendSlice("static ");
@@ -257,41 +266,60 @@ fn emitFunctionPrototype(
 
     try emitValueTypeName(out, module, function.return_type, diagnostics, item.span);
     try out.appendSlice(" ");
-    try appendFunctionSymbol(out, item, function);
+    try appendFunctionSymbol(out, item, linkage);
     try out.appendSlice("(");
-    try emitParameterList(out, module, function, diagnostics, item.span);
+    try emitParameterList(allocator, out, module, function, diagnostics, item.span);
     try out.appendSlice(");\n");
 }
 
 fn emitFunctionDefinition(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    item: *const mir.Item,
-    function: *const mir.FunctionData,
+    lowered: *const backend_contract.LoweredModule,
+    module: *const program.Module,
+    item: *const program.Item,
+    function: *const program.FunctionData,
     diagnostics: *diag.Bag,
 ) !void {
-    if (function.foreign) return;
+    const linkage = functionLinkage(lowered, item.name);
+    if (linkage == .foreign_import) return;
 
-    if (function.export_name != null) {
+    if (linkage == .foreign_export) {
         try out.appendSlice("RUNA_EXPORT ");
     } else {
         try out.appendSlice("static ");
     }
     try emitValueTypeName(out, module, function.return_type, diagnostics, item.span);
     try out.appendSlice(" ");
-    try appendFunctionSymbol(out, item, function);
+    try appendFunctionSymbol(out, item, linkage);
     try out.appendSlice("(");
-    try emitParameterList(out, module, function, diagnostics, item.span);
+    try emitParameterList(allocator, out, module, function, diagnostics, item.span);
     try out.appendSlice(") {\n");
+    try emitVariadicPrelude(out, function);
     try emitBlockStatements(allocator, out, module, &function.body, function.parameters, &.{}, &.{}, false, diagnostics, item.span, 1);
     try out.appendSlice("}\n\n");
+}
+
+fn emitVariadicPrelude(out: *array_list.Managed(u8), function: *const program.FunctionData) !void {
+    const tail_index = variadicTailIndex(function) orelse return;
+    if (tail_index == 0) return;
+    const tail = function.parameters[tail_index];
+    const local_name = c_va_list.localName(tail.name);
+    const anchor = function.parameters[tail_index - 1].name;
+    try out.appendSlice("    va_list ");
+    try out.appendSlice(local_name);
+    try out.appendSlice(";\n    va_start(");
+    try out.appendSlice(local_name);
+    try out.appendSlice(", ");
+    try out.appendSlice(anchor);
+    try out.appendSlice(");\n");
 }
 
 fn emitMainWrapper(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
+    lowered: *const backend_contract.LoweredModule,
+    module: *const program.Module,
     diagnostics: *diag.Bag,
 ) !void {
     const entry = findNamedFunction(module, "main") orelse {
@@ -310,53 +338,70 @@ fn emitMainWrapper(
         return error.CodegenFailed;
     }
 
-    switch (function.return_type) {
-        .builtin => |builtin| switch (builtin) {
-            .unit, .i32 => {},
-            else => {
-                try diagnostics.add(.@"error", "codegen.main.return", item.span, "stage0 entry 'main' must return Unit or I32", .{});
-                return error.CodegenFailed;
-            },
-        },
+    const wrapper_return_type = function.return_type.builtin orelse {
+        try diagnostics.add(.@"error", "codegen.main.return", item.span, "stage0 entry 'main' must return Unit or I32", .{});
+        return error.CodegenFailed;
+    };
+    switch (wrapper_return_type) {
+        .unit, .i32 => {},
         else => {
             try diagnostics.add(.@"error", "codegen.main.return", item.span, "stage0 entry 'main' must return Unit or I32", .{});
             return error.CodegenFailed;
         },
     }
 
-    const wrapper_return_type = switch (function.return_type) {
-        .builtin => |builtin| builtin,
-        else => unreachable,
-    };
-
     var symbol = array_list.Managed(u8).init(allocator);
     defer symbol.deinit();
-    try appendFunctionSymbol(&symbol, item, function);
+    try appendFunctionSymbol(&symbol, item, functionLinkage(lowered, item.name));
     const wrapper = try runtime.entry.renderMainWrapper(allocator, symbol.items, wrapper_return_type);
     defer allocator.free(wrapper);
     try out.appendSlice(wrapper);
 }
 
 fn emitParameterList(
+    allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    function: *const mir.FunctionData,
+    module: *const program.Module,
+    function: *const program.FunctionData,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) !void {
+    _ = allocator;
+    const tail_index = variadicTailIndex(function);
+    var emitted_count: usize = 0;
     for (function.parameters, 0..) |parameter, index| {
-        if (index != 0) try out.appendSlice(", ");
+        if (tail_index != null and index == tail_index.?) continue;
+        if (emitted_count != 0) try out.appendSlice(", ");
+        if (isCallableValueType(parameter.ty)) {
+            try emitCallableDeclarator(out, parameter.ty, parameter.name);
+            emitted_count += 1;
+            continue;
+        }
         try emitParameterTypeName(out, module, parameter, diagnostics, span);
         try out.appendSlice(" ");
         try out.appendSlice(parameter.name);
+        emitted_count += 1;
     }
-    if (function.parameters.len == 0) try out.appendSlice("void");
+    if (tail_index != null) {
+        if (emitted_count != 0) try out.appendSlice(", ");
+        try out.appendSlice("...");
+    } else if (emitted_count == 0) {
+        try out.appendSlice("void");
+    }
+}
+
+fn variadicTailIndex(function: *const program.FunctionData) ?usize {
+    if (function.parameters.len == 0) return null;
+    const last_index = function.parameters.len - 1;
+    const last = function.parameters[last_index];
+    if (std.mem.startsWith(u8, last.name, "...")) return last_index;
+    return null;
 }
 
 fn emitParameterTypeName(
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter: mir.Parameter,
+    module: *const program.Module,
+    parameter: program.Parameter,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) !void {
@@ -367,7 +412,7 @@ fn emitParameterTypeName(
     }
 }
 
-fn isBorrowParameter(parameters: []const mir.Parameter, name: []const u8) bool {
+fn isBorrowParameter(parameters: []const program.Parameter, name: []const u8) bool {
     for (parameters) |parameter| {
         if (!std.mem.eql(u8, parameter.name, name)) continue;
         return switch (parameter.mode) {
@@ -381,9 +426,9 @@ fn isBorrowParameter(parameters: []const mir.Parameter, name: []const u8) bool {
 fn emitBorrowArgument(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
-    expr: *const mir.Expr,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    expr: *const program.Expr,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) anyerror!void {
@@ -400,19 +445,19 @@ fn emitBorrowArgument(
                 try out.appendSlice(name);
             }
         },
-        .field => {
+        .field, .index => {
             try out.appendSlice("&(");
             try emitExpr(allocator, out, module, parameter_context, expr, false, diagnostics, span);
             try out.appendSlice(")");
         },
         else => {
-            try diagnostics.add(.@"error", "codegen.call.borrow_arg", span, "borrow arguments must be plain locals or field projections in stage0", .{});
+            try diagnostics.add(.@"error", "codegen.call.borrow_arg", span, "borrow arguments must be plain locals, fields, or array element projections in stage0", .{});
             return error.CodegenFailed;
         },
     }
 }
 
-fn emitRenderedAssignTarget(out: *array_list.Managed(u8), rendered_name: []const u8, parameter_context: []const mir.Parameter) !void {
+fn emitRenderedAssignTarget(out: *array_list.Managed(u8), rendered_name: []const u8, parameter_context: []const program.Parameter) !void {
     if (std.mem.indexOfScalar(u8, rendered_name, '.')) |dot_index| {
         const base_name = rendered_name[0..dot_index];
         if (isBorrowParameter(parameter_context, base_name)) {
@@ -432,88 +477,264 @@ fn emitRenderedAssignTarget(out: *array_list.Managed(u8), rendered_name: []const
     try out.appendSlice(rendered_name);
 }
 
-fn emitCallableBindingDecl(
+fn isCVaListCopyExpr(expr: *const program.Expr) bool {
+    return switch (expr.node) {
+        .call => |call| std.mem.eql(u8, call.callee, c_va_list.copy_callee),
+        else => false,
+    };
+}
+
+fn emitCVaListCopyBinding(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    ty: types.TypeRef,
+    module: *const program.Module,
+    ty: program.ValueType,
     name: []const u8,
-    expr: *const mir.Expr,
-    is_const: bool,
-    parameter_context: []const mir.Parameter,
+    expr: *const program.Expr,
+    parameter_context: []const program.Parameter,
     diagnostics: *diag.Bag,
     span: ?source.Span,
     indent_level: usize,
 ) !bool {
-    const callable_type_name = switch (ty) {
-        .named => |type_name| type_name,
-        else => return false,
-    };
-    const callable = try parseCallableTypeName(callable_type_name, allocator) orelse return false;
-
+    if (ty.kind != .c_va_list) return false;
+    if (!isCVaListCopyExpr(expr)) return false;
+    const call = expr.node.call;
+    if (call.args.len != 1) {
+        try diagnostics.add(.@"error", "codegen.valist.copy_arity", span, "CVaList.copy expects one source list", .{});
+        return error.CodegenFailed;
+    }
     try appendIndent(out, indent_level);
-    try emitValueTypeName(out, module, shallowTypeRefFromName(callable.output_type_name), diagnostics, span);
+    try out.appendSlice("va_list ");
+    try out.appendSlice(name);
+    try out.appendSlice(";\n");
+    try appendIndent(out, indent_level);
+    try out.appendSlice("va_copy(");
+    try out.appendSlice(name);
+    try out.appendSlice(", ");
+    try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+    try out.appendSlice(");\n");
+    return true;
+}
+
+fn isCallableValueType(ty: program.ValueType) bool {
+    return ty.callable != null;
+}
+
+fn emitCallableDeclarator(
+    out: *array_list.Managed(u8),
+    ty: program.ValueType,
+    name: []const u8,
+) !void {
+    const callable = ty.callable orelse return error.CodegenFailed;
+    try emitValueTypeName(out, null, callable.return_type.*, null, null);
     try out.appendSlice(" (*");
-    if (is_const) try out.appendSlice("const ");
     try out.appendSlice(name);
     try out.appendSlice(")(");
-    try emitCallableInputParameterList(allocator, out, module, callable.input_type_name, diagnostics, span);
-    try out.appendSlice(") = ");
+    try emitCallableParameterList(out, callable);
+    try out.appendSlice(")");
+}
+
+fn emitCallableCast(
+    out: *array_list.Managed(u8),
+    ty: program.ValueType,
+) !bool {
+    const callable = ty.callable orelse return false;
+    try out.appendSlice("((");
+    try emitValueTypeName(out, null, callable.return_type.*, null, null);
+    try out.appendSlice(" (*)(");
+    try emitCallableParameterList(out, callable);
+    try out.appendSlice("))");
+    return true;
+}
+
+fn emitCallableBindingDecl(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    ty: program.ValueType,
+    name: []const u8,
+    expr: *const program.Expr,
+    is_const: bool,
+    parameter_context: []const program.Parameter,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+    indent_level: usize,
+) !bool {
+    if (!isCallableValueType(ty)) return false;
+    try appendIndent(out, indent_level);
+    const rendered_name = if (is_const) try std.fmt.allocPrint(allocator, "const {s}", .{name}) else name;
+    defer if (is_const) allocator.free(rendered_name);
+    try emitCallableDeclarator(out, ty, rendered_name);
+    try out.appendSlice(" = ");
     try emitExpr(allocator, out, module, parameter_context, expr, false, diagnostics, span);
     try out.appendSlice(";\n");
     return true;
 }
 
-fn emitCallableInputParameterList(
-    allocator: Allocator,
+fn emitCallableParameterList(
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    input_type_name: []const u8,
-    diagnostics: *diag.Bag,
-    span: ?source.Span,
+    callable: program.CallableType,
 ) !void {
-    const parts = try callableInputTypeParts(allocator, input_type_name);
-    defer allocator.free(parts);
-    if (parts.len == 0) {
+    if (callable.parameters.len == 0 and !callable.variadic) {
         try out.appendSlice("void");
         return;
     }
-    for (parts, 0..) |part, index| {
+    for (callable.parameters, 0..) |parameter_type, index| {
         if (index != 0) try out.appendSlice(", ");
-        try emitValueTypeName(out, module, shallowTypeRefFromName(part), diagnostics, span);
+        try emitValueTypeName(out, null, parameter_type, null, null);
+    }
+    if (callable.variadic) {
+        if (callable.parameters.len != 0) try out.appendSlice(", ");
+        try out.appendSlice("...");
     }
 }
 
-fn callableInputTypeParts(allocator: Allocator, input_type_name: []const u8) ![][]const u8 {
-    const trimmed = std.mem.trim(u8, input_type_name, " \t");
-    if (std.mem.eql(u8, trimmed, "Unit")) return allocator.alloc([]const u8, 0);
-
-    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
-        const inside = trimmed[1 .. trimmed.len - 1];
-        if (hasTopLevelComma(inside)) return typed_text.splitTopLevelCommaParts(allocator, inside);
-    }
-
-    const parts = try allocator.alloc([]const u8, 1);
-    parts[0] = trimmed;
-    return parts;
-}
-
-fn hasTopLevelComma(raw: []const u8) bool {
-    var paren_depth: usize = 0;
-    var bracket_depth: usize = 0;
-    for (raw) |byte| {
-        switch (byte) {
-            '(' => paren_depth += 1,
-            ')' => {
-                if (paren_depth > 0) paren_depth -= 1;
-            },
-            '[' => bracket_depth += 1,
-            ']' => {
-                if (bracket_depth > 0) bracket_depth -= 1;
-            },
-            ',' => if (paren_depth == 0 and bracket_depth == 0) return true,
-            else => {},
+fn emitCVaListOperationExpr(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    expr: *const program.Expr,
+    call: program.Expr.Call,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+) anyerror!void {
+    if (std.mem.eql(u8, call.callee, c_va_list.next_callee)) {
+        if (call.args.len != 1) {
+            try diagnostics.add(.@"error", "codegen.valist.next_arity", span, "CVaList.next expects one source list", .{});
+            return error.CodegenFailed;
         }
+        try out.appendSlice("va_arg(");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(", ");
+        try emitValueTypeName(out, module, expr.ty, diagnostics, span);
+        try out.appendSlice(")");
+        return;
+    }
+    if (std.mem.eql(u8, call.callee, c_va_list.finish_callee)) {
+        if (call.args.len != 1) {
+            try diagnostics.add(.@"error", "codegen.valist.finish_arity", span, "CVaList.finish expects one source list", .{});
+            return error.CodegenFailed;
+        }
+        try out.appendSlice("va_end(");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(")");
+        return;
+    }
+    try diagnostics.add(.@"error", "codegen.valist.copy_expr", span, "CVaList.copy must bind to a local in stage0", .{});
+    return error.CodegenFailed;
+}
+
+fn emitDynamicLibraryExpr(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    expr: *const program.Expr,
+    call: program.Expr.Call,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+) anyerror!bool {
+    if (!dynamic_library.isLeafCallee(call.callee)) return false;
+
+    if (std.mem.eql(u8, call.callee, dynamic_library.lookup_callee)) {
+        if (call.args.len != 2) {
+            try diagnostics.add(.@"error", "codegen.dynamic.lookup_arity", span, "lookup_symbol expects a library and symbol name", .{});
+            return error.CodegenFailed;
+        }
+        if (!try emitCallableCast(out, expr.ty)) {
+            if (expr.ty.kind == .raw_pointer) {
+                try out.appendSlice("((");
+                try emitValueTypeName(out, module, expr.ty, diagnostics, span);
+                try out.appendSlice(")");
+            } else {
+                try diagnostics.add(.@"error", "codegen.dynamic.lookup_type", span, "lookup_symbol result must be a foreign function pointer or raw pointer", .{});
+                return error.CodegenFailed;
+            }
+        }
+        try out.appendSlice(dynamic_library.lookup_callee);
+        try out.appendSlice("(");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(", ");
+        try emitExpr(allocator, out, module, parameter_context, call.args[1], false, diagnostics, span);
+        try out.appendSlice(")");
+        try out.appendSlice(")");
+        return true;
+    }
+
+    try out.appendSlice(call.callee);
+    try out.appendSlice("(");
+    for (call.args, 0..) |arg, index| {
+        if (index != 0) try out.appendSlice(", ");
+        try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span);
+    }
+    try out.appendSlice(")");
+    return true;
+}
+
+fn emitRawPointerExpr(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    expr: *const program.Expr,
+    call: program.Expr.Call,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+) anyerror!bool {
+    if (!raw_pointer.isLeafCallee(call.callee)) return false;
+    if (std.mem.eql(u8, call.callee, raw_pointer.address_read_callee) or
+        std.mem.eql(u8, call.callee, raw_pointer.address_edit_callee))
+    {
+        if (call.args.len != 1) {
+            try diagnostics.add(.@"error", "codegen.raw_pointer.address_arity", span, "raw pointer formation expects one place", .{});
+            return error.CodegenFailed;
+        }
+        try out.appendSlice("(&");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(")");
+        return true;
+    }
+    if (std.mem.eql(u8, call.callee, raw_pointer.is_null_callee)) {
+        if (call.args.len != 1) return error.CodegenFailed;
+        try out.appendSlice("(");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(" == NULL)");
+        return true;
+    }
+    if (std.mem.eql(u8, call.callee, raw_pointer.cast_callee)) {
+        if (call.args.len != 1) return error.CodegenFailed;
+        try out.appendSlice("((");
+        try emitValueTypeName(out, module, expr.ty, diagnostics, span);
+        try out.appendSlice(")");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(")");
+        return true;
+    }
+    if (std.mem.eql(u8, call.callee, raw_pointer.offset_callee)) {
+        if (call.args.len != 2) return error.CodegenFailed;
+        try out.appendSlice("(");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(" + ");
+        try emitExpr(allocator, out, module, parameter_context, call.args[1], false, diagnostics, span);
+        try out.appendSlice(")");
+        return true;
+    }
+    if (std.mem.eql(u8, call.callee, raw_pointer.load_callee)) {
+        if (call.args.len != 1) return error.CodegenFailed;
+        try out.appendSlice("(*");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(")");
+        return true;
+    }
+    if (std.mem.eql(u8, call.callee, raw_pointer.store_callee)) {
+        if (call.args.len != 2) return error.CodegenFailed;
+        try out.appendSlice("(*");
+        try emitExpr(allocator, out, module, parameter_context, call.args[0], false, diagnostics, span);
+        try out.appendSlice(" = ");
+        try emitExpr(allocator, out, module, parameter_context, call.args[1], false, diagnostics, span);
+        try out.appendSlice(")");
+        return true;
     }
     return false;
 }
@@ -521,9 +742,9 @@ fn hasTopLevelComma(raw: []const u8) bool {
 fn emitExpr(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
-    expr: *const mir.Expr,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    expr: *const program.Expr,
     global_const_context: bool,
     diagnostics: *diag.Bag,
     span: ?source.Span,
@@ -537,13 +758,9 @@ fn emitExpr(
         .bool_lit => |value| try out.appendSlice(if (value) "true" else "false"),
         .string => |value| try appendEscapedCString(out, value),
         .identifier => |name| {
-            const callable = switch (expr.ty) {
-                .named => |type_name| try parseCallableTypeName(type_name, allocator),
-                else => null,
-            };
-            if (callable != null) {
+            if (isCallableValueType(expr.ty)) {
                 if (findNamedFunction(module, name)) |target| {
-                    try appendFunctionSymbol(out, target.item, target.function);
+                    try appendFunctionSymbol(out, target.item, target.function.linkage);
                     return;
                 }
                 if (findImportedFunction(module, name)) |binding| {
@@ -591,6 +808,10 @@ fn emitExpr(
             try out.appendSlice(field.field_name);
             try out.appendSlice(")");
         },
+        .tuple => {
+            try diagnostics.add(.@"error", "codegen.tuple.expr", span, "stage0 C codegen does not emit tuple expressions yet", .{});
+            return error.CodegenFailed;
+        },
         .array => |array| {
             try out.appendSlice("{");
             for (array.items, 0..) |item, index| {
@@ -636,18 +857,28 @@ fn emitExpr(
                 try diagnostics.add(.@"error", "codegen.const.call", span, "stage0 const initializers do not support call expressions in generated C", .{});
                 return error.CodegenFailed;
             }
+            if (try emitDynamicLibraryExpr(allocator, out, module, parameter_context, expr, call, diagnostics, span)) {
+                return;
+            }
+            if (try emitRawPointerExpr(allocator, out, module, parameter_context, expr, call, diagnostics, span)) {
+                return;
+            }
+            if (c_va_list.isOperationCallee(call.callee)) {
+                try emitCVaListOperationExpr(allocator, out, module, parameter_context, expr, call, diagnostics, span);
+                return;
+            }
             if (findNamedFunction(module, call.callee)) |target| {
-                try appendFunctionSymbol(out, target.item, target.function);
+                try appendFunctionSymbol(out, target.item, target.function.linkage);
                 try out.appendSlice("(");
                 for (call.args, 0..) |arg, index| {
                     if (index != 0) try out.appendSlice(", ");
-                    const mode = if (index < target.function.parameters.len)
-                        target.function.parameters[index].mode
-                    else
-                        typed.ParameterMode.owned;
-                    switch (mode) {
-                        .read, .edit => try emitBorrowArgument(allocator, out, module, parameter_context, arg, diagnostics, span),
-                        .owned, .take => try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span),
+                    if (index < target.function.parameters.len) {
+                        switch (target.function.parameters[index].mode) {
+                            .read, .edit => try emitBorrowArgument(allocator, out, module, parameter_context, arg, diagnostics, span),
+                            .owned, .take => try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span),
+                        }
+                    } else {
+                        try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span);
                     }
                 }
             } else if (findImportedFunction(module, call.callee)) |binding| {
@@ -655,13 +886,17 @@ fn emitExpr(
                 try out.appendSlice("(");
                 for (call.args, 0..) |arg, index| {
                     if (index != 0) try out.appendSlice(", ");
-                    const mode = if (binding.function_parameter_modes) |modes|
-                        if (index < modes.len) modes[index] else typed.ParameterMode.owned
-                    else
-                        typed.ParameterMode.owned;
-                    switch (mode) {
-                        .read, .edit => try emitBorrowArgument(allocator, out, module, parameter_context, arg, diagnostics, span),
-                        .owned, .take => try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span),
+                    if (binding.function_parameter_modes) |modes| {
+                        if (index < modes.len) {
+                            switch (modes[index]) {
+                                .read, .edit => try emitBorrowArgument(allocator, out, module, parameter_context, arg, diagnostics, span),
+                                .owned, .take => try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span),
+                            }
+                        } else {
+                            try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span);
+                        }
+                    } else {
+                        try emitExpr(allocator, out, module, parameter_context, arg, false, diagnostics, span);
                     }
                 }
             } else {
@@ -708,9 +943,9 @@ fn emitExpr(
 fn emitDeferredExprs(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
-    deferred: []const *const mir.Expr,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    deferred: []const *const program.Expr,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) !void {
@@ -726,11 +961,11 @@ fn emitDeferredExprs(
 fn emitSelectStatement(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
-    select_data: *const mir.Statement.SelectData,
-    return_deferred: []const *const mir.Expr,
-    loop_deferred: []const *const mir.Expr,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    select_data: *const program.Statement.SelectData,
+    return_deferred: []const *const program.Expr,
+    loop_deferred: []const *const program.Expr,
     in_loop: bool,
     diagnostics: *diag.Bag,
     span: ?source.Span,
@@ -784,17 +1019,17 @@ fn emitSelectStatement(
 fn emitBlockStatements(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    block: *const mir.Block,
-    parameter_context: []const mir.Parameter,
-    return_deferred: []const *const mir.Expr,
-    loop_deferred: []const *const mir.Expr,
+    module: *const program.Module,
+    block: *const program.Block,
+    parameter_context: []const program.Parameter,
+    return_deferred: []const *const program.Expr,
+    loop_deferred: []const *const program.Expr,
     in_loop: bool,
     diagnostics: *diag.Bag,
     span: ?source.Span,
     indent_level: usize,
 ) anyerror!void {
-    var scoped_deferred = array_list.Managed(*const mir.Expr).init(allocator);
+    var scoped_deferred = array_list.Managed(*const program.Expr).init(allocator);
     defer scoped_deferred.deinit();
 
     for (block.statements.items) |statement| {
@@ -804,6 +1039,9 @@ fn emitBlockStatements(
                 try out.appendSlice("runa_abort();\n");
             },
             .let_decl => |binding| {
+                if (try emitCVaListCopyBinding(allocator, out, module, binding.ty, binding.name, binding.expr, parameter_context, diagnostics, span, indent_level)) {
+                    continue;
+                }
                 if (try emitCallableBindingDecl(allocator, out, module, binding.ty, binding.name, binding.expr, false, parameter_context, diagnostics, span, indent_level)) {
                     continue;
                 }
@@ -816,6 +1054,10 @@ fn emitBlockStatements(
                 try out.appendSlice(";\n");
             },
             .const_decl => |binding| {
+                if (isCVaListCopyExpr(binding.expr)) {
+                    try diagnostics.add(.@"error", "codegen.valist.const_copy", span, "CVaList.copy must bind to a mutable local in stage0", .{});
+                    return error.CodegenFailed;
+                }
                 if (try emitCallableBindingDecl(allocator, out, module, binding.ty, binding.name, binding.expr, true, parameter_context, diagnostics, span, indent_level)) {
                     continue;
                 }
@@ -929,10 +1171,10 @@ fn emitBlockStatements(
 fn emitLoopStatement(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
-    loop_data: *const mir.Statement.LoopData,
-    return_deferred: []const *const mir.Expr,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    loop_data: *const program.Statement.LoopData,
+    return_deferred: []const *const program.Expr,
     diagnostics: *diag.Bag,
     span: ?source.Span,
     indent_level: usize,
@@ -954,9 +1196,9 @@ fn emitLoopStatement(
 fn emitDeferredExprsIndented(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
-    deferred: []const *const mir.Expr,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    deferred: []const *const program.Expr,
     diagnostics: *diag.Bag,
     span: ?source.Span,
     indent_level: usize,
@@ -979,25 +1221,21 @@ fn appendIndent(out: *array_list.Managed(u8), indent_level: usize) !void {
 
 fn combineDeferredExprs(
     allocator: Allocator,
-    outer: []const *const mir.Expr,
-    local: []const *const mir.Expr,
-) ![]const *const mir.Expr {
-    const combined = try allocator.alloc(*const mir.Expr, outer.len + local.len);
+    outer: []const *const program.Expr,
+    local: []const *const program.Expr,
+) ![]const *const program.Expr {
+    const combined = try allocator.alloc(*const program.Expr, outer.len + local.len);
     @memcpy(combined[0..outer.len], outer);
     @memcpy(combined[outer.len..], local);
     return combined;
 }
 
-fn appendFunctionSymbol(out: *array_list.Managed(u8), item: *const mir.Item, function: *const mir.FunctionData) !void {
-    if (function.foreign) {
-        try out.appendSlice(item.name);
-        return;
+fn appendFunctionSymbol(out: *array_list.Managed(u8), item: *const program.Item, linkage: FunctionLinkage) !void {
+    switch (linkage) {
+        .foreign_import => try out.appendSlice(item.name),
+        .foreign_export => |name| try out.appendSlice(name),
+        .internal => try appendFunctionSymbolName(out, item.symbol_name),
     }
-    if (function.export_name) |name| {
-        try out.appendSlice(name);
-        return;
-    }
-    try appendFunctionSymbolName(out, item.symbol_name);
 }
 
 fn appendFunctionSymbolName(out: *array_list.Managed(u8), symbol_name: []const u8) !void {
@@ -1028,7 +1266,7 @@ fn appendEscapedCString(out: *array_list.Managed(u8), value: []const u8) !void {
 fn emitNominalDefinitions(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
+    module: *const program.Module,
     diagnostics: *diag.Bag,
 ) !void {
     var emitted = std.StringHashMap(void).init(allocator);
@@ -1049,6 +1287,11 @@ fn emitNominalDefinitions(
                     try out.appendSlice(" {\n");
                     for (struct_type.fields) |field| {
                         try out.appendSlice("    ");
+                        if (isCallableValueType(field.ty)) {
+                            try emitCallableDeclarator(out, field.ty, field.name);
+                            try out.appendSlice(";\n");
+                            continue;
+                        }
                         try emitValueTypeName(out, module, field.ty, diagnostics, item.span);
                         try out.appendSlice(" ");
                         try out.appendSlice(field.name);
@@ -1147,32 +1390,32 @@ fn emitNominalDefinitions(
     }
 }
 
-fn structFieldsReady(module: *const mir.Module, emitted: *const std.StringHashMap(void), fields: []const mir.StructField) bool {
+fn structFieldsReady(module: *const program.Module, emitted: *const std.StringHashMap(void), fields: []const program.StructField) bool {
     for (fields) |field| {
-        switch (field.ty) {
-            .builtin, .unsupported => {},
-            .named => |name| {
-                const item = findStructType(module, name) orelse findEnumType(module, name) orelse findOpaqueType(module, name) orelse return false;
-                if (!emitted.contains(item.symbol_name)) return false;
-            },
+        if (valueTypeReady(field.ty)) continue;
+        if (field.ty.kind == .nominal) {
+            const item = findNominalTypeByCName(module, field.ty.c_name) orelse return false;
+            if (!emitted.contains(item.symbol_name)) return false;
+            continue;
         }
+        return false;
     }
     return true;
 }
 
-fn enumVariantsReady(module: *const mir.Module, emitted: *const std.StringHashMap(void), variants: []const mir.EnumVariant) bool {
+fn enumVariantsReady(module: *const program.Module, emitted: *const std.StringHashMap(void), variants: []const program.EnumVariant) bool {
     for (variants) |variant| {
         switch (variant.payload) {
             .none => {},
             .tuple_fields => |tuple_fields| {
                 for (tuple_fields) |field| {
-                    switch (field.ty) {
-                        .builtin, .unsupported => {},
-                        .named => |name| {
-                            const item = findStructType(module, name) orelse findEnumType(module, name) orelse findOpaqueType(module, name) orelse return false;
-                            if (!emitted.contains(item.symbol_name)) return false;
-                        },
+                    if (valueTypeReady(field.ty)) continue;
+                    if (field.ty.kind == .nominal) {
+                        const item = findNominalTypeByCName(module, field.ty.c_name) orelse return false;
+                        if (!emitted.contains(item.symbol_name)) return false;
+                        continue;
                     }
+                    return false;
                 }
             },
             .named_fields => |named_fields| {
@@ -1183,30 +1426,39 @@ fn enumVariantsReady(module: *const mir.Module, emitted: *const std.StringHashMa
     return true;
 }
 
-fn emitBuiltinTypeName(out: *array_list.Managed(u8), ty: types.Builtin) !void {
-    try out.appendSlice(ty.cName());
+fn valueTypeReady(ty: program.ValueType) bool {
+    return switch (ty.kind) {
+        .builtin, .c_abi_alias, .raw_pointer, .callable, .foreign_callable, .dynamic_library, .c_va_list => true,
+        .nominal, .tuple, .unsupported => false,
+    };
 }
 
 fn emitValueTypeName(
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    ty: types.TypeRef,
-    diagnostics: *diag.Bag,
+    module: ?*const program.Module,
+    ty: program.ValueType,
+    diagnostics: ?*diag.Bag,
     span: ?source.Span,
 ) !void {
-    switch (ty) {
-        .builtin => |builtin| try emitBuiltinTypeName(out, builtin),
-        .named => |name| {
-            const item = findStructType(module, name) orelse findEnumType(module, name) orelse findOpaqueType(module, name) orelse {
-                try diagnostics.add(.@"error", "codegen.type.named", span, "stage0 codegen only emits locally declared nominal value types; missing '{s}'", .{baseTypeName(name)});
-                return error.CodegenFailed;
-            };
-            try appendStructTypeName(out, item.symbol_name);
-        },
-        .unsupported => {
-            try diagnostics.add(.@"error", "codegen.type.unsupported", span, "cannot emit unsupported stage0 value type", .{});
+    switch (ty.kind) {
+        .tuple => {
+            if (diagnostics) |bag| try bag.add(.@"error", "codegen.type.tuple", span, "stage0 C codegen does not emit tuple value types yet", .{});
             return error.CodegenFailed;
         },
+        .unsupported => {
+            if (diagnostics) |bag| try bag.add(.@"error", "codegen.type.unsupported", span, "cannot emit unsupported stage0 value type", .{});
+            return error.CodegenFailed;
+        },
+        .nominal => if (module) |program_module| {
+            if (findNominalTypeByCName(program_module, ty.c_name) == null) {
+                if (diagnostics) |bag| try bag.add(.@"error", "codegen.type.named", span, "stage0 codegen only emits lowered nominal value types; missing '{s}'", .{ty.c_name});
+                return error.CodegenFailed;
+            }
+            try out.appendSlice(ty.c_name);
+        } else {
+            try out.appendSlice(ty.c_name);
+        },
+        else => try out.appendSlice(ty.c_name),
     }
 }
 
@@ -1230,11 +1482,11 @@ fn appendEnumVariantTagName(out: *array_list.Managed(u8), enum_symbol: []const u
 fn emitEnumValueLiteral(
     allocator: Allocator,
     out: *array_list.Managed(u8),
-    module: *const mir.Module,
-    parameter_context: []const mir.Parameter,
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
     enum_symbol: []const u8,
     variant_name: []const u8,
-    maybe_args: ?[]*mir.Expr,
+    maybe_args: ?[]*program.Expr,
     diagnostics: *diag.Bag,
     span: ?source.Span,
 ) anyerror!void {
@@ -1315,7 +1567,7 @@ fn emitEnumValueLiteral(
     try out.appendSlice("})");
 }
 
-fn hasConstItems(module: *const mir.Module) bool {
+fn hasConstItems(module: *const program.Module) bool {
     for (module.items.items) |item| {
         switch (item.payload) {
             .const_item => return true,
@@ -1325,11 +1577,11 @@ fn hasConstItems(module: *const mir.Module) bool {
     return false;
 }
 
-fn hasNominalItems(module: *const mir.Module) bool {
+fn hasNominalItems(module: *const program.Module) bool {
     return countNominalItems(module) != 0;
 }
 
-fn enumHasPayload(variants: []const mir.EnumVariant) bool {
+fn enumHasPayload(variants: []const program.EnumVariant) bool {
     for (variants) |variant| {
         switch (variant.payload) {
             .none => {},
@@ -1339,11 +1591,11 @@ fn enumHasPayload(variants: []const mir.EnumVariant) bool {
     return false;
 }
 
-fn countNominalItems(module: *const mir.Module) usize {
+fn countNominalItems(module: *const program.Module) usize {
     return countStructItems(module) + countEnumItems(module) + countOpaqueItems(module);
 }
 
-fn countStructItems(module: *const mir.Module) usize {
+fn countStructItems(module: *const program.Module) usize {
     var count: usize = 0;
     for (module.items.items) |item| {
         switch (item.payload) {
@@ -1354,7 +1606,7 @@ fn countStructItems(module: *const mir.Module) usize {
     return count;
 }
 
-fn countEnumItems(module: *const mir.Module) usize {
+fn countEnumItems(module: *const program.Module) usize {
     var count: usize = 0;
     for (module.items.items) |item| {
         switch (item.payload) {
@@ -1365,7 +1617,7 @@ fn countEnumItems(module: *const mir.Module) usize {
     return count;
 }
 
-fn countOpaqueItems(module: *const mir.Module) usize {
+fn countOpaqueItems(module: *const program.Module) usize {
     var count: usize = 0;
     for (module.items.items) |item| {
         switch (item.payload) {
@@ -1376,7 +1628,7 @@ fn countOpaqueItems(module: *const mir.Module) usize {
     return count;
 }
 
-fn hasFunctionItems(module: *const mir.Module) bool {
+fn hasFunctionItems(module: *const program.Module) bool {
     for (module.items.items) |item| {
         switch (item.payload) {
             .function => return true,
@@ -1386,12 +1638,34 @@ fn hasFunctionItems(module: *const mir.Module) bool {
     return false;
 }
 
+fn runtimeRequirementEnabled(
+    lowered: *const backend_contract.LoweredModule,
+    kind: backend_contract.RuntimeRequirementKind,
+) bool {
+    for (lowered.runtime_requirements) |requirement| {
+        if (requirement.kind == kind) return requirement.required and requirement.supported;
+    }
+    return false;
+}
+
+const FunctionLinkage = program.FunctionLinkage;
+
 const FunctionMatch = struct {
-    item: *const mir.Item,
-    function: *const mir.FunctionData,
+    item: *const program.Item,
+    function: *const program.FunctionData,
 };
 
-fn findNamedFunction(module: *const mir.Module, name: []const u8) ?FunctionMatch {
+fn functionLinkage(lowered: *const backend_contract.LoweredModule, local_name: []const u8) FunctionLinkage {
+    for (lowered.imports) |import_desc| {
+        if (std.mem.eql(u8, import_desc.name, local_name)) return .foreign_import;
+    }
+    for (lowered.exports) |export_desc| {
+        if (std.mem.eql(u8, export_desc.local_name, local_name)) return .{ .foreign_export = export_desc.name };
+    }
+    return .internal;
+}
+
+fn findNamedFunction(module: *const program.Module, name: []const u8) ?FunctionMatch {
     for (module.items.items) |*item| {
         switch (item.payload) {
             .function => |*function| {
@@ -1408,7 +1682,7 @@ fn findNamedFunction(module: *const mir.Module, name: []const u8) ?FunctionMatch
     return null;
 }
 
-fn findConstItem(module: *const mir.Module, name: []const u8) ?*const mir.Item {
+fn findConstItem(module: *const program.Module, name: []const u8) ?*const program.Item {
     for (module.items.items) |*item| {
         switch (item.payload) {
             .const_item => {
@@ -1420,12 +1694,14 @@ fn findConstItem(module: *const mir.Module, name: []const u8) ?*const mir.Item {
     return null;
 }
 
-fn findStructType(module: *const mir.Module, name: []const u8) ?*const mir.Item {
-    const base_name = baseTypeName(name);
+fn findNominalTypeByCName(module: *const program.Module, c_name: []const u8) ?*const program.Item {
+    const prefix = "runa_type_";
+    if (!std.mem.startsWith(u8, c_name, prefix)) return null;
+    const symbol_name = c_name[prefix.len..];
     for (module.items.items) |*item| {
         switch (item.payload) {
-            .struct_type => {
-                if (std.mem.eql(u8, item.name, base_name)) return item;
+            .struct_type, .enum_type, .opaque_type => {
+                if (std.mem.eql(u8, item.symbol_name, symbol_name)) return item;
             },
             else => {},
         }
@@ -1433,33 +1709,7 @@ fn findStructType(module: *const mir.Module, name: []const u8) ?*const mir.Item 
     return null;
 }
 
-fn findEnumType(module: *const mir.Module, name: []const u8) ?*const mir.Item {
-    const base_name = baseTypeName(name);
-    for (module.items.items) |*item| {
-        switch (item.payload) {
-            .enum_type => {
-                if (std.mem.eql(u8, item.name, base_name)) return item;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn findOpaqueType(module: *const mir.Module, name: []const u8) ?*const mir.Item {
-    const base_name = baseTypeName(name);
-    for (module.items.items) |*item| {
-        switch (item.payload) {
-            .opaque_type => {
-                if (std.mem.eql(u8, item.name, base_name)) return item;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn findEnumTypeBySymbol(module: *const mir.Module, symbol_name: []const u8) ?*const mir.Item {
+fn findEnumTypeBySymbol(module: *const program.Module, symbol_name: []const u8) ?*const program.Item {
     for (module.items.items) |*item| {
         switch (item.payload) {
             .enum_type => {
@@ -1471,15 +1721,7 @@ fn findEnumTypeBySymbol(module: *const mir.Module, symbol_name: []const u8) ?*co
     return null;
 }
 
-fn baseTypeName(raw: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (std.mem.indexOfScalar(u8, trimmed, '[')) |open_index| {
-        return std.mem.trim(u8, trimmed[0..open_index], " \t");
-    }
-    return trimmed;
-}
-
-fn findImportedConst(module: *const mir.Module, name: []const u8) ?mir.ImportedBinding {
+fn findImportedConst(module: *const program.Module, name: []const u8) ?program.ImportedBinding {
     for (module.imports.items) |binding| {
         if (binding.const_type == null) continue;
         if (std.mem.eql(u8, binding.local_name, name)) return binding;
@@ -1487,7 +1729,7 @@ fn findImportedConst(module: *const mir.Module, name: []const u8) ?mir.ImportedB
     return null;
 }
 
-fn findImportedFunction(module: *const mir.Module, name: []const u8) ?mir.ImportedBinding {
+fn findImportedFunction(module: *const program.Module, name: []const u8) ?program.ImportedBinding {
     for (module.imports.items) |binding| {
         if (binding.function_return_type == null) continue;
         if (std.mem.eql(u8, binding.local_name, name)) return binding;

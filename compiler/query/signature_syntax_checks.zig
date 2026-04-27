@@ -7,7 +7,6 @@ const item_syntax_bridge = @import("item_syntax_bridge.zig");
 const query_text = @import("text.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_attributes = @import("attributes.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
@@ -26,6 +25,7 @@ pub fn validateItemSyntax(
     switch (item.kind) {
         .function, .suspend_function, .foreign_function => try validateFunctionSyntax(allocator, item, typed_item, diagnostics),
         .const_item => try validateConstSyntax(allocator, item, diagnostics),
+        .type_alias => try validateTypeAliasSyntax(allocator, item, diagnostics),
         .struct_type => try validateStructSyntax(allocator, item, diagnostics),
         .union_type => try validateUnionSyntax(allocator, item, diagnostics),
         .enum_type => try validateEnumSyntax(allocator, item, diagnostics),
@@ -50,10 +50,27 @@ fn validateFunctionSyntax(
         .function => |signature| try item_syntax_bridge.fillFunctionDataFromSyntax(allocator, &function, signature, item.span, diagnostics),
         else => return error.InvalidParse,
     }
+}
 
-    if (item.kind != .foreign_function) return;
-    if (typed_attributes.parseExportName(item.attributes) != null) {
-        try diagnostics.add(.@"error", "type.foreign.export", item.span, "foreign declarations do not combine with #export in stage0", .{});
+fn validateTypeAliasSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag.Bag) !void {
+    const alias = switch (item.syntax) {
+        .type_alias => |signature| signature,
+        else => return error.InvalidParse,
+    };
+    _ = allocator;
+    const name = alias.name orelse {
+        try diagnostics.add(.@"error", "type.alias.name", item.span, "type alias requires a name", .{});
+        return;
+    };
+    const target = alias.target orelse {
+        try diagnostics.add(.@"error", "type.alias.target", item.span, "type alias '{s}' requires '= Type'", .{name.text});
+        return;
+    };
+    if (!isPlainIdentifier(std.mem.trim(u8, name.text, " \t"))) {
+        try diagnostics.add(.@"error", "type.alias.name", item.span, "malformed type alias name '{s}'", .{name.text});
+    }
+    if (std.mem.trim(u8, target.text, " \t").len == 0) {
+        try diagnostics.add(.@"error", "type.alias.target", item.span, "type alias '{s}' requires a target type", .{name.text});
     }
 }
 
@@ -91,11 +108,6 @@ fn validateUnionSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag.
         .union_fields => |fields| {
             const lowered = try body_syntax_bridge.parseFieldsFromSyntax(allocator, fields, item.name, item.span, diagnostics);
             defer allocator.free(lowered);
-            for (lowered) |field| {
-                if (!fieldTypeLooksCAbiSafe(field.type_name)) {
-                    try diagnostics.add(.@"error", "type.union.field_c_abi", item.span, "stage0 union fields must use C ABI-safe types", .{});
-                }
-            }
         },
         .none => {},
         else => return error.InvalidParse,
@@ -292,11 +304,6 @@ fn parseImplAssociatedConsts(
     }
 
     return lowered.toOwnedSlice();
-}
-
-fn fieldTypeLooksCAbiSafe(type_name: []const u8) bool {
-    const builtin = types.Builtin.fromName(type_name);
-    return builtin != .unsupported and builtin.isCAbiSafe();
 }
 
 fn hasReprC(attributes: []const ast.Attribute) bool {

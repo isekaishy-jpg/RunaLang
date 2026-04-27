@@ -1,8 +1,10 @@
 const std = @import("std");
+const c_va_list = @import("../abi/c/va_list.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const typed_expr = @import("../typed/expr.zig");
 const typed_signatures = @import("signatures.zig");
 const typed_text = @import("text.zig");
+const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;
@@ -57,7 +59,7 @@ pub fn parseBoundaryType(raw: []const u8) BoundaryType {
             .kind = .value,
             .inner_type_name = trimmed,
         };
-        const lifetime_name = std.mem.trim(u8, trimmed["hold[".len .. close_index], " \t");
+        const lifetime_name = std.mem.trim(u8, trimmed["hold[".len..close_index], " \t");
         const rest = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t");
         if (std.mem.startsWith(u8, rest, "read ")) return .{
             .kind = .retained_read,
@@ -89,6 +91,7 @@ pub fn parseBoundaryType(raw: []const u8) BoundaryType {
 pub fn returnTypeStructurallyCompatible(actual: types.TypeRef, expected: types.TypeRef) bool {
     if (actual.eql(expected)) return true;
     if (actual.isUnsupported() or expected.isUnsupported()) return false;
+    if (typeRefsTupleCompatible(actual, expected)) return true;
 
     const expected_boundary = parseBoundaryType(typeRefRawName(expected));
     if (!expected_boundary.isBoundary()) return false;
@@ -161,6 +164,8 @@ pub fn callArgumentTypeCompatible(
 ) bool {
     if (actual.eql(expected)) return true;
     if (actual.isUnsupported() or expected.isUnsupported()) return false;
+    if (rawPointerCompatible(actual, expected)) return true;
+    if (typeRefCompatibleWithName(actual, expected_type_name, generic_params, allow_self)) return true;
 
     const expected_boundary = parseBoundaryType(expected_type_name);
     if (expected_boundary.isBoundary()) {
@@ -173,6 +178,113 @@ pub fn callArgumentTypeCompatible(
     if (allow_self and std.mem.eql(u8, trimmed_expected, "Self")) return true;
     if (genericParamExists(generic_params, trimmed_expected, .type_param)) return true;
     return false;
+}
+
+fn typeRefsTupleCompatible(actual: types.TypeRef, expected: types.TypeRef) bool {
+    const actual_name = switch (actual) {
+        .named => |name| name,
+        else => return false,
+    };
+    const expected_name = switch (expected) {
+        .named => |name| name,
+        else => return false,
+    };
+    return tuple_types.typeNamesStructurallyEqual(std.heap.page_allocator, actual_name, expected_name) catch false;
+}
+
+fn typeRefCompatibleWithName(
+    actual: types.TypeRef,
+    expected_type_name: []const u8,
+    generic_params: []const GenericParam,
+    allow_self: bool,
+) bool {
+    _ = generic_params;
+    _ = allow_self;
+    const actual_name = switch (actual) {
+        .named => |name| name,
+        .builtin => |builtin| builtin.displayName(),
+        .unsupported => return false,
+    };
+    const expected_trimmed = std.mem.trim(u8, expected_type_name, " \t\r\n");
+    return tuple_types.typeNamesStructurallyEqual(std.heap.page_allocator, actual_name, expected_trimmed) catch false;
+}
+
+fn rawPointerCompatible(actual: types.TypeRef, expected: types.TypeRef) bool {
+    const actual_name = switch (actual) {
+        .named => |name| name,
+        else => return false,
+    };
+    const expected_name = switch (expected) {
+        .named => |name| name,
+        else => return false,
+    };
+    const actual_pointer = parseRawPointer(actual_name) orelse return false;
+    const expected_pointer = parseRawPointer(expected_name) orelse return false;
+    if (!std.mem.eql(u8, actual_pointer.pointee, expected_pointer.pointee)) return false;
+    return actual_pointer.access == expected_pointer.access or
+        (actual_pointer.access == .edit and expected_pointer.access == .read);
+}
+
+const RawPointerAccess = enum {
+    read,
+    edit,
+};
+
+const RawPointer = struct {
+    access: RawPointerAccess,
+    pointee: []const u8,
+};
+
+fn parseRawPointer(raw: []const u8) ?RawPointer {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "*read ")) return .{
+        .access = .read,
+        .pointee = std.mem.trim(u8, trimmed["*read ".len..], " \t\r\n"),
+    };
+    if (std.mem.startsWith(u8, trimmed, "*edit ")) return .{
+        .access = .edit,
+        .pointee = std.mem.trim(u8, trimmed["*edit ".len..], " \t\r\n"),
+    };
+    return null;
+}
+
+pub fn cVariadicTailIndex(parameter_type_names: []const []const u8) ?usize {
+    if (parameter_type_names.len == 0) return null;
+    const last_index = parameter_type_names.len - 1;
+    const tail_name = std.mem.trim(u8, parameter_type_names[last_index], " \t\r\n");
+    if (std.mem.eql(u8, tail_name, "CVaList")) return last_index;
+    if (std.mem.startsWith(u8, tail_name, "...")) return last_index;
+    return null;
+}
+
+pub fn cVariadicFixedParameterCount(parameter_count: usize, parameter_type_names: []const []const u8) usize {
+    if (cVariadicTailIndex(parameter_type_names)) |tail_index| {
+        if (tail_index < parameter_count) return tail_index;
+    }
+    return parameter_count;
+}
+
+pub fn cVariadicCallArityValid(arg_count: usize, parameter_count: usize, parameter_type_names: []const []const u8) bool {
+    if (cVariadicTailIndex(parameter_type_names)) |tail_index| {
+        if (tail_index >= parameter_count) return arg_count == parameter_count;
+        return arg_count >= tail_index;
+    }
+    return arg_count == parameter_count;
+}
+
+pub fn cVariadicArgumentTypeSupported(ty: types.TypeRef) bool {
+    return switch (ty) {
+        .builtin => |builtin| switch (builtin) {
+            .i32, .u32, .index, .isize => true,
+            .unit, .bool, .str, .unsupported => false,
+        },
+        .named => |name| cVariadicArgumentTypeNameSupported(name),
+        .unsupported => false,
+    };
+}
+
+pub fn cVariadicArgumentTypeNameSupported(raw_name: []const u8) bool {
+    return c_va_list.variadicValueTypeNameSupported(raw_name);
 }
 
 pub fn boundaryFromParameter(parameter: Parameter) BoundaryType {

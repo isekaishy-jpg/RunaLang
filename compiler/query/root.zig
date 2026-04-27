@@ -1,10 +1,15 @@
 const std = @import("std");
 const abi = @import("../abi/root.zig");
+const c_va_list = @import("../abi/c/va_list.zig");
+const abi_query = @import("abi_query.zig");
 const ast = @import("../ast/root.zig");
+const backend_contract = @import("../backend_contract/root.zig");
+const backend_contract_query = @import("backend_contract_query.zig");
 const borrow = @import("../borrow/root.zig");
 const boundary_checks = @import("boundary_checks.zig");
 pub const checked_body = @import("checked_body.zig");
 const callable_checks = @import("callable_checks.zig");
+const callable_types = @import("callable_types.zig");
 const coherence_checks = @import("coherence_checks.zig");
 const const_contexts = @import("const_contexts.zig");
 pub const const_ir = @import("const_ir.zig");
@@ -15,38 +20,49 @@ const body_syntax_lower = @import("../parse/body_syntax_lower.zig");
 const diag = @import("../diag/root.zig");
 const domain_state_body = @import("domain_state_body.zig");
 const domain_state_checks = @import("domain_state_checks.zig");
+const dynamic_library = @import("../runtime/dynamic_library/root.zig");
 const expression_parse = @import("expression_parse.zig");
 const expression_checks = @import("expression_checks.zig");
+const foreign_callable_types = @import("foreign_callable_types.zig");
+const handle_types = @import("handle_types.zig");
 const hir = @import("../hir/root.zig");
 const item_syntax_bridge = @import("item_syntax_bridge.zig");
 const lifetimes = @import("../lifetimes/root.zig");
+pub const layout = @import("../layout/root.zig");
+const layout_query = @import("layout_query.zig");
 const local_const_checks = @import("local_const_checks.zig");
+const method_mir_lower = @import("method_mir_lower.zig");
 const mir = @import("../mir/root.zig");
 const ownership = @import("../ownership/root.zig");
 const pattern_checks = @import("pattern_checks.zig");
+const raw_pointer = @import("../raw_pointer/root.zig");
 const reflect = @import("../reflect/root.zig");
 const resolve = @import("../resolve/root.zig");
 const regions = @import("../regions/root.zig");
+const runtime_requirements_query = @import("runtime_requirements_query.zig");
 const session = @import("../session/root.zig");
 const signature_syntax_checks = @import("signature_syntax_checks.zig");
 const source = @import("../source/root.zig");
 const send_checks = @import("send_checks.zig");
+const standard_families = @import("standard_families.zig");
 const statement_checks = @import("statement_checks.zig");
+const target = @import("../target/root.zig");
 const trait_solver = @import("trait_solver.zig");
 const typed = @import("../typed/root.zig");
 const typed_attributes = @import("attributes.zig");
 const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
+const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const query_types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const baseTypeName = typed_text.baseTypeName;
-const builtinOfTypeRef = type_support.builtinOfTypeRef;
 const findMatchingDelimiter = typed_text.findMatchingDelimiter;
 const findMethodPrototype = type_support.findMethodPrototype;
 const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const isPlainIdentifier = typed_text.isPlainIdentifier;
 const parseExportName = typed_attributes.parseExportName;
+const parseLinkName = typed_attributes.parseLinkName;
 const symbolNameForSyntheticName = typed_attributes.symbolNameForSyntheticName;
 const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 
@@ -56,6 +72,13 @@ pub const QueryFamily = query_types.QueryFamily;
 pub const BoundaryKind = @import("boundary_checks.zig").BoundaryKind;
 pub const CheckedSignature = query_types.CheckedSignature;
 pub const CheckedBody = query_types.CheckedBody;
+pub const LayoutResult = layout.LayoutResult;
+pub const AbiFamily = abi.AbiFamily;
+pub const AbiTypeResult = abi.AbiTypeResult;
+pub const AbiCallableResult = abi.AbiCallableResult;
+pub const LoweredBackendModule = backend_contract.LoweredModule;
+pub const RuntimeRequirementResult = backend_contract.RuntimeRequirementResult;
+pub const AbiSurfaceRole = query_types.AbiSurfaceRole;
 pub const ReflectionMetadata = query_types.ReflectionMetadata;
 pub const RuntimeReflectionResult = query_types.RuntimeReflectionResult;
 pub const ModuleReflectionResult = query_types.ModuleReflectionResult;
@@ -113,12 +136,634 @@ pub const testing = if (@import("builtin").is_test) struct {
     ) !query_types.TraitGoalKey {
         return trait_solver.traitGoalKeyFromNames(active, module_id, self_type_name, trait_name, where_predicates);
     }
+
+    pub fn canonicalTypeForKey(active: *session.Session, key: types.TypeKey) !types.CanonicalTypeId {
+        return canonicalType(active, key);
+    }
+
+    pub fn canonicalTypeForName(active: *session.Session, module_id: session.ModuleId, name: []const u8) !types.CanonicalTypeId {
+        return canonicalTypeForNameInModule(active, module_id, name);
+    }
+
+    pub fn canonicalTypeForTypeRef(active: *session.Session, module_id: session.ModuleId, ty: types.TypeRef) !types.CanonicalTypeId {
+        return canonicalTypeFromTypeRef(active, module_id, ty);
+    }
+
+    pub fn canonicalTypeKey(active: *const session.Session, id: types.CanonicalTypeId) ?types.TypeKey {
+        if (id.index >= active.caches.canonical_types.items.len) return null;
+        return active.caches.canonical_types.items[id.index].key;
+    }
+
+    pub fn canonicalTypeCount(active: *const session.Session) usize {
+        return active.caches.canonical_types.items.len;
+    }
+
+    pub fn layoutCacheCount(active: *const session.Session) usize {
+        return active.caches.layouts.items.len;
+    }
+
+    pub fn abiTypeCacheCount(active: *const session.Session) usize {
+        return active.caches.abi_types.items.len;
+    }
+
+    pub fn loweredBackendModuleCacheCount(active: *const session.Session) usize {
+        return active.caches.lowered_backend_modules.items.len;
+    }
+
+    pub fn runtimeRequirementCacheCount(active: *const session.Session) usize {
+        return active.caches.runtime_requirements.items.len;
+    }
 } else struct {};
 
 fn markCycleFailure(entry: anytype) void {
     entry.value = null;
     entry.failed = true;
     entry.state = .complete;
+}
+
+pub fn canonicalType(active: *session.Session, key: types.TypeKey) !types.CanonicalTypeId {
+    for (active.caches.canonical_types.items) |canonical| {
+        if (canonical.key.eql(key)) return canonical.id;
+    }
+
+    var owned_key = try types.cloneTypeKey(active.allocator, key);
+    errdefer types.deinitTypeKey(active.allocator, &owned_key);
+    const id = types.CanonicalTypeId{ .index = active.caches.canonical_types.items.len };
+    try active.caches.canonical_types.append(.{
+        .id = id,
+        .key = owned_key,
+    });
+    return id;
+}
+
+pub fn layoutForKey(active: *session.Session, key: layout.LayoutKey) !layout.LayoutResult {
+    const normalized_key = try normalizeLayoutKey(active, key);
+    const layout_index = try findOrCreateLayoutEntry(active, normalized_key);
+    var entry = &active.caches.layouts.items[layout_index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.layout, layout_index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    const value = try buildLayoutResult(active, entry.key);
+    entry = &active.caches.layouts.items[layout_index];
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
+fn normalizeLayoutKey(active: *session.Session, key: layout.LayoutKey) !layout.LayoutKey {
+    switch (key.repr_context) {
+        .declared => return key,
+        .default => {},
+    }
+    if (key.type_id.index >= active.caches.canonical_types.items.len) return key;
+    return switch (active.caches.canonical_types.items[key.type_id.index].key) {
+        .nominal => |nominal| blk: {
+            if (nominal.item_index >= active.semantic_index.items.items.len) break :blk key;
+            const checked = try checkedSignature(active, .{ .index = nominal.item_index });
+            break :blk .{
+                .type_id = key.type_id,
+                .target_name = key.target_name,
+                .repr_context = .{ .declared = checked.surface.declared_repr },
+            };
+        },
+        else => key,
+    };
+}
+
+pub fn layoutForCanonicalType(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    target_name: []const u8,
+    repr_context: layout.ReprContext,
+) !layout.LayoutResult {
+    return layoutForKey(active, .{
+        .type_id = type_id,
+        .target_name = target_name,
+        .repr_context = repr_context,
+    });
+}
+
+pub fn abiTypeForKey(active: *session.Session, key: abi.AbiTypeKey) !abi.AbiTypeResult {
+    const abi_index = try findOrCreateAbiTypeEntry(active, key);
+    var entry = &active.caches.abi_types.items[abi_index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.abi_type, abi_index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    const value = try buildAbiTypeResult(active, entry.key);
+    entry = &active.caches.abi_types.items[abi_index];
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
+pub fn abiCallableForKey(active: *session.Session, key: abi.AbiCallableKey) !abi.AbiCallableResult {
+    const abi_index = try findOrCreateAbiCallableEntry(active, key);
+    var entry = &active.caches.abi_callables.items[abi_index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.abi_callable, abi_index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    const value = try abi_query.buildCallable(active, entry.key, .{
+        .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .checked_signature = checkedSignature,
+        .layout_for_key = layoutForKey,
+        .abi_type_for_key = abiTypeForKey,
+    });
+    entry = &active.caches.abi_callables.items[abi_index];
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
+pub fn loweredBackendModuleForKey(
+    active: *session.Session,
+    key: backend_contract.LoweredModuleKey,
+) !backend_contract.LoweredModule {
+    const lowered_index = try findOrCreateLoweredBackendModuleEntry(active, key);
+    var entry = &active.caches.lowered_backend_modules.items[lowered_index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.lowered_backend_module, lowered_index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    const value = try backend_contract_query.build(active, entry.key, .{
+        .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .checked_signature = checkedSignature,
+        .checked_body = checkedBody,
+        .statements_by_body = statementsByBody,
+        .expressions_by_body = expressionsByBody,
+        .ownership_by_body = ownershipByBody,
+        .borrow_by_body = borrowByBody,
+        .lifetimes_by_body = lifetimesByBody,
+        .regions_by_body = regionsByBody,
+        .runtime_requirements = runtimeRequirementsForKey,
+        .layout_for_key = layoutForKey,
+        .abi_type_for_key = abiTypeForKey,
+        .abi_callable_for_key = abiCallableForKey,
+        .program_descriptors = backendProgramDescriptorsForLoweredBackend,
+    });
+    entry = &active.caches.lowered_backend_modules.items[lowered_index];
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
+pub fn runtimeRequirementsForKey(
+    active: *session.Session,
+    key: backend_contract.RuntimeRequirementKey,
+) !backend_contract.RuntimeRequirementResult {
+    const requirement_index = try findOrCreateRuntimeRequirementEntry(active, key);
+    var entry = &active.caches.runtime_requirements.items[requirement_index];
+    if (entry.state == .complete) return if (entry.failed) error.CachedFailure else entry.value.?;
+    if (entry.state == .in_progress) {
+        markCycleFailure(entry);
+        return error.QueryCycle;
+    }
+
+    entry.state = .in_progress;
+    if (!try active.pushActiveQuery(.runtime_requirements, requirement_index)) {
+        entry.state = .complete;
+        entry.failed = true;
+        return error.QueryCycle;
+    }
+    defer active.popActiveQuery();
+    errdefer {
+        entry.state = .complete;
+        entry.failed = true;
+    }
+
+    const value = try runtime_requirements_query.build(active, entry.key);
+    entry = &active.caches.runtime_requirements.items[requirement_index];
+    entry.value = value;
+    entry.state = .complete;
+    return value;
+}
+
+pub fn runtimeRequirements(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    target_name: []const u8,
+    output_kind: backend_contract.OutputKind,
+) !backend_contract.RuntimeRequirementResult {
+    return runtimeRequirementsForKey(active, .{
+        .module_id = module_id,
+        .target_name = target_name,
+        .output_kind = output_kind,
+    });
+}
+
+pub fn loweredBackendModule(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    target_name: []const u8,
+) !backend_contract.LoweredModule {
+    return loweredBackendModuleForKey(active, .{
+        .module_id = module_id,
+        .target_name = target_name,
+    });
+}
+
+fn findOrCreateLayoutEntry(active: *session.Session, key: layout.LayoutKey) !usize {
+    for (active.caches.layouts.items, 0..) |entry, index| {
+        if (entry.key.eql(key)) return index;
+    }
+
+    const owned_key = try layout.cloneLayoutKey(active.allocator, key);
+    errdefer {
+        var cleanup = owned_key;
+        layout.deinitLayoutKey(active.allocator, &cleanup);
+    }
+    try active.caches.layouts.append(.{ .key = owned_key });
+    return active.caches.layouts.items.len - 1;
+}
+
+fn findOrCreateAbiTypeEntry(active: *session.Session, key: abi.AbiTypeKey) !usize {
+    for (active.caches.abi_types.items, 0..) |entry, index| {
+        if (entry.key.eql(key)) return index;
+    }
+
+    const owned_key = try abi.cloneAbiTypeKey(active.allocator, key);
+    errdefer {
+        var cleanup = owned_key;
+        abi.deinitAbiTypeKey(active.allocator, &cleanup);
+    }
+    try active.caches.abi_types.append(.{ .key = owned_key });
+    return active.caches.abi_types.items.len - 1;
+}
+
+fn findOrCreateAbiCallableEntry(active: *session.Session, key: abi.AbiCallableKey) !usize {
+    for (active.caches.abi_callables.items, 0..) |entry, index| {
+        if (entry.key.eql(key)) return index;
+    }
+
+    const owned_key = try abi.cloneAbiCallableKey(active.allocator, key);
+    errdefer {
+        var cleanup = owned_key;
+        abi.deinitAbiCallableKey(active.allocator, &cleanup);
+    }
+    try active.caches.abi_callables.append(.{ .key = owned_key });
+    return active.caches.abi_callables.items.len - 1;
+}
+
+fn findOrCreateLoweredBackendModuleEntry(active: *session.Session, key: backend_contract.LoweredModuleKey) !usize {
+    for (active.caches.lowered_backend_modules.items, 0..) |entry, index| {
+        if (entry.key.eql(key)) return index;
+    }
+
+    const owned_key = try backend_contract.cloneLoweredModuleKey(active.allocator, key);
+    errdefer {
+        var cleanup = owned_key;
+        backend_contract.deinitLoweredModuleKey(active.allocator, &cleanup);
+    }
+    try active.caches.lowered_backend_modules.append(.{ .key = owned_key });
+    return active.caches.lowered_backend_modules.items.len - 1;
+}
+
+fn findOrCreateRuntimeRequirementEntry(active: *session.Session, key: backend_contract.RuntimeRequirementKey) !usize {
+    for (active.caches.runtime_requirements.items, 0..) |entry, index| {
+        if (entry.key.eql(key)) return index;
+    }
+
+    const owned_key = try backend_contract.cloneRuntimeRequirementKey(active.allocator, key);
+    errdefer {
+        var cleanup = owned_key;
+        backend_contract.deinitRuntimeRequirementKey(active.allocator, &cleanup);
+    }
+    try active.caches.runtime_requirements.append(.{ .key = owned_key });
+    return active.caches.runtime_requirements.items.len - 1;
+}
+
+fn buildLayoutResult(active: *session.Session, key: layout.LayoutKey) !layout.LayoutResult {
+    return layout_query.build(active, key, .{
+        .canonical_key = canonicalType,
+        .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .checked_signature = checkedSignature,
+        .layout_for_key = layoutForKey,
+    });
+}
+
+fn buildAbiTypeResult(active: *session.Session, key: abi.AbiTypeKey) !abi.AbiTypeResult {
+    return abi_query.buildType(active, key, .{
+        .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .checked_signature = checkedSignature,
+        .layout_for_key = layoutForKey,
+        .abi_type_for_key = abiTypeForKey,
+    });
+}
+
+pub fn canonicalTypeFromTypeRef(active: *session.Session, module_id: session.ModuleId, ty: types.TypeRef) !types.CanonicalTypeId {
+    return switch (ty) {
+        .builtin => |builtin| if (types.BuiltinScalar.fromBuiltin(builtin)) |scalar|
+            canonicalType(active, .{ .builtin_scalar = scalar })
+        else
+            canonicalType(active, .unsupported),
+        .named => |name| canonicalTypeFromTypeExpression(active, module_id, name),
+        .unsupported => canonicalType(active, .unsupported),
+    };
+}
+
+pub fn canonicalTypeFromTypeExpression(active: *session.Session, module_id: session.ModuleId, raw_name: []const u8) anyerror!types.CanonicalTypeId {
+    const name = std.mem.trim(u8, raw_name, " \t\r\n");
+    if (name.len == 0) return canonicalType(active, .unsupported);
+
+    if (std.mem.startsWith(u8, name, "[")) {
+        const close_index = findMatchingDelimiter(name, 0, '[', ']') orelse return canonicalType(active, .unsupported);
+        if (std.mem.trim(u8, name[close_index + 1 ..], " \t\r\n").len != 0) return canonicalType(active, .unsupported);
+        const inner = name[1..close_index];
+        const separator = findTopLevelHeaderScalar(inner, ';') orelse return canonicalType(active, .unsupported);
+        const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
+        const length_name = std.mem.trim(u8, inner[separator + 1 ..], " \t\r\n");
+        const element = try canonicalTypeFromTypeExpression(active, module_id, element_name);
+        const length = std.fmt.parseInt(u64, length_name, 10) catch return canonicalType(active, .unsupported);
+        return canonicalType(active, .{ .fixed_array = .{
+            .element = element,
+            .length = length,
+        } });
+    }
+
+    if (std.mem.startsWith(u8, name, "(")) {
+        const parts = (try tuple_types.splitTypeParts(active.allocator, name)) orelse return canonicalType(active, .unsupported);
+        defer active.allocator.free(parts);
+        if (!tuple_types.validTupleParts(parts)) return canonicalType(active, .unsupported);
+        const elements = try active.allocator.alloc(types.CanonicalTypeId, parts.len);
+        defer active.allocator.free(elements);
+        for (parts, 0..) |part, index| {
+            elements[index] = try canonicalTypeFromTypeExpression(active, module_id, part);
+        }
+        return canonicalType(active, .{ .tuple = .{ .elements = elements } });
+    }
+
+    if (std.mem.startsWith(u8, name, "*read ")) {
+        const pointee = try canonicalTypeFromTypeExpression(active, module_id, name["*read ".len..]);
+        return canonicalType(active, .{ .raw_pointer = .{
+            .access = .read,
+            .pointee = pointee,
+        } });
+    }
+    if (std.mem.startsWith(u8, name, "*edit ")) {
+        const pointee = try canonicalTypeFromTypeExpression(active, module_id, name["*edit ".len..]);
+        return canonicalType(active, .{ .raw_pointer = .{
+            .access = .edit,
+            .pointee = pointee,
+        } });
+    }
+
+    if (try foreign_callable_types.parseCanonical(active, module_id, name, .{
+        .canonical_type_expression = canonicalTypeFromTypeExpression,
+    })) |parsed_callable| {
+        var owned = parsed_callable;
+        defer owned.deinit(active.allocator);
+        return canonicalType(active, .{ .callable = owned.callable });
+    }
+
+    if (try callable_types.parseCallableTypeName(name, active.allocator)) |callable| {
+        return canonicalOrdinaryCallableType(active, module_id, callable);
+    }
+
+    if (try canonicalStandardFamilyType(active, module_id, name)) |standard| return standard;
+    if (try canonicalGenericApplicationType(active, module_id, name)) |application| return application;
+
+    return canonicalTypeForNameInModule(active, module_id, name);
+}
+
+fn canonicalOrdinaryCallableType(active: *session.Session, module_id: session.ModuleId, callable: callable_types.CallableType) !types.CanonicalTypeId {
+    const input_parts = try canonicalCallableInputTypeParts(active.allocator, callable.input_type_name);
+    defer active.allocator.free(input_parts);
+
+    var parameters: []types.CallableParameter = &.{};
+    if (input_parts.len != 0) {
+        parameters = try active.allocator.alloc(types.CallableParameter, input_parts.len);
+    }
+    defer if (parameters.len != 0) active.allocator.free(parameters);
+
+    for (input_parts, 0..) |parameter_type, index| {
+        parameters[index] = .{
+            .mode = .owned,
+            .ty = try canonicalTypeFromTypeExpression(active, module_id, parameter_type),
+        };
+    }
+
+    return canonicalType(active, .{ .callable = .{
+        .abi = .runa,
+        .is_suspend = callable.is_suspend,
+        .parameters = parameters,
+        .return_type = try canonicalTypeFromTypeExpression(active, module_id, callable.output_type_name),
+    } });
+}
+
+fn canonicalCallableInputTypeParts(allocator: Allocator, input_type_name: []const u8) ![][]const u8 {
+    const trimmed = std.mem.trim(u8, input_type_name, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "Unit")) return allocator.alloc([]const u8, 0);
+
+    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
+        const inside = trimmed[1 .. trimmed.len - 1];
+        if (hasTopLevelComma(inside)) return splitTopLevelCommaParts(allocator, inside);
+    }
+
+    const parts = try allocator.alloc([]const u8, 1);
+    parts[0] = trimmed;
+    return parts;
+}
+
+fn canonicalGenericApplicationType(active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!?types.CanonicalTypeId {
+    const open_index = std.mem.indexOfScalar(u8, name, '[') orelse return null;
+    const close_index = findMatchingDelimiter(name, open_index, '[', ']') orelse return null;
+    if (std.mem.trim(u8, name[close_index + 1 ..], " \t\r\n").len != 0) return null;
+
+    const base_name = std.mem.trim(u8, name[0..open_index], " \t\r\n");
+    if (base_name.len == 0) return try canonicalType(active, .unsupported);
+
+    const arg_parts = try splitTopLevelCommaParts(active.allocator, name[open_index + 1 .. close_index]);
+    defer active.allocator.free(arg_parts);
+    if (arg_parts.len == 0) return try canonicalType(active, .unsupported);
+
+    const args = try active.allocator.alloc(types.CanonicalTypeId, arg_parts.len);
+    defer active.allocator.free(args);
+    for (arg_parts, 0..) |arg, index| {
+        const trimmed_arg = std.mem.trim(u8, arg, " \t\r\n");
+        if (trimmed_arg.len == 0) return try canonicalType(active, .unsupported);
+        args[index] = try canonicalTypeFromTypeExpression(active, module_id, trimmed_arg);
+    }
+
+    const base = try canonicalTypeForNameInModule(active, module_id, base_name);
+    if (base.index >= active.caches.canonical_types.items.len or active.caches.canonical_types.items[base.index].key == .unsupported) {
+        return try canonicalType(active, .unsupported);
+    }
+    return try canonicalType(active, .{ .generic_application = .{
+        .base = base,
+        .args = args,
+    } });
+}
+
+fn canonicalStandardFamilyType(active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!?types.CanonicalTypeId {
+    if (try standard_families.applicationArgs(active.allocator, name, .option)) |args| {
+        defer active.allocator.free(args);
+        if (args.len != 1) return try canonicalType(active, .unsupported);
+        return try canonicalType(active, .{ .option = .{
+            .payload = try canonicalTypeFromTypeExpression(active, module_id, args[0]),
+        } });
+    }
+    if (try standard_families.applicationArgs(active.allocator, name, .result)) |args| {
+        defer active.allocator.free(args);
+        if (args.len != 2) return try canonicalType(active, .unsupported);
+        return try canonicalType(active, .{ .result = .{
+            .ok = try canonicalTypeFromTypeExpression(active, module_id, args[0]),
+            .err = try canonicalTypeFromTypeExpression(active, module_id, args[1]),
+        } });
+    }
+    return null;
+}
+
+pub fn canonicalTypeForNameInModule(active: *session.Session, module_id: session.ModuleId, raw_name: []const u8) !types.CanonicalTypeId {
+    const name = std.mem.trim(u8, raw_name, " \t\r\n");
+    const builtin = types.Builtin.fromName(name);
+    if (types.BuiltinScalar.fromBuiltin(builtin)) |scalar| {
+        return canonicalType(active, .{ .builtin_scalar = scalar });
+    }
+    if (types.CAbiAlias.fromName(name)) |alias| {
+        return canonicalType(active, .{ .c_abi_alias = alias });
+    }
+    if (c_va_list.isTypeName(name)) {
+        return canonicalType(active, .c_va_list);
+    }
+    if (dynamic_library.isTypeName(name)) {
+        const void_type = try canonicalType(active, .{ .c_abi_alias = .c_void });
+        return canonicalType(active, .{ .raw_pointer = .{
+            .access = .edit,
+            .pointee = void_type,
+        } });
+    }
+    if (try canonicalStandardFamilyType(active, module_id, name)) |standard| return standard;
+    var alias_stack = std.array_list.Managed([]const u8).init(active.allocator);
+    defer alias_stack.deinit();
+    if (try canonicalTypeForAliasName(active, module_id, name, &alias_stack)) |aliased| return aliased;
+    if (resolveNominalTypeItemId(active, module_id, name)) |item_id| {
+        const nominal = try canonicalType(active, .{ .nominal = .{ .item_index = item_id.index } });
+        if (handle_types.itemIsHandleFamily(active, item_id)) {
+            return canonicalType(active, .{ .handle = .{ .target = nominal } });
+        }
+        return nominal;
+    }
+    return canonicalType(active, .unsupported);
+}
+
+fn canonicalTypeForAliasName(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    name: []const u8,
+    alias_stack: *std.array_list.Managed([]const u8),
+) !?types.CanonicalTypeId {
+    const alias_source = findTypeAliasSourceItem(active, module_id, name) orelse return null;
+    for (alias_stack.items) |active_name| {
+        if (std.mem.eql(u8, active_name, name)) return try canonicalType(active, .unsupported);
+    }
+    try alias_stack.append(name);
+    defer _ = alias_stack.pop();
+
+    const signature = switch (alias_source.item.syntax) {
+        .type_alias => |alias| alias,
+        else => return null,
+    };
+    const alias_target = signature.target orelse return try canonicalType(active, .unsupported);
+    const target_name = std.mem.trim(u8, alias_target.text, " \t\r\n");
+    if (target_name.len == 0) return try canonicalType(active, .unsupported);
+    const target_builtin = types.Builtin.fromName(target_name);
+    if (types.BuiltinScalar.fromBuiltin(target_builtin)) |scalar| {
+        return try canonicalType(active, .{ .builtin_scalar = scalar });
+    }
+    if (types.CAbiAlias.fromName(target_name)) |alias| {
+        return try canonicalType(active, .{ .c_abi_alias = alias });
+    }
+    if (c_va_list.isTypeName(target_name)) {
+        return try canonicalType(active, .c_va_list);
+    }
+    if (try canonicalTypeForAliasName(active, alias_source.module_id, target_name, alias_stack)) |aliased| return aliased;
+    if (resolveNominalTypeItemId(active, alias_source.module_id, target_name)) |item_id| {
+        const nominal = try canonicalType(active, .{ .nominal = .{ .item_index = item_id.index } });
+        if (handle_types.itemIsHandleFamily(active, item_id)) {
+            return try canonicalType(active, .{ .handle = .{ .target = nominal } });
+        }
+        return nominal;
+    }
+    return try canonicalTypeFromTypeExpression(active, alias_source.module_id, target_name);
+}
+
+fn resolveNominalTypeItemId(active: *const session.Session, module_id: session.ModuleId, name: []const u8) ?session.ItemId {
+    for (active.semantic_index.items.items, 0..) |item_entry, index| {
+        if (item_entry.module_id.index != module_id.index) continue;
+        const item = active.item(.{ .index = index });
+        if (item.category != .type_decl) continue;
+        if (item.kind == .type_alias) continue;
+        if (std.mem.eql(u8, item.name, name) or std.mem.eql(u8, item.symbol_name, name)) return .{ .index = index };
+    }
+
+    const module = active.module(module_id);
+    for (module.imports.items) |binding| {
+        if (binding.category != .type_decl) continue;
+        if (!std.mem.eql(u8, binding.local_name, name)) continue;
+        const item_id = findItemIdBySymbol(active, binding.target_symbol) orelse return null;
+        if (active.item(item_id).kind == .type_alias) return null;
+        return item_id;
+    }
+
+    return null;
 }
 
 pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !CheckedSignature {
@@ -150,6 +795,7 @@ pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !Chec
         try signature_syntax_checks.validateItemSyntax(active.allocator, syntax_item, item, &active.pipeline.diagnostics);
     }
     const facts = try buildCheckedSignatureFacts(active, item_entry.module_id, item, source_item, &active.pipeline.diagnostics);
+    const surface = try signatureSurfaceFacts(active, item_entry.module_id, item_id, item, facts);
     const const_required_expr_sites = try buildConstRequiredExprSites(active, item_entry.module_id, item, facts, &active.pipeline.diagnostics);
     var value = CheckedSignature{
         .item_id = item_id,
@@ -160,6 +806,7 @@ pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !Chec
         .reflectable = item.is_reflectable,
         .exported = item.visibility == .pub_item,
         .unsafe_required = item.is_unsafe,
+        .surface = surface,
         .const_required_expr_sites = const_required_expr_sites,
         .facts = facts,
     };
@@ -178,12 +825,90 @@ pub fn checkedSignature(active: *session.Session, item_id: session.ItemId) !Chec
     return value;
 }
 
-fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !void {
-    for (item.attributes) |attribute| {
-        if (!typed_attributes.isAllowedAttribute(attribute.name)) {
-            try diagnostics.add(.@"error", "type.attr.unknown", attribute.span, "unknown attribute '{s}'", .{attribute.name});
-        }
+fn signatureSurfaceFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    item_id: session.ItemId,
+    item: *const typed.Item,
+    facts: query_types.SignatureFacts,
+) !query_types.SignatureSurfaceFacts {
+    var surface = query_types.SignatureSurfaceFacts{
+        .nominal_item_id = if (isNominalTypeItemKind(item.kind)) item_id else null,
+        .declared_repr = try declaredReprForItem(active, module_id, item),
+        .unsafe_required = item.is_unsafe,
+        .opaque_incomplete = item.kind == .opaque_type,
+    };
+
+    switch (facts) {
+        .function => |function| {
+            surface.foreign_convention = function.abi;
+            surface.abi_role = if (function.foreign)
+                if (item.has_body and function.export_name != null) .foreign_export else .foreign_import
+            else if (function.export_name != null)
+                .foreign_export
+            else
+                .none;
+            surface.variadic = functionSignatureHasVariadicTail(function);
+        },
+        else => {},
     }
+
+    return surface;
+}
+
+fn isNominalTypeItemKind(kind: ast.ItemKind) bool {
+    return switch (kind) {
+        .struct_type, .union_type, .enum_type, .opaque_type => true,
+        else => false,
+    };
+}
+
+fn declaredReprForItem(active: *session.Session, module_id: session.ModuleId, item: *const typed.Item) !types.DeclaredRepr {
+    for (item.attributes) |attribute| {
+        if (!std.mem.eql(u8, attribute.name, "repr")) continue;
+        const open_index = std.mem.indexOfScalar(u8, attribute.raw, '[') orelse return .default;
+        const close_index = std.mem.lastIndexOfScalar(u8, attribute.raw, ']') orelse return .default;
+        if (close_index <= open_index) return .default;
+
+        var saw_c = false;
+        var enum_repr_type: ?types.CanonicalTypeId = null;
+        var parts = std.mem.splitScalar(u8, attribute.raw[open_index + 1 .. close_index], ',');
+        while (parts.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            if (std.mem.eql(u8, trimmed, "c")) {
+                saw_c = true;
+                continue;
+            }
+            if (item.kind == .enum_type) {
+                enum_repr_type = try canonicalTypeForNameInModule(active, module_id, trimmed);
+            }
+        }
+
+        if (!saw_c) return .default;
+        if (item.kind == .enum_type) {
+            if (enum_repr_type) |repr_type| return .{ .c_enum = repr_type };
+        }
+        return .c;
+    }
+
+    return .default;
+}
+
+fn functionSignatureHasVariadicTail(function: query_types.FunctionSignature) bool {
+    return variadicTailIndex(function) != null;
+}
+
+fn variadicTailIndex(function: query_types.FunctionSignature) ?usize {
+    if (function.parameters.len == 0) return null;
+    const last_index = function.parameters.len - 1;
+    const last = function.parameters[last_index];
+    if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last.type_name, "...")) return last_index;
+    return null;
+}
+
+fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !void {
+    try typed_attributes.validateDeclarationAttributes(item.attributes, declarationTargetForItem(item), item.has_body, item.span, diagnostics);
 
     if (item.is_domain_root and item.kind != .struct_type) {
         try diagnostics.add(.@"error", "type.domain_root.target", item.span, "#domain_root is valid only on struct declarations", .{});
@@ -219,6 +944,23 @@ fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !
         => {},
         else => try diagnostics.add(.@"error", "type.reflect.target", item.span, "#reflect is not valid on this declaration kind", .{}),
     }
+}
+
+fn declarationTargetForItem(item: *const typed.Item) typed_attributes.DeclarationTarget {
+    return switch (item.kind) {
+        .function => .function,
+        .suspend_function => .suspend_function,
+        .foreign_function => .foreign_function,
+        .const_item => .const_item,
+        .type_alias => .type_alias,
+        .struct_type => .struct_type,
+        .union_type => .union_type,
+        .enum_type => .enum_type,
+        .opaque_type => .opaque_type,
+        .trait_type => .trait_type,
+        .impl_block => .impl_block,
+        else => .other,
+    };
 }
 
 const TraitMethodSource = enum {
@@ -274,25 +1016,51 @@ fn validateFunctionSignatureSemantics(
     function: query_types.FunctionSignature,
     diagnostics: *diag.Bag,
 ) !void {
-    if (!function.foreign) return;
+    _ = item;
+    _ = function;
+    _ = diagnostics;
+}
 
-    if (builtinOfTypeRef(function.return_type) == .unsupported) {
-        try diagnostics.add(.@"error", "type.stage0.return", item.span, "unsupported stage0 foreign return type '{s}'", .{function.return_type_name});
+fn rawPointerPointee(raw_type_name: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "*read ")) return std.mem.trim(u8, trimmed["*read ".len..], " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "*edit ")) return std.mem.trim(u8, trimmed["*edit ".len..], " \t\r\n");
+    return null;
+}
+
+fn validateForeignAbiThroughQuery(active: *session.Session, checked: CheckedSignature, diagnostics: *diag.Bag) !void {
+    const function = switch (checked.facts) {
+        .function => |function| function,
+        else => return,
+    };
+    if (!function.foreign and variadicTailIndex(function) == null) return;
+
+    const callable_abi = try abiCallableForKey(active, .{
+        .subject = .{ .item = checked.item_id },
+        .target_name = target.hostName(),
+        .family = abiFamilyForForeignConvention(function.abi),
+        .role = if (checked.surface.abi_role == .foreign_export) .foreign_export else .foreign_import,
+    });
+    for (callable_abi.diagnostics) |abi_diagnostic| {
+        try addDiagnosticIfMissing(diagnostics, checked.item.span, abi_diagnostic.code, abi_diagnostic.message);
     }
-    for (function.parameters) |parameter| {
-        if (builtinOfTypeRef(parameter.ty) == .unsupported) {
-            try diagnostics.add(.@"error", "type.stage0.param_type", item.span, "unsupported stage0 foreign parameter type in function '{s}'", .{item.name});
+}
+
+fn abiFamilyForForeignConvention(convention: ?[]const u8) abi.AbiFamily {
+    if (convention) |value| {
+        if (std.mem.eql(u8, value, "system")) return .system;
+    }
+    return .c;
+}
+
+fn addDiagnosticIfMissing(diagnostics: *diag.Bag, span: source.Span, code: []const u8, message: []const u8) !void {
+    for (diagnostics.items.items) |item| {
+        if (!std.mem.eql(u8, item.code, code)) continue;
+        if (item.span) |existing| {
+            if (existing.file_id == span.file_id and existing.start == span.start and existing.end == span.end) return;
         }
     }
-
-    var typed_function = typed.FunctionData.init(diagnostics.allocator, function.is_suspend, function.foreign);
-    defer typed_function.deinit(diagnostics.allocator);
-    typed_function.return_type_name = function.return_type_name;
-    typed_function.return_type = function.return_type;
-    typed_function.export_name = function.export_name;
-    typed_function.abi = function.abi;
-    for (function.parameters) |parameter| try typed_function.parameters.append(parameter);
-    try abi.validateForeignFunction(item.span, item.has_body, item.is_unsafe, &typed_function, diagnostics);
+    try diagnostics.add(.@"error", code, span, "{s}", .{message});
 }
 
 fn validateConstInitializerType(
@@ -433,7 +1201,7 @@ pub fn checkedBody(active: *session.Session, body_id: session.BodyId) !CheckedBo
     const enum_prototypes = try buildResolvedEnumPrototypes(active.allocator, active, body_entry.module_id);
     defer if (enum_prototypes.len != 0) active.allocator.free(enum_prototypes);
 
-    if (body.item.kind != .foreign_function and body.item.has_body) {
+    if (body.item.has_body) {
         try body_parse.parseFunctionBody(
             active.allocator,
             @constCast(body.item),
@@ -1080,7 +1848,10 @@ pub fn moduleBoundaryApiMetadata(
     }
 
     var all = std.array_list.Managed(BoundaryApiMetadata).init(active.allocator);
-    errdefer all.deinit();
+    errdefer {
+        deinitBoundaryApiMetadataItems(active.allocator, all.items);
+        all.deinit();
+    }
 
     for (active.semantic_index.items.items, 0..) |item_entry, item_index| {
         if (item_entry.module_id.index != module_id.index) continue;
@@ -1100,6 +1871,7 @@ pub fn moduleBoundaryApiMetadata(
             .parameters = function.parameters,
             .return_type = function.return_type,
             .export_name = function.export_name,
+            .referenced_capability_families = try collectBoundaryApiCapabilityFamilies(active, signature.module_id, function),
         });
     }
 
@@ -1144,6 +1916,71 @@ pub fn collectModuleBoundaryApiMetadata(
     return allocator.dupe(BoundaryApiMetadata, result.apis);
 }
 
+pub fn deinitModuleBoundaryApiResult(allocator: Allocator, result: ModuleBoundaryApiResult) void {
+    deinitBoundaryApiMetadataItems(allocator, result.apis);
+    if (result.apis.len != 0) allocator.free(result.apis);
+}
+
+fn deinitBoundaryApiMetadataItems(allocator: Allocator, apis: []const BoundaryApiMetadata) void {
+    for (apis) |api| {
+        for (api.referenced_capability_families) |family| {
+            if (family.len != 0) allocator.free(family);
+        }
+        if (api.referenced_capability_families.len != 0) allocator.free(api.referenced_capability_families);
+    }
+}
+
+fn collectBoundaryApiCapabilityFamilies(active: *session.Session, module_id: session.ModuleId, function: query_types.FunctionSignature) ![]const []const u8 {
+    var families = std.array_list.Managed([]const u8).init(active.allocator);
+    errdefer {
+        for (families.items) |family| active.allocator.free(family);
+        families.deinit();
+    }
+
+    for (function.parameters) |parameter| {
+        try appendBoundaryCapabilityFamily(active, module_id, parameter.type_name, &families);
+    }
+    try appendBoundaryCapabilityFamily(active, module_id, function.return_type_name, &families);
+    return families.toOwnedSlice();
+}
+
+fn appendBoundaryCapabilityFamily(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    raw_type_name: []const u8,
+    families: *std.array_list.Managed([]const u8),
+) !void {
+    const name = baseTypeName(type_support.parseBoundaryType(raw_type_name).inner_type_name);
+    if (name.len == 0) return;
+    const item_id = resolveBoundaryTypeItemId(active, module_id, name) orelse return;
+    const signature = try checkedSignature(active, item_id);
+    if (signature.boundary_kind != .capability) return;
+    for (families.items) |existing| {
+        if (std.mem.eql(u8, existing, signature.item.name)) return;
+    }
+    try families.append(try active.allocator.dupe(u8, signature.item.name));
+}
+
+fn resolveBoundaryTypeItemId(active: *const session.Session, module_id: session.ModuleId, name: []const u8) ?session.ItemId {
+    for (active.semantic_index.items.items, 0..) |entry, index| {
+        if (entry.module_id.index != module_id.index) continue;
+        const item = active.item(.{ .index = index });
+        if (item.category != .type_decl) continue;
+        if (std.mem.eql(u8, item.name, name)) return .{ .index = index };
+    }
+
+    const module = active.module(module_id);
+    for (module.imports.items) |binding| {
+        if (!std.mem.eql(u8, binding.local_name, name)) continue;
+        for (active.semantic_index.items.items, 0..) |_, index| {
+            const item = active.item(.{ .index = index });
+            if (std.mem.eql(u8, item.symbol_name, binding.target_symbol)) return .{ .index = index };
+        }
+    }
+
+    return null;
+}
+
 fn duplicateMetadataSlice(allocator: Allocator, metadata: []const reflect.ItemMetadata) ![]reflect.ItemMetadata {
     return allocator.dupe(reflect.ItemMetadata, metadata);
 }
@@ -1155,6 +1992,11 @@ pub fn finalizeSemanticChecks(active: *session.Session) !void {
 
     for (active.semantic_index.items.items, 0..) |_, index| {
         _ = try checkedSignature(active, .{ .index = index });
+    }
+
+    for (active.semantic_index.items.items, 0..) |_, index| {
+        const checked = try checkedSignature(active, .{ .index = index });
+        try validateForeignAbiThroughQuery(active, checked, &active.pipeline.diagnostics);
     }
 
     if (active.pipeline.diagnostics.hasErrors()) return;
@@ -1244,42 +2086,1366 @@ pub fn finalizeSemanticChecks(active: *session.Session) !void {
     if (active.pipeline.diagnostics.hasErrors()) return;
 
     for (active.pipeline.modules.items, 0..) |*module_pipeline, pipeline_module_index| {
-        if (module_pipeline.mir != null) continue;
+        if (module_pipeline.mir != null and module_pipeline.backend_contract != null) continue;
 
         const module_id = moduleIdForPipelineIndex(active, pipeline_module_index) orelse return error.MissingSemanticModule;
-        var checked_signatures = std.array_list.Managed(CheckedSignature).init(active.allocator);
-        defer checked_signatures.deinit();
-        for (active.semantic_index.items.items, 0..) |item_entry, item_index| {
-            if (item_entry.module_id.index != module_id.index) continue;
-            try checked_signatures.append(try checkedSignature(active, .{ .index = item_index }));
+        _ = try ensureMirModuleForModule(active, module_id);
+        if (module_pipeline.backend_contract == null) {
+            var lowered = try backend_contract_query.build(active, .{
+                .module_id = module_id,
+                .target_name = target.hostName(),
+                .output_kind = .module,
+            }, .{
+                .canonical_type_expression = canonicalTypeFromTypeExpression,
+                .checked_signature = checkedSignature,
+                .checked_body = checkedBody,
+                .statements_by_body = statementsByBody,
+                .expressions_by_body = expressionsByBody,
+                .ownership_by_body = ownershipByBody,
+                .borrow_by_body = borrowByBody,
+                .lifetimes_by_body = lifetimesByBody,
+                .regions_by_body = regionsByBody,
+                .runtime_requirements = runtimeRequirementsForKey,
+                .layout_for_key = layoutForKey,
+                .abi_type_for_key = abiTypeForKey,
+                .abi_callable_for_key = abiCallableForKey,
+                .program_descriptors = backendProgramDescriptorsForLoweredBackend,
+            });
+            errdefer backend_contract.deinitLoweredModule(active.allocator, &lowered);
+            module_pipeline.backend_contract = lowered;
         }
-
-        var checked_bodies = std.array_list.Managed(CheckedBody).init(active.allocator);
-        defer checked_bodies.deinit();
-        for (active.semantic_index.bodies.items, 0..) |body_entry, body_index| {
-            if (body_entry.module_id.index != module_id.index) continue;
-            try checked_bodies.append(try checkedBody(active, .{ .index = body_index }));
-        }
-        const module = active.module(module_id);
-        const mir_imports = try buildMirImportInputs(active.allocator, module.imports.items);
-        defer deinitMirImportInputs(active.allocator, mir_imports);
-        module_pipeline.mir = try mir.lowerModuleFromCheckedFacts(active.allocator, .{
-            .file_id = module.file_id,
-            .module_path = module.module_path,
-            .imports = mir_imports,
-        }, checked_signatures.items, checked_bodies.items);
-        try appendExecutableMethodMirItems(
-            active.allocator,
-            active,
-            module_id,
-            &module_pipeline.mir.?,
-            &active.pipeline.diagnostics,
-        );
         for (active.semantic_index.bodies.items, 0..) |body_entry, body_index| {
             if (body_entry.module_id.index != module_id.index) continue;
             if (active.caches.bodies[body_index].value) |*cached_body| {
                 cached_body.owned_function = null;
             }
+        }
+    }
+}
+
+fn backendProgramDescriptorsForLoweredBackend(active: *session.Session, module_id: session.ModuleId) !backend_contract.program.Module {
+    var checked_signatures = std.array_list.Managed(CheckedSignature).init(active.allocator);
+    defer checked_signatures.deinit();
+    for (active.semantic_index.items.items, 0..) |item_entry, item_index| {
+        if (item_entry.module_id.index != module_id.index) continue;
+        try checked_signatures.append(try checkedSignature(active, .{ .index = item_index }));
+    }
+
+    var checked_bodies = std.array_list.Managed(CheckedBody).init(active.allocator);
+    defer checked_bodies.deinit();
+    for (active.semantic_index.bodies.items, 0..) |body_entry, body_index| {
+        if (body_entry.module_id.index != module_id.index) continue;
+        try checked_bodies.append(try checkedBody(active, .{ .index = body_index }));
+    }
+
+    var backend_type_facts = try buildBackendProgramTypeFacts(active, module_id, checked_signatures.items, checked_bodies.items);
+    defer backend_type_facts.deinit(active.allocator);
+
+    var program_module = try lowerBackendProgramFromCheckedFacts(active, module_id, checked_signatures.items, checked_bodies.items, backend_type_facts);
+    errdefer program_module.deinit();
+    try appendExecutableMethodControlFlowItems(
+        active.allocator,
+        active,
+        module_id,
+        &program_module,
+        &active.pipeline.diagnostics,
+    );
+    return program_module;
+}
+
+fn lowerBackendProgramFromCheckedFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    checked_signatures: []const CheckedSignature,
+    checked_bodies: []const CheckedBody,
+    backend_type_facts: BackendProgramTypeFacts,
+) !backend_contract.program.Module {
+    const module = active.module(module_id);
+    var program_module = backend_contract.program.Module.init(
+        active.allocator,
+        module.file_id,
+        try active.allocator.dupe(u8, module.module_path),
+    );
+    errdefer program_module.deinit();
+
+    try appendBackendProgramImports(active, &program_module, module.imports.items, backend_type_facts.imports);
+
+    for (checked_signatures, 0..) |checked_signature, signature_index| {
+        const item = checked_signature.item;
+        const signature_type_facts = backend_type_facts.signatures[signature_index];
+        var program_item = backend_contract.program.Item{
+            .name = item.name,
+            .symbol_name = item.symbol_name,
+            .kind = programItemCategory(item.category),
+            .is_entry_candidate = item.kind == .function and std.mem.eql(u8, item.name, "main"),
+            .span = item.span,
+            .payload = .none,
+        };
+        errdefer program_item.deinit(active.allocator);
+
+        switch (checked_signature.facts) {
+            .function => |function| {
+                const body_facts = findCheckedBodyByItemId(checked_bodies, checked_signature.item_id) orelse return error.MissingCheckedBody;
+                const body_type_facts = backend_type_facts.findBodyByItemId(checked_signature.item_id) orelse return error.MissingCheckedBody;
+                const function_type_facts = switch (signature_type_facts) {
+                    .function => |value| value,
+                    else => return error.InvalidMirLowering,
+                };
+                const params = try active.allocator.alloc(backend_contract.program.Parameter, body_facts.parameters.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (params[0..initialized]) |*parameter| parameter.deinit(active.allocator);
+                    active.allocator.free(params);
+                }
+                for (body_facts.parameters, 0..) |parameter, index| {
+                    if (index >= body_type_facts.parameter_types.len) return error.InvalidMirLowering;
+                    params[index] = .{
+                        .name = parameter.name,
+                        .mode = programParameterMode(parameter.mode),
+                        .ty = try backendValueTypeFromCanonicalType(active, body_type_facts.parameter_types[index]),
+                    };
+                    initialized += 1;
+                }
+
+                const body_view = backendCheckedBodyView(body_facts);
+                var body = try lowerBackendCheckedBlock(active, body_view, body_type_facts.exprs, body_view.root_block_id);
+                errdefer body.deinit(active.allocator);
+
+                program_item.payload = .{ .function = .{
+                    .return_type = try backendValueTypeFromCanonicalType(active, function_type_facts.return_type),
+                    .parameters = params,
+                    .body = body,
+                    .linkage = programFunctionLinkage(function),
+                    .export_name = function.export_name,
+                    .is_suspend = function.is_suspend,
+                    .foreign = function.foreign,
+                } };
+            },
+            .const_item => |const_signature| {
+                const const_type_facts = switch (signature_type_facts) {
+                    .const_item => |value| value,
+                    else => return error.InvalidMirLowering,
+                };
+                const expr = const_signature.expr orelse return error.InvalidMirLowering;
+                program_item.payload = .{ .const_item = .{
+                    .ty = const_signature.ty,
+                    .type_ref = try backendValueTypeFromCanonicalType(active, const_type_facts.type_ref),
+                    .expr = try cloneConstExprForBackendControlFlow(active.allocator, expr),
+                } };
+            },
+            .struct_type => |struct_type| {
+                const struct_type_facts = switch (signature_type_facts) {
+                    .struct_type => |value| value,
+                    else => return error.InvalidMirLowering,
+                };
+                const fields = try active.allocator.alloc(backend_contract.program.StructField, struct_type.fields.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (fields[0..initialized]) |*field| field.deinit(active.allocator);
+                    active.allocator.free(fields);
+                }
+                for (struct_type.fields, 0..) |field, field_index| {
+                    if (field_index >= struct_type_facts.field_types.len) return error.InvalidMirLowering;
+                    fields[field_index] = .{
+                        .name = field.name,
+                        .type_name = field.type_name,
+                        .ty = try backendValueTypeFromCanonicalType(active, struct_type_facts.field_types[field_index]),
+                    };
+                    initialized += 1;
+                }
+                program_item.payload = .{ .struct_type = .{ .fields = fields } };
+            },
+            .enum_type => |enum_type| {
+                const enum_type_facts = switch (signature_type_facts) {
+                    .enum_type => |value| value,
+                    else => return error.InvalidMirLowering,
+                };
+                const variants = try lowerBackendEnumVariants(active, enum_type.variants, enum_type_facts.variants);
+                program_item.payload = .{ .enum_type = .{ .variants = variants } };
+            },
+            .opaque_type => {
+                program_item.payload = .{ .opaque_type = .{} };
+            },
+            .type_alias => continue,
+            .union_type, .trait_type, .impl_block, .none => {},
+        }
+
+        try program_module.items.append(program_item);
+    }
+
+    return program_module;
+}
+
+fn findCheckedBodyByItemId(checked_bodies: []const CheckedBody, item_id: session.ItemId) ?CheckedBody {
+    for (checked_bodies) |body| {
+        if (body.item_id.index == item_id.index) return body;
+    }
+    return null;
+}
+
+const BackendCheckedBodyView = struct {
+    module_id: session.ModuleId,
+    parameters: []const typed.Parameter,
+    root_block_id: usize,
+    block_sites: []const checked_body.BlockSite,
+    statement_sites: []const checked_body.StatementSite,
+};
+
+fn backendCheckedBodyView(body: CheckedBody) BackendCheckedBodyView {
+    return .{
+        .module_id = body.module_id,
+        .parameters = body.parameters,
+        .root_block_id = body.root_block_id,
+        .block_sites = body.block_sites,
+        .statement_sites = body.statement_sites,
+    };
+}
+
+const BackendProgramTypeFacts = struct {
+    imports: []BackendImportTypeFacts,
+    signatures: []BackendSignatureTypeFacts,
+    bodies: []BackendBodyTypeFacts,
+
+    fn deinit(self: *BackendProgramTypeFacts, allocator: Allocator) void {
+        for (self.imports) |*item| item.deinit(allocator);
+        if (self.imports.len != 0) allocator.free(self.imports);
+        for (self.signatures) |*item| item.deinit(allocator);
+        if (self.signatures.len != 0) allocator.free(self.signatures);
+        for (self.bodies) |*item| item.deinit(allocator);
+        if (self.bodies.len != 0) allocator.free(self.bodies);
+        self.* = .{
+            .imports = &.{},
+            .signatures = &.{},
+            .bodies = &.{},
+        };
+    }
+
+    fn findBodyByItemId(self: BackendProgramTypeFacts, item_id: session.ItemId) ?BackendBodyTypeFacts {
+        for (self.bodies) |body| {
+            if (body.item_id) |body_item_id| {
+                if (body_item_id.index == item_id.index) return body;
+            }
+        }
+        return null;
+    }
+};
+
+const BackendImportTypeFacts = struct {
+    const_type: ?types.CanonicalTypeId = null,
+    function_return_type: ?types.CanonicalTypeId = null,
+    function_parameter_types: ?[]types.CanonicalTypeId = null,
+
+    fn deinit(self: *BackendImportTypeFacts, allocator: Allocator) void {
+        if (self.function_parameter_types) |values| allocator.free(values);
+        self.* = .{};
+    }
+};
+
+const BackendFunctionSignatureTypeFacts = struct {
+    return_type: types.CanonicalTypeId,
+};
+
+const BackendConstSignatureTypeFacts = struct {
+    type_ref: types.CanonicalTypeId,
+};
+
+const BackendStructSignatureTypeFacts = struct {
+    field_types: []types.CanonicalTypeId,
+};
+
+const BackendEnumVariantTypeFacts = union(enum) {
+    none,
+    tuple_fields: []types.CanonicalTypeId,
+    named_fields: []types.CanonicalTypeId,
+
+    fn deinit(self: *BackendEnumVariantTypeFacts, allocator: Allocator) void {
+        switch (self.*) {
+            .tuple_fields => |values| if (values.len != 0) allocator.free(values),
+            .named_fields => |values| if (values.len != 0) allocator.free(values),
+            .none => {},
+        }
+        self.* = .none;
+    }
+};
+
+const BackendEnumSignatureTypeFacts = struct {
+    variants: []BackendEnumVariantTypeFacts,
+};
+
+const BackendSignatureTypeFacts = union(enum) {
+    none,
+    function: BackendFunctionSignatureTypeFacts,
+    const_item: BackendConstSignatureTypeFacts,
+    struct_type: BackendStructSignatureTypeFacts,
+    enum_type: BackendEnumSignatureTypeFacts,
+    opaque_type,
+
+    fn deinit(self: *BackendSignatureTypeFacts, allocator: Allocator) void {
+        switch (self.*) {
+            .struct_type => |value| if (value.field_types.len != 0) allocator.free(value.field_types),
+            .enum_type => |value| {
+                for (value.variants) |*variant| variant.deinit(allocator);
+                if (value.variants.len != 0) allocator.free(value.variants);
+            },
+            else => {},
+        }
+        self.* = .none;
+    }
+};
+
+const BackendExprTypeFacts = struct {
+    expr_types: std.AutoHashMap(usize, types.CanonicalTypeId),
+    conversion_target_types: std.AutoHashMap(usize, types.CanonicalTypeId),
+    binding_types: std.AutoHashMap(usize, types.CanonicalTypeId),
+    assign_types: std.AutoHashMap(usize, types.CanonicalTypeId),
+    select_binding_types: std.AutoHashMap(usize, types.CanonicalTypeId),
+
+    fn init(allocator: Allocator) BackendExprTypeFacts {
+        return .{
+            .expr_types = std.AutoHashMap(usize, types.CanonicalTypeId).init(allocator),
+            .conversion_target_types = std.AutoHashMap(usize, types.CanonicalTypeId).init(allocator),
+            .binding_types = std.AutoHashMap(usize, types.CanonicalTypeId).init(allocator),
+            .assign_types = std.AutoHashMap(usize, types.CanonicalTypeId).init(allocator),
+            .select_binding_types = std.AutoHashMap(usize, types.CanonicalTypeId).init(allocator),
+        };
+    }
+
+    fn deinit(self: *BackendExprTypeFacts) void {
+        self.expr_types.deinit();
+        self.conversion_target_types.deinit();
+        self.binding_types.deinit();
+        self.assign_types.deinit();
+        self.select_binding_types.deinit();
+    }
+
+    fn exprType(self: *const BackendExprTypeFacts, expr: *const typed.Expr) !types.CanonicalTypeId {
+        return self.expr_types.get(backendExprKey(expr)) orelse error.InvalidMirLowering;
+    }
+
+    fn conversionTargetType(self: *const BackendExprTypeFacts, expr: *const typed.Expr) !types.CanonicalTypeId {
+        return self.conversion_target_types.get(backendExprKey(expr)) orelse error.InvalidMirLowering;
+    }
+
+    fn bindingType(self: *const BackendExprTypeFacts, expr: *const typed.Expr) !types.CanonicalTypeId {
+        return self.binding_types.get(backendExprKey(expr)) orelse error.InvalidMirLowering;
+    }
+
+    fn assignType(self: *const BackendExprTypeFacts, expr: *const typed.Expr) !types.CanonicalTypeId {
+        return self.assign_types.get(backendExprKey(expr)) orelse error.InvalidMirLowering;
+    }
+
+    fn selectBindingType(self: *const BackendExprTypeFacts, expr: *const typed.Expr) !types.CanonicalTypeId {
+        return self.select_binding_types.get(backendExprKey(expr)) orelse error.InvalidMirLowering;
+    }
+};
+
+const BackendBodyTypeFacts = struct {
+    item_id: ?session.ItemId,
+    parameter_types: []types.CanonicalTypeId,
+    exprs: BackendExprTypeFacts,
+
+    fn deinit(self: *BackendBodyTypeFacts, allocator: Allocator) void {
+        if (self.parameter_types.len != 0) allocator.free(self.parameter_types);
+        self.exprs.deinit();
+        self.item_id = null;
+        self.parameter_types = &.{};
+    }
+};
+
+fn backendExprKey(expr: *const typed.Expr) usize {
+    return @intFromPtr(expr);
+}
+
+fn canonicalTypeIsUnsupported(active: *const session.Session, type_id: types.CanonicalTypeId) bool {
+    return type_id.index >= active.caches.canonical_types.items.len or active.caches.canonical_types.items[type_id.index].key == .unsupported;
+}
+
+fn buildBackendProgramTypeFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    checked_signatures: []const CheckedSignature,
+    checked_bodies: []const CheckedBody,
+) !BackendProgramTypeFacts {
+    const module = active.module(module_id);
+    var result = BackendProgramTypeFacts{
+        .imports = &.{},
+        .signatures = &.{},
+        .bodies = &.{},
+    };
+    result.imports = try active.allocator.alloc(BackendImportTypeFacts, module.imports.items.len);
+    errdefer if (result.imports.len != 0) active.allocator.free(result.imports);
+    result.signatures = try active.allocator.alloc(BackendSignatureTypeFacts, checked_signatures.len);
+    errdefer if (result.signatures.len != 0) active.allocator.free(result.signatures);
+    result.bodies = try active.allocator.alloc(BackendBodyTypeFacts, checked_bodies.len);
+    errdefer if (result.bodies.len != 0) active.allocator.free(result.bodies);
+
+    var imports_initialized: usize = 0;
+    var signatures_initialized: usize = 0;
+    var bodies_initialized: usize = 0;
+    errdefer {
+        for (result.imports[0..imports_initialized]) |*item| item.deinit(active.allocator);
+        for (result.signatures[0..signatures_initialized]) |*item| item.deinit(active.allocator);
+        for (result.bodies[0..bodies_initialized]) |*item| item.deinit(active.allocator);
+    }
+
+    for (module.imports.items, 0..) |binding, index| {
+        result.imports[index] = try buildBackendImportTypeFacts(active, module_id, binding);
+        imports_initialized += 1;
+    }
+    for (checked_signatures, 0..) |signature, index| {
+        result.signatures[index] = try buildBackendSignatureTypeFacts(active, signature);
+        signatures_initialized += 1;
+    }
+    for (checked_bodies, 0..) |body, index| {
+        result.bodies[index] = try buildBackendBodyTypeFacts(active, body);
+        bodies_initialized += 1;
+    }
+    return result;
+}
+
+fn buildBackendImportTypeFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    binding: typed.ImportedBinding,
+) !BackendImportTypeFacts {
+    const type_module_id = backendImportedBindingTypeModuleId(active, module_id, binding);
+    return .{
+        .const_type = if (binding.const_type) |ty| try canonicalTypeFromTypeRef(active, type_module_id, ty) else null,
+        .function_return_type = if (binding.function_return_type) |ty| try canonicalTypeFromTypeRef(active, type_module_id, ty) else null,
+        .function_parameter_types = if (binding.function_parameter_types) |values| try canonicalTypeIdsFromTypeRefs(active, type_module_id, values) else null,
+    };
+}
+
+fn buildBackendSignatureTypeFacts(
+    active: *session.Session,
+    checked: CheckedSignature,
+) !BackendSignatureTypeFacts {
+    return switch (checked.facts) {
+        .function => |function| .{ .function = .{
+            .return_type = try canonicalTypeFromTypeRef(active, checked.module_id, function.return_type),
+        } },
+        .const_item => |const_item| .{ .const_item = .{
+            .type_ref = try canonicalTypeFromTypeRef(active, checked.module_id, const_item.type_ref),
+        } },
+        .struct_type => |struct_type| .{ .struct_type = .{
+            .field_types = try canonicalStructFieldTypes(active, checked.module_id, struct_type.fields),
+        } },
+        .enum_type => |enum_type| .{ .enum_type = .{
+            .variants = try canonicalEnumVariantTypes(active, checked.module_id, enum_type.variants),
+        } },
+        .opaque_type => .opaque_type,
+        else => .none,
+    };
+}
+
+fn canonicalStructFieldTypes(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    fields: []const typed.StructField,
+) ![]types.CanonicalTypeId {
+    const result = try active.allocator.alloc(types.CanonicalTypeId, fields.len);
+    errdefer active.allocator.free(result);
+    for (fields, 0..) |field, index| {
+        result[index] = try canonicalTypeFromTypeRef(active, module_id, field.ty);
+    }
+    return result;
+}
+
+fn canonicalTupleFieldTypes(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    fields: []const typed.TupleField,
+) ![]types.CanonicalTypeId {
+    const result = try active.allocator.alloc(types.CanonicalTypeId, fields.len);
+    errdefer active.allocator.free(result);
+    for (fields, 0..) |field, index| {
+        result[index] = try canonicalTypeFromTypeRef(active, module_id, field.ty);
+    }
+    return result;
+}
+
+fn canonicalEnumVariantTypes(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    variants: []const typed.EnumVariant,
+) ![]BackendEnumVariantTypeFacts {
+    const result = try active.allocator.alloc(BackendEnumVariantTypeFacts, variants.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |*variant| variant.deinit(active.allocator);
+        active.allocator.free(result);
+    }
+    for (variants, 0..) |variant, index| {
+        result[index] = switch (variant.payload) {
+            .none => .none,
+            .tuple_fields => |fields| .{ .tuple_fields = try canonicalTupleFieldTypes(active, module_id, fields) },
+            .named_fields => |fields| .{ .named_fields = try canonicalStructFieldTypes(active, module_id, fields) },
+        };
+        initialized += 1;
+    }
+    return result;
+}
+
+fn buildBackendBodyTypeFacts(active: *session.Session, body: CheckedBody) !BackendBodyTypeFacts {
+    return buildBackendBodyTypeFactsFromView(active, body.item_id, backendCheckedBodyView(body));
+}
+
+fn buildBackendBodyTypeFactsFromView(
+    active: *session.Session,
+    item_id: ?session.ItemId,
+    body: BackendCheckedBodyView,
+) !BackendBodyTypeFacts {
+    var result = BackendBodyTypeFacts{
+        .item_id = item_id,
+        .parameter_types = try canonicalTypedParameters(active, body.module_id, body.parameters),
+        .exprs = BackendExprTypeFacts.init(active.allocator),
+    };
+    errdefer result.deinit(active.allocator);
+    for (body.statement_sites) |statement| {
+        try recordBackendCheckedStatementTypeFacts(active, body.module_id, &result.exprs, statement);
+    }
+    return result;
+}
+
+fn canonicalTypedParameters(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    parameters: []const typed.Parameter,
+) ![]types.CanonicalTypeId {
+    const result = try active.allocator.alloc(types.CanonicalTypeId, parameters.len);
+    errdefer active.allocator.free(result);
+    for (parameters, 0..) |parameter, index| {
+        result[index] = try canonicalTypeFromTypeRef(active, module_id, parameter.ty);
+    }
+    return result;
+}
+
+fn recordBackendCheckedStatementTypeFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    facts: *BackendExprTypeFacts,
+    statement: @import("checked_body.zig").StatementSite,
+) !void {
+    switch (statement.kind) {
+        .let_decl, .const_decl => {
+            const expr = statement.binding_expr orelse return error.InvalidMirLowering;
+            try recordBackendExprTypeFacts(active, module_id, facts, expr);
+            try facts.binding_types.put(backendExprKey(expr), try backendBindingCanonicalType(active, module_id, facts, statement.binding_ty, expr));
+        },
+        .assign_stmt => {
+            const expr = statement.assign_expr orelse return error.InvalidMirLowering;
+            try recordBackendExprTypeFacts(active, module_id, facts, expr);
+            try facts.assign_types.put(backendExprKey(expr), try canonicalTypeFromTypeRef(active, module_id, statement.assign_ty));
+        },
+        .select_stmt => {
+            if (statement.select_subject) |subject| try recordBackendExprTypeFacts(active, module_id, facts, subject);
+            for (statement.select_arms) |arm| {
+                try recordBackendExprTypeFacts(active, module_id, facts, arm.condition);
+                for (arm.bindings) |binding| {
+                    try recordBackendExprTypeFacts(active, module_id, facts, binding.expr);
+                    try facts.select_binding_types.put(backendExprKey(binding.expr), try canonicalTypeFromTypeRef(active, module_id, binding.ty));
+                }
+            }
+        },
+        .loop_stmt => if (statement.loop_condition) |condition| try recordBackendExprTypeFacts(active, module_id, facts, condition),
+        .defer_stmt, .return_stmt, .expr_stmt => if (statement.expr) |expr| try recordBackendExprTypeFacts(active, module_id, facts, expr),
+        .placeholder, .break_stmt, .continue_stmt, .unsafe_block => {},
+    }
+}
+
+fn recordBackendExprTypeFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    facts: *BackendExprTypeFacts,
+    expr: *const typed.Expr,
+) anyerror!void {
+    const key = backendExprKey(expr);
+    if (facts.expr_types.contains(key)) return;
+    try facts.expr_types.put(key, try backendExprCanonicalType(active, module_id, expr));
+
+    switch (expr.node) {
+        .call => |call| for (call.args) |arg| try recordBackendExprTypeFacts(active, module_id, facts, arg),
+        .enum_construct => |construct| for (construct.args) |arg| try recordBackendExprTypeFacts(active, module_id, facts, arg),
+        .constructor => |constructor| for (constructor.args) |arg| try recordBackendExprTypeFacts(active, module_id, facts, arg),
+        .field => |field| try recordBackendExprTypeFacts(active, module_id, facts, field.base),
+        .tuple => |tuple| for (tuple.items) |item| try recordBackendExprTypeFacts(active, module_id, facts, item),
+        .array => |array| for (array.items) |item| try recordBackendExprTypeFacts(active, module_id, facts, item),
+        .array_repeat => |array_repeat| {
+            try recordBackendExprTypeFacts(active, module_id, facts, array_repeat.value);
+            try recordBackendExprTypeFacts(active, module_id, facts, array_repeat.length);
+        },
+        .index => |index| {
+            try recordBackendExprTypeFacts(active, module_id, facts, index.base);
+            try recordBackendExprTypeFacts(active, module_id, facts, index.index);
+        },
+        .conversion => |conversion| {
+            try facts.conversion_target_types.put(key, try canonicalTypeFromTypeRef(active, module_id, conversion.target_type));
+            try recordBackendExprTypeFacts(active, module_id, facts, conversion.operand);
+        },
+        .unary => |unary| try recordBackendExprTypeFacts(active, module_id, facts, unary.operand),
+        .binary => |binary| {
+            try recordBackendExprTypeFacts(active, module_id, facts, binary.lhs);
+            try recordBackendExprTypeFacts(active, module_id, facts, binary.rhs);
+        },
+        .integer,
+        .bool_lit,
+        .string,
+        .identifier,
+        .enum_variant,
+        .enum_tag,
+        .enum_constructor_target,
+        .method_target,
+        => {},
+    }
+}
+
+fn backendExprCanonicalType(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    expr: *const typed.Expr,
+) !types.CanonicalTypeId {
+    const expr_type_id = try canonicalTypeFromTypeRef(active, module_id, expr.ty);
+    if (!canonicalTypeIsUnsupported(active, expr_type_id)) return expr_type_id;
+    switch (expr.node) {
+        .call => |call| if (try backendCallReturnCanonicalType(active, module_id, call.callee)) |return_type| return return_type,
+        else => {},
+    }
+    return canonicalType(active, .unsupported);
+}
+
+fn backendBindingCanonicalType(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    facts: *const BackendExprTypeFacts,
+    declared_ty: types.TypeRef,
+    expr: *const typed.Expr,
+) !types.CanonicalTypeId {
+    const declared_type_id = try canonicalTypeFromTypeRef(active, module_id, declared_ty);
+    if (!canonicalTypeIsUnsupported(active, declared_type_id)) return declared_type_id;
+    return facts.exprType(expr);
+}
+
+fn lowerBackendEnumVariants(
+    active: *session.Session,
+    variants_in: anytype,
+    variant_type_facts: []const BackendEnumVariantTypeFacts,
+) ![]backend_contract.program.EnumVariant {
+    const variants = try active.allocator.alloc(backend_contract.program.EnumVariant, variants_in.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (variants[0..initialized]) |*variant| variant.deinit(active.allocator);
+        active.allocator.free(variants);
+    }
+    for (variants_in, 0..) |variant, variant_index| {
+        if (variant_index >= variant_type_facts.len) return error.InvalidMirLowering;
+        variants[variant_index] = .{
+            .name = variant.name,
+            .payload = switch (variant.payload) {
+                .none => .none,
+                .tuple_fields => |tuple_fields| blk: {
+                    const tuple_type_facts = switch (variant_type_facts[variant_index]) {
+                        .tuple_fields => |values| values,
+                        else => return error.InvalidMirLowering,
+                    };
+                    const fields = try active.allocator.alloc(backend_contract.program.TupleField, tuple_fields.len);
+                    var field_initialized: usize = 0;
+                    errdefer {
+                        for (fields[0..field_initialized]) |*field| field.deinit(active.allocator);
+                        active.allocator.free(fields);
+                    }
+                    for (tuple_fields, 0..) |field, field_index| {
+                        if (field_index >= tuple_type_facts.len) return error.InvalidMirLowering;
+                        fields[field_index] = .{
+                            .type_name = field.type_name,
+                            .ty = try backendValueTypeFromCanonicalType(active, tuple_type_facts[field_index]),
+                        };
+                        field_initialized += 1;
+                    }
+                    break :blk .{ .tuple_fields = fields };
+                },
+                .named_fields => |named_fields| blk: {
+                    const named_type_facts = switch (variant_type_facts[variant_index]) {
+                        .named_fields => |values| values,
+                        else => return error.InvalidMirLowering,
+                    };
+                    const fields = try active.allocator.alloc(backend_contract.program.StructField, named_fields.len);
+                    var field_initialized: usize = 0;
+                    errdefer {
+                        for (fields[0..field_initialized]) |*field| field.deinit(active.allocator);
+                        active.allocator.free(fields);
+                    }
+                    for (named_fields, 0..) |field, field_index| {
+                        if (field_index >= named_type_facts.len) return error.InvalidMirLowering;
+                        fields[field_index] = .{
+                            .name = field.name,
+                            .type_name = field.type_name,
+                            .ty = try backendValueTypeFromCanonicalType(active, named_type_facts[field_index]),
+                        };
+                        field_initialized += 1;
+                    }
+                    break :blk .{ .named_fields = fields };
+                },
+            },
+        };
+        initialized += 1;
+    }
+    return variants;
+}
+
+fn lowerBackendCheckedBlock(
+    active: *session.Session,
+    body: BackendCheckedBodyView,
+    type_facts: BackendExprTypeFacts,
+    block_id: usize,
+) anyerror!backend_contract.program.Block {
+    var lowered = backend_contract.program.Block.init(active.allocator);
+    errdefer lowered.deinit(active.allocator);
+    if (block_id >= body.block_sites.len) return error.InvalidMirLowering;
+
+    for (body.block_sites[block_id].statement_indices) |statement_index| {
+        if (statement_index >= body.statement_sites.len) return error.InvalidMirLowering;
+        try lowered.statements.append(try lowerBackendCheckedStatement(active, body, type_facts, body.statement_sites[statement_index]));
+    }
+    return lowered;
+}
+
+fn lowerBackendCheckedStatement(
+    active: *session.Session,
+    body: BackendCheckedBodyView,
+    type_facts: BackendExprTypeFacts,
+    statement: checked_body.StatementSite,
+) anyerror!backend_contract.program.Statement {
+    return switch (statement.kind) {
+        .placeholder => .placeholder,
+        .let_decl => .{ .let_decl = .{
+            .name = statement.binding_name orelse return error.InvalidMirLowering,
+            .ty = try backendValueTypeFromCanonicalType(active, try type_facts.bindingType(statement.binding_expr orelse return error.InvalidMirLowering)),
+            .expr = try cloneCheckedExprForBackendProgram(active, type_facts, statement.binding_expr orelse return error.InvalidMirLowering),
+        } },
+        .const_decl => .{ .const_decl = .{
+            .name = statement.binding_name orelse return error.InvalidMirLowering,
+            .ty = try backendValueTypeFromCanonicalType(active, try type_facts.bindingType(statement.binding_expr orelse return error.InvalidMirLowering)),
+            .expr = try cloneCheckedExprForBackendProgram(active, type_facts, statement.binding_expr orelse return error.InvalidMirLowering),
+        } },
+        .assign_stmt => blk: {
+            const name = statement.assign_name orelse return error.InvalidMirLowering;
+            const owned_name = if (statement.assign_owns_name) try active.allocator.dupe(u8, name) else null;
+            break :blk .{ .assign_stmt = .{
+                .name = owned_name orelse name,
+                .owned_name = owned_name,
+                .ty = try backendValueTypeFromCanonicalType(active, try type_facts.assignType(statement.assign_expr orelse return error.InvalidMirLowering)),
+                .op = if (statement.assign_op) |op| programBinaryOp(op) else null,
+                .expr = try cloneCheckedExprForBackendProgram(active, type_facts, statement.assign_expr orelse return error.InvalidMirLowering),
+            } };
+        },
+        .select_stmt => try lowerBackendSelectStatement(active, body, type_facts, statement),
+        .loop_stmt => blk: {
+            const lowered_body = try active.allocator.create(backend_contract.program.Block);
+            errdefer active.allocator.destroy(lowered_body);
+            lowered_body.* = try lowerBackendCheckedBlock(active, body, type_facts, statement.loop_body_block_id orelse return error.InvalidMirLowering);
+
+            const result = try active.allocator.create(backend_contract.program.Statement.LoopData);
+            errdefer active.allocator.destroy(result);
+            result.* = .{
+                .condition = if (statement.loop_condition) |condition| try cloneCheckedExprForBackendProgram(active, type_facts, condition) else null,
+                .body = lowered_body,
+            };
+            break :blk .{ .loop_stmt = result };
+        },
+        .unsafe_block => blk: {
+            const lowered_body = try active.allocator.create(backend_contract.program.Block);
+            errdefer active.allocator.destroy(lowered_body);
+            lowered_body.* = try lowerBackendCheckedBlock(active, body, type_facts, statement.unsafe_block_id orelse return error.InvalidMirLowering);
+            break :blk .{ .unsafe_block = lowered_body };
+        },
+        .defer_stmt => .{ .defer_stmt = try cloneCheckedExprForBackendProgram(active, type_facts, statement.expr orelse return error.InvalidMirLowering) },
+        .break_stmt => .break_stmt,
+        .continue_stmt => .continue_stmt,
+        .return_stmt => .{ .return_stmt = if (statement.expr) |expr| try cloneCheckedExprForBackendProgram(active, type_facts, expr) else null },
+        .expr_stmt => .{ .expr_stmt = try cloneCheckedExprForBackendProgram(active, type_facts, statement.expr orelse return error.InvalidMirLowering) },
+    };
+}
+
+fn lowerBackendSelectStatement(
+    active: *session.Session,
+    body: BackendCheckedBodyView,
+    type_facts: BackendExprTypeFacts,
+    statement: checked_body.StatementSite,
+) !backend_contract.program.Statement {
+    var arms = try active.allocator.alloc(backend_contract.program.Statement.SelectArm, statement.select_arms.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (arms[0..initialized]) |arm| arm.deinit(active.allocator);
+        active.allocator.free(arms);
+    }
+    for (statement.select_arms, 0..) |arm, index| {
+        const arm_body = try active.allocator.create(backend_contract.program.Block);
+        errdefer active.allocator.destroy(arm_body);
+        arm_body.* = try lowerBackendCheckedBlock(active, body, type_facts, arm.body_block_id);
+        errdefer arm_body.deinit(active.allocator);
+
+        const bindings = try active.allocator.alloc(backend_contract.program.Statement.SelectBinding, arm.bindings.len);
+        var binding_initialized: usize = 0;
+        errdefer {
+            for (bindings[0..binding_initialized]) |binding| binding.deinit(active.allocator);
+            active.allocator.free(bindings);
+        }
+        for (arm.bindings, 0..) |binding, binding_index| {
+            bindings[binding_index] = .{
+                .name = binding.name,
+                .ty = try backendValueTypeFromCanonicalType(active, try type_facts.selectBindingType(binding.expr)),
+                .expr = try cloneCheckedExprForBackendProgram(active, type_facts, binding.expr),
+            };
+            binding_initialized += 1;
+        }
+        arms[index] = .{
+            .condition = try cloneCheckedExprForBackendProgram(active, type_facts, arm.condition),
+            .bindings = bindings,
+            .body = arm_body,
+        };
+        initialized += 1;
+    }
+
+    var else_body: ?*backend_contract.program.Block = null;
+    if (statement.select_else_block_id) |else_block_id| {
+        const lowered_else = try active.allocator.create(backend_contract.program.Block);
+        errdefer active.allocator.destroy(lowered_else);
+        lowered_else.* = try lowerBackendCheckedBlock(active, body, type_facts, else_block_id);
+        else_body = lowered_else;
+    }
+
+    const result = try active.allocator.create(backend_contract.program.Statement.SelectData);
+    errdefer active.allocator.destroy(result);
+    result.* = .{
+        .subject = if (statement.select_subject) |subject| try cloneCheckedExprForBackendProgram(active, type_facts, subject) else null,
+        .subject_temp_name = if (statement.select_subject_temp_name) |name| try active.allocator.dupe(u8, name) else null,
+        .arms = arms,
+        .else_body = else_body,
+    };
+    return .{ .select_stmt = result };
+}
+
+fn cloneCheckedExprForBackendProgram(
+    active: *session.Session,
+    type_facts: BackendExprTypeFacts,
+    expr: *const typed.Expr,
+) !*backend_contract.program.Expr {
+    const result = try active.allocator.create(backend_contract.program.Expr);
+    errdefer active.allocator.destroy(result);
+
+    result.ty = try backendValueTypeFromCanonicalType(active, try type_facts.exprType(expr));
+    var owned_callee: ?[]u8 = null;
+    result.node = switch (expr.node) {
+        .integer => |value| .{ .integer = value },
+        .bool_lit => |value| .{ .bool_lit = value },
+        .string => |value| .{ .string = value },
+        .identifier => |value| .{ .identifier = value },
+        .enum_variant => |value| .{ .enum_variant = .{
+            .enum_name = value.enum_name,
+            .enum_symbol = value.enum_symbol,
+            .variant_name = value.variant_name,
+        } },
+        .enum_tag => |value| .{ .enum_tag = .{
+            .enum_name = value.enum_name,
+            .enum_symbol = value.enum_symbol,
+            .variant_name = value.variant_name,
+        } },
+        .enum_constructor_target => |value| .{ .enum_constructor_target = .{
+            .enum_name = value.enum_name,
+            .enum_symbol = value.enum_symbol,
+            .variant_name = value.variant_name,
+        } },
+        .enum_construct => |construct| blk: {
+            const args = try active.allocator.alloc(*backend_contract.program.Expr, construct.args.len);
+            errdefer active.allocator.free(args);
+            for (construct.args, 0..) |arg, index| {
+                args[index] = try cloneCheckedExprForBackendProgram(active, type_facts, arg);
+            }
+            break :blk .{ .enum_construct = .{
+                .enum_name = construct.enum_name,
+                .enum_symbol = construct.enum_symbol,
+                .variant_name = construct.variant_name,
+                .args = args,
+            } };
+        },
+        .call => |call| blk: {
+            const args = try active.allocator.alloc(*backend_contract.program.Expr, call.args.len);
+            errdefer active.allocator.free(args);
+            for (call.args, 0..) |arg, index| {
+                args[index] = try cloneCheckedExprForBackendProgram(active, type_facts, arg);
+            }
+            owned_callee = try active.allocator.dupe(u8, call.callee);
+            errdefer if (owned_callee) |value| active.allocator.free(value);
+            break :blk .{ .call = .{
+                .callee = owned_callee.?,
+                .args = args,
+            } };
+        },
+        .constructor => |constructor| blk: {
+            const args = try active.allocator.alloc(*backend_contract.program.Expr, constructor.args.len);
+            errdefer active.allocator.free(args);
+            for (constructor.args, 0..) |arg, index| {
+                args[index] = try cloneCheckedExprForBackendProgram(active, type_facts, arg);
+            }
+            break :blk .{ .constructor = .{
+                .type_name = constructor.type_name,
+                .type_symbol = constructor.type_symbol,
+                .args = args,
+            } };
+        },
+        .method_target => return error.InvalidMirLowering,
+        .field => |field| .{ .field = .{
+            .base = try cloneCheckedExprForBackendProgram(active, type_facts, field.base),
+            .field_name = field.field_name,
+        } },
+        .tuple => |tuple| blk: {
+            const items = try active.allocator.alloc(*backend_contract.program.Expr, tuple.items.len);
+            errdefer active.allocator.free(items);
+            for (tuple.items, 0..) |item, index| {
+                items[index] = try cloneCheckedExprForBackendProgram(active, type_facts, item);
+            }
+            break :blk .{ .tuple = .{ .items = items } };
+        },
+        .array => |array| blk: {
+            const items = try active.allocator.alloc(*backend_contract.program.Expr, array.items.len);
+            errdefer active.allocator.free(items);
+            for (array.items, 0..) |item, index| {
+                items[index] = try cloneCheckedExprForBackendProgram(active, type_facts, item);
+            }
+            break :blk .{ .array = .{ .items = items } };
+        },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneCheckedExprForBackendProgram(active, type_facts, array_repeat.value),
+            .length = try cloneCheckedExprForBackendProgram(active, type_facts, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneCheckedExprForBackendProgram(active, type_facts, index.base),
+            .index = try cloneCheckedExprForBackendProgram(active, type_facts, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneCheckedExprForBackendProgram(active, type_facts, conversion.operand),
+            .mode = programConversionMode(conversion.mode),
+            .target_type = try backendValueTypeFromCanonicalType(active, try type_facts.conversionTargetType(expr)),
+            .target_type_name = conversion.target_type_name,
+        } },
+        .unary => |unary| .{ .unary = .{
+            .op = programUnaryOp(unary.op),
+            .operand = try cloneCheckedExprForBackendProgram(active, type_facts, unary.operand),
+        } },
+        .binary => |binary| .{ .binary = .{
+            .op = programBinaryOp(binary.op),
+            .lhs = try cloneCheckedExprForBackendProgram(active, type_facts, binary.lhs),
+            .rhs = try cloneCheckedExprForBackendProgram(active, type_facts, binary.rhs),
+        } },
+    };
+    result.owned_callee = owned_callee;
+    return result;
+}
+
+fn cloneConstExprForBackendControlFlow(
+    allocator: Allocator,
+    expr: *const const_ir.Expr,
+) !*const_ir.Expr {
+    return backend_contract.program.cloneConstExpr(allocator, expr);
+}
+
+fn appendBackendProgramImports(
+    active: *session.Session,
+    program_module: *backend_contract.program.Module,
+    imports: []const typed.ImportedBinding,
+    import_type_facts: []const BackendImportTypeFacts,
+) !void {
+    for (imports, 0..) |binding, import_index| {
+        if (import_index >= import_type_facts.len) return error.InvalidMirLowering;
+        const type_facts = import_type_facts[import_index];
+        var program_binding = backend_contract.program.ImportedBinding{
+            .local_name = binding.local_name,
+            .target_name = binding.target_name,
+            .target_symbol = binding.target_symbol,
+            .category = programItemCategory(binding.category),
+            .const_type = if (type_facts.const_type) |ty| try backendValueTypeFromCanonicalType(active, ty) else null,
+            .function_return_type = if (type_facts.function_return_type) |ty| try backendValueTypeFromCanonicalType(active, ty) else null,
+            .function_is_suspend = binding.function_is_suspend,
+        };
+        errdefer program_binding.deinit(active.allocator);
+
+        program_binding.function_parameter_types = if (type_facts.function_parameter_types) |values|
+            try backendValueTypesFromCanonicalTypes(active, values)
+        else
+            null;
+        program_binding.function_parameter_type_names = if (binding.function_parameter_type_names) |values|
+            try active.allocator.dupe([]const u8, values)
+        else
+            null;
+        program_binding.function_parameter_modes = if (binding.function_parameter_modes) |values|
+            try programParameterModes(active.allocator, values)
+        else
+            null;
+
+        try program_module.imports.append(program_binding);
+    }
+}
+
+fn backendImportedBindingTypeModuleId(
+    active: *const session.Session,
+    fallback_module_id: session.ModuleId,
+    binding: typed.ImportedBinding,
+) session.ModuleId {
+    const item_id = findItemIdBySymbol(active, binding.target_symbol) orelse return fallback_module_id;
+    return active.semantic_index.itemEntry(item_id).module_id;
+}
+
+fn canonicalTypeIdsFromTypeRefs(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    values: []const types.TypeRef,
+) ![]types.CanonicalTypeId {
+    const result = try active.allocator.alloc(types.CanonicalTypeId, values.len);
+    errdefer active.allocator.free(result);
+    for (values, 0..) |value, index| {
+        result[index] = try canonicalTypeFromTypeRef(active, module_id, value);
+    }
+    return result;
+}
+
+fn backendValueTypesFromCanonicalTypes(
+    active: *session.Session,
+    values: []const types.CanonicalTypeId,
+) ![]backend_contract.program.ValueType {
+    const result = try active.allocator.alloc(backend_contract.program.ValueType, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |*value| value.deinit(active.allocator);
+        active.allocator.free(result);
+    }
+    for (values, 0..) |value, index| {
+        result[index] = try backendValueTypeFromCanonicalType(active, value);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn backendCallReturnCanonicalType(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    callee: []const u8,
+) !?types.CanonicalTypeId {
+    const module = active.module(module_id);
+    for (module.items.items, 0..) |item, item_index| {
+        if (item.kind != .function) continue;
+        if (!std.mem.eql(u8, item.name, callee)) continue;
+        const item_id = findItemIdForModuleItem(active, module_id, item_index) orelse return null;
+        const checked = try checkedSignature(active, item_id);
+        return switch (checked.facts) {
+            .function => |function| try canonicalTypeFromTypeRef(active, checked.module_id, function.return_type),
+            else => null,
+        };
+    }
+    for (module.imports.items) |binding| {
+        if (!std.mem.eql(u8, binding.local_name, callee)) continue;
+        const return_type = binding.function_return_type orelse continue;
+        return try canonicalTypeFromTypeRef(active, backendImportedBindingTypeModuleId(active, module_id, binding), return_type);
+    }
+    return null;
+}
+
+fn backendValueTypeFromCanonicalType(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+) anyerror!backend_contract.program.ValueType {
+    if (type_id.index >= active.caches.canonical_types.items.len) return backendUnsupportedValueType(active);
+
+    const canonical = active.caches.canonical_types.items[type_id.index];
+    return switch (canonical.key) {
+        .builtin_scalar => |scalar| backendValueTypeFromBuiltinScalar(active, type_id, scalar),
+        .c_abi_alias => |alias| ownedBackendValueType(active, type_id, backend_contract.cAbiAliasTypeName(alias), .c_abi_alias, null, null),
+        .nominal => |nominal| backendValueTypeFromNominal(active, type_id, nominal),
+        .generic_application => |application| backendValueTypeFromGenericApplication(active, type_id, application),
+        .raw_pointer => |pointer| backendValueTypeFromRawPointer(active, type_id, pointer),
+        .callable => |callable| backendValueTypeFromCallable(active, type_id, callable),
+        .c_va_list => ownedBackendValueType(active, type_id, "va_list", .c_va_list, null, null),
+        .handle => |handle| backendValueTypeFromHandle(active, type_id, handle),
+        .tuple => ownedBackendValueType(active, type_id, "", .tuple, null, null),
+        .generic_param,
+        .fixed_array,
+        .option,
+        .result,
+        .unsupported,
+        => ownedBackendValueType(active, type_id, "void*", .unsupported, null, null),
+    };
+}
+
+fn backendValueTypeFromGenericApplication(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    application: types.GenericApplication,
+) !backend_contract.program.ValueType {
+    if (application.base.index >= active.caches.canonical_types.items.len) {
+        return ownedBackendValueType(active, type_id, "void*", .unsupported, null, null);
+    }
+    return switch (active.caches.canonical_types.items[application.base.index].key) {
+        .nominal => |nominal| backendValueTypeFromNominal(active, type_id, nominal),
+        .handle => |handle| backendValueTypeFromHandle(active, type_id, handle),
+        else => ownedBackendValueType(active, type_id, "void*", .unsupported, null, null),
+    };
+}
+
+fn backendValueTypeFromHandle(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    handle: types.HandleType,
+) !backend_contract.program.ValueType {
+    if (handle.target.index >= active.caches.canonical_types.items.len) {
+        return ownedBackendValueType(active, type_id, "void*", .unsupported, null, null);
+    }
+    return switch (active.caches.canonical_types.items[handle.target.index].key) {
+        .nominal => |nominal| backendValueTypeFromNominal(active, type_id, nominal),
+        else => ownedBackendValueType(active, type_id, "void*", .unsupported, null, null),
+    };
+}
+
+fn backendValueTypeFromBuiltinScalar(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    scalar: types.BuiltinScalar,
+) !backend_contract.program.ValueType {
+    const builtin = scalar.toBuiltin();
+    return ownedBackendValueType(active, type_id, backend_contract.cBuiltinTypeName(builtin), .builtin, builtin, null);
+}
+
+fn backendValueTypeFromNominal(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    nominal: types.NominalType,
+) !backend_contract.program.ValueType {
+    if (nominal.item_index >= active.semantic_index.items.items.len) {
+        return ownedBackendValueType(active, type_id, "void*", .unsupported, null, null);
+    }
+    const item = active.item(.{ .index = nominal.item_index });
+    const c_name = try std.fmt.allocPrint(active.allocator, "runa_type_{s}", .{item.symbol_name});
+    return .{
+        .type_id = type_id,
+        .c_name = c_name,
+        .owned_c_name = c_name,
+        .kind = .nominal,
+    };
+}
+
+fn backendValueTypeFromRawPointer(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    pointer: types.RawPointer,
+) anyerror!backend_contract.program.ValueType {
+    const pointee = try backendValueTypeFromCanonicalType(active, pointer.pointee);
+    defer {
+        var owned = pointee;
+        owned.deinit(active.allocator);
+    }
+    const c_name = try std.fmt.allocPrint(active.allocator, "{s}{s}*", .{
+        if (pointer.access == .read) "const " else "",
+        pointee.c_name,
+    });
+    return .{
+        .type_id = type_id,
+        .c_name = c_name,
+        .owned_c_name = c_name,
+        .kind = .raw_pointer,
+    };
+}
+
+fn backendValueTypeFromCallable(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    callable: types.CallableType,
+) anyerror!backend_contract.program.ValueType {
+    const return_type = try active.allocator.create(backend_contract.program.ValueType);
+    errdefer active.allocator.destroy(return_type);
+    return_type.* = try backendValueTypeFromCanonicalType(active, callable.return_type);
+    errdefer return_type.deinit(active.allocator);
+
+    const parameters = try active.allocator.alloc(backend_contract.program.ValueType, callable.parameters.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (parameters[0..initialized]) |*parameter| parameter.deinit(active.allocator);
+        active.allocator.free(parameters);
+    }
+    for (callable.parameters, 0..) |parameter, index| {
+        parameters[index] = try backendValueTypeFromCanonicalType(active, parameter.ty);
+        initialized += 1;
+    }
+
+    const kind: backend_contract.program.TypeKind = switch (callable.abi) {
+        .runa => .callable,
+        .c, .system => .foreign_callable,
+    };
+    return ownedBackendValueType(active, type_id, "void*", kind, null, .{
+        .parameters = parameters,
+        .return_type = return_type,
+        .variadic = callable.variadic_tail != null,
+    });
+}
+
+fn hasTopLevelComma(raw: []const u8) bool {
+    var square_depth: usize = 0;
+    var paren_depth: usize = 0;
+    for (raw) |byte| {
+        switch (byte) {
+            '[' => square_depth += 1,
+            ']' => {
+                if (square_depth != 0) square_depth -= 1;
+            },
+            '(' => paren_depth += 1,
+            ')' => {
+                if (paren_depth != 0) paren_depth -= 1;
+            },
+            ',' => if (square_depth == 0 and paren_depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn ownedBackendValueType(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    c_name: []const u8,
+    kind: backend_contract.program.TypeKind,
+    builtin: ?types.Builtin,
+    callable: ?backend_contract.program.CallableType,
+) !backend_contract.program.ValueType {
+    const owned_name = try active.allocator.dupe(u8, c_name);
+    return .{
+        .type_id = type_id,
+        .c_name = owned_name,
+        .owned_c_name = owned_name,
+        .kind = kind,
+        .builtin = builtin,
+        .callable = callable,
+    };
+}
+
+fn backendUnsupportedValueType(active: *session.Session) !backend_contract.program.ValueType {
+    return ownedBackendValueType(active, try canonicalType(active, .unsupported), "void*", .unsupported, null, null);
+}
+
+fn programItemCategory(category: typed.ItemCategory) backend_contract.program.ItemCategory {
+    return switch (category) {
+        .value => .value,
+        .type_decl => .type_decl,
+        .trait_decl => .trait_decl,
+        .impl_block => .impl_block,
+        .foreign_decl => .foreign_decl,
+        .module_decl => .module_decl,
+        .import_binding => .import_binding,
+    };
+}
+
+fn programParameterMode(mode: typed.ParameterMode) backend_contract.program.ParameterMode {
+    return switch (mode) {
+        .owned => .owned,
+        .take => .take,
+        .read => .read,
+        .edit => .edit,
+    };
+}
+
+fn programParameterModes(allocator: Allocator, values: []const typed.ParameterMode) ![]backend_contract.program.ParameterMode {
+    const result = try allocator.alloc(backend_contract.program.ParameterMode, values.len);
+    for (values, 0..) |value, index| result[index] = programParameterMode(value);
+    return result;
+}
+
+fn programFunctionLinkage(function: query_types.FunctionSignature) backend_contract.program.FunctionLinkage {
+    return programFunctionLinkageFlags(function.foreign, function.export_name);
+}
+
+fn programFunctionLinkageFlags(foreign: bool, export_name: ?[]const u8) backend_contract.program.FunctionLinkage {
+    if (export_name) |name| return .{ .foreign_export = name };
+    if (foreign) return .foreign_import;
+    return .internal;
+}
+
+fn programBinaryOp(op: typed.BinaryOp) backend_contract.program.BinaryOp {
+    return switch (op) {
+        .add => .add,
+        .sub => .sub,
+        .mul => .mul,
+        .div => .div,
+        .mod => .mod,
+        .shl => .shl,
+        .shr => .shr,
+        .eq => .eq,
+        .ne => .ne,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        .bit_and => .bit_and,
+        .bit_xor => .bit_xor,
+        .bit_or => .bit_or,
+        .bool_and => .bool_and,
+        .bool_or => .bool_or,
+    };
+}
+
+fn programUnaryOp(op: typed.UnaryOp) backend_contract.program.UnaryOp {
+    return switch (op) {
+        .bool_not => .bool_not,
+        .negate => .negate,
+        .bit_not => .bit_not,
+    };
+}
+
+fn programConversionMode(mode: typed.ConversionMode) backend_contract.program.ConversionMode {
+    return switch (mode) {
+        .explicit_infallible => .explicit_infallible,
+        .explicit_checked => .explicit_checked,
+    };
+}
+
+fn ensureMirModuleForModule(active: *session.Session, module_id: session.ModuleId) !*mir.Module {
+    const module_entry = active.semantic_index.moduleEntry(module_id);
+    const module_pipeline = &active.pipeline.modules.items[module_entry.pipeline_index];
+    if (module_pipeline.mir != null) return &module_pipeline.mir.?;
+
+    var checked_signatures = std.array_list.Managed(CheckedSignature).init(active.allocator);
+    defer checked_signatures.deinit();
+    for (active.semantic_index.items.items, 0..) |item_entry, item_index| {
+        if (item_entry.module_id.index != module_id.index) continue;
+        try checked_signatures.append(try checkedSignature(active, .{ .index = item_index }));
+    }
+
+    var checked_bodies = std.array_list.Managed(CheckedBody).init(active.allocator);
+    defer checked_bodies.deinit();
+    for (active.semantic_index.bodies.items, 0..) |body_entry, body_index| {
+        if (body_entry.module_id.index != module_id.index) continue;
+        try checked_bodies.append(try checkedBody(active, .{ .index = body_index }));
+    }
+
+    const module = active.module(module_id);
+    const mir_imports = try buildMirImportInputs(active.allocator, module.imports.items);
+    defer deinitMirImportInputs(active.allocator, mir_imports);
+    module_pipeline.mir = try mir.lowerModuleFromCheckedFacts(active.allocator, .{
+        .file_id = module.file_id,
+        .module_path = module.module_path,
+        .imports = mir_imports,
+    }, checked_signatures.items, checked_bodies.items);
+    try appendExecutableMethodMirItems(
+        active.allocator,
+        active,
+        module_id,
+        &module_pipeline.mir.?,
+        &active.pipeline.diagnostics,
+    );
+    releaseCheckedBodyOwnedFunctionsForModule(active, module_id);
+    return &module_pipeline.mir.?;
+}
+
+fn releaseCheckedBodyOwnedFunctionsForModule(active: *session.Session, module_id: session.ModuleId) void {
+    for (active.semantic_index.bodies.items, 0..) |body_entry, body_index| {
+        if (body_entry.module_id.index != module_id.index) continue;
+        if (active.caches.bodies[body_index].value) |*cached_body| {
+            cached_body.owned_function = null;
         }
     }
 }
@@ -1801,6 +3967,10 @@ const CheckedCallableResolver = struct {
         if (function.generic_params.len != 0) return .generic;
         if (!usesOwnedPackedCallableInput(function.parameters)) return .borrow_parameter;
         return .none;
+    }
+
+    pub fn isMoveOnlyType(self: CheckedCallableResolver, ty: types.TypeRef) !bool {
+        return handle_types.typeRefContainsHandleFamily(self.active, self.module_id, ty, checkedSignature);
     }
 };
 
@@ -2452,6 +4622,7 @@ fn buildFunctionForCheckedBody(
     cloned.return_type = signature.return_type;
     if (source_item.block_syntax) |block_syntax| cloned.block_syntax = try block_syntax.clone(allocator);
     cloned.export_name = signature.export_name;
+    cloned.link_name = signature.link_name;
     cloned.abi = signature.abi;
     return cloned;
 }
@@ -2976,8 +5147,11 @@ fn resolveExecutableMethodFunction(
     try seedTypeScope(&type_scope, module);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
         .generic_params = function.generic_params,
+        .where_predicates = function.where_predicates,
         .allow_self = true,
         .self_type_name = target_type,
     };
@@ -3309,7 +5483,7 @@ fn appendOwnedExecutableMethodMirBatch(
             );
         }
 
-        var mir_item = try mir.lowerTypedFunctionItem(
+        var mir_item = try method_mir_lower.lowerExecutableMethod(
             allocator,
             method.function_name,
             method.symbol_name,
@@ -3322,6 +5496,175 @@ fn appendOwnedExecutableMethodMirBatch(
         try mir_module.appendRetainedCheckedFunction(function);
         method.function = null;
     }
+}
+
+fn appendOwnedExecutableMethodControlFlowBatch(
+    allocator: Allocator,
+    active: *session.Session,
+    module_id: session.ModuleId,
+    program_module: *backend_contract.program.Module,
+    methods: []OwnedExecutableMethod,
+    function_prototypes: []const typed.FunctionPrototype,
+    method_prototypes: []const typed.MethodPrototype,
+    global_scope: *body_parse.Scope,
+    struct_prototypes: []const typed.StructPrototype,
+    enum_prototypes: []const typed.EnumPrototype,
+    diagnostics: *diag.Bag,
+) !void {
+    for (methods) |*method| {
+        const function = method.function orelse continue;
+        if (!function.foreign and function.block_syntax != null) {
+            var temp_item = typed.Item{
+                .name = method.function_name,
+                .symbol_name = method.symbol_name,
+                .category = .value,
+                .kind = .function,
+                .visibility = .private,
+                .attributes = &.{},
+                .span = method.span,
+                .has_body = function.block_syntax != null,
+                .is_synthetic = true,
+                .is_reflectable = false,
+                .is_boundary_api = false,
+                .is_unsafe = false,
+                .is_domain_root = false,
+                .is_domain_context = false,
+                .payload = .none,
+            };
+            try body_parse.parseFunctionBody(
+                allocator,
+                &temp_item,
+                function,
+                function_prototypes,
+                method_prototypes,
+                global_scope,
+                struct_prototypes,
+                enum_prototypes,
+                diagnostics,
+            );
+        }
+
+        var checked_method = try buildCheckedExecutableMethodFacts(
+            active,
+            module_id,
+            method,
+            function,
+        );
+        defer checked_method.deinit(active.allocator);
+
+        var program_item = try lowerExecutableMethodFromCheckedFacts(active, checked_method, false);
+        errdefer program_item.deinit(allocator);
+        try program_module.items.append(program_item);
+    }
+}
+
+const CheckedExecutableMethodFacts = struct {
+    name: []const u8,
+    symbol_name: []const u8,
+    span: source.Span,
+    parameters: []const typed.Parameter,
+    return_type: types.CanonicalTypeId,
+    body_view: BackendCheckedBodyView,
+    body_type_facts: BackendBodyTypeFacts,
+    checked_facts: checked_body.Facts,
+    linkage: backend_contract.program.FunctionLinkage,
+    export_name: ?[]const u8,
+    is_suspend: bool,
+    foreign: bool,
+
+    fn deinit(self: *CheckedExecutableMethodFacts, allocator: Allocator) void {
+        self.body_type_facts.deinit(allocator);
+        self.checked_facts.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn buildCheckedExecutableMethodFacts(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    method: *const OwnedExecutableMethod,
+    function: *const typed.FunctionData,
+) !CheckedExecutableMethodFacts {
+    var checked_facts = try checked_body.buildFacts(
+        active.allocator,
+        function,
+        CheckedCallableResolver{ .active = active, .module_id = module_id },
+    );
+    errdefer checked_facts.deinit(active.allocator);
+
+    const body_view = BackendCheckedBodyView{
+        .module_id = module_id,
+        .parameters = function.parameters.items,
+        .root_block_id = checked_facts.root_block_id,
+        .block_sites = checked_facts.block_sites,
+        .statement_sites = checked_facts.statement_sites,
+    };
+    var body_type_facts = try buildBackendBodyTypeFactsFromView(active, null, body_view);
+    errdefer body_type_facts.deinit(active.allocator);
+
+    return .{
+        .name = method.function_name,
+        .symbol_name = method.symbol_name,
+        .span = method.span,
+        .parameters = function.parameters.items,
+        .return_type = try canonicalTypeFromTypeRef(active, module_id, function.return_type),
+        .body_view = body_view,
+        .body_type_facts = body_type_facts,
+        .checked_facts = checked_facts,
+        .linkage = programFunctionLinkageFlags(function.foreign, function.export_name),
+        .export_name = function.export_name,
+        .is_suspend = function.is_suspend,
+        .foreign = function.foreign,
+    };
+}
+
+fn lowerExecutableMethodFromCheckedFacts(
+    active: *session.Session,
+    method: CheckedExecutableMethodFacts,
+    is_entry_candidate: bool,
+) !backend_contract.program.Item {
+    const owned_name = try active.allocator.dupe(u8, method.name);
+    errdefer active.allocator.free(owned_name);
+    const owned_symbol_name = try active.allocator.dupe(u8, method.symbol_name);
+    errdefer active.allocator.free(owned_symbol_name);
+
+    const params = try active.allocator.alloc(backend_contract.program.Parameter, method.parameters.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (params[0..initialized]) |*parameter| parameter.deinit(active.allocator);
+        active.allocator.free(params);
+    }
+    for (method.parameters, 0..) |parameter, index| {
+        if (index >= method.body_type_facts.parameter_types.len) return error.InvalidMirLowering;
+        params[index] = .{
+            .name = parameter.name,
+            .mode = programParameterMode(parameter.mode),
+            .ty = try backendValueTypeFromCanonicalType(active, method.body_type_facts.parameter_types[index]),
+        };
+        initialized += 1;
+    }
+
+    var body = try lowerBackendCheckedBlock(active, method.body_view, method.body_type_facts.exprs, method.body_view.root_block_id);
+    errdefer body.deinit(active.allocator);
+
+    return .{
+        .name = owned_name,
+        .owned_name = owned_name,
+        .symbol_name = owned_symbol_name,
+        .owned_symbol_name = owned_symbol_name,
+        .kind = .value,
+        .is_entry_candidate = is_entry_candidate,
+        .span = method.span,
+        .payload = .{ .function = .{
+            .return_type = try backendValueTypeFromCanonicalType(active, method.return_type),
+            .parameters = params,
+            .body = body,
+            .linkage = method.linkage,
+            .export_name = method.export_name,
+            .is_suspend = method.is_suspend,
+            .foreign = method.foreign,
+        } },
+    };
 }
 
 fn appendExecutableMethodMirItems(
@@ -3377,6 +5720,73 @@ fn appendExecutableMethodMirItems(
     try appendOwnedExecutableMethodMirBatch(
         allocator,
         mir_module,
+        synthesized_default_methods,
+        function_prototypes,
+        method_prototypes,
+        &global_scope,
+        struct_prototypes,
+        enum_prototypes,
+        diagnostics,
+    );
+}
+
+fn appendExecutableMethodControlFlowItems(
+    allocator: Allocator,
+    active: *session.Session,
+    module_id: session.ModuleId,
+    program_module: *backend_contract.program.Module,
+    diagnostics: *diag.Bag,
+) !void {
+    const imported_method_prototypes = try buildImportedMethodPrototypes(allocator, active, module_id, true, diagnostics);
+    defer deinitMethodPrototypes(allocator, imported_method_prototypes);
+    const local_methods = try buildDeclaredExecutableMethods(allocator, active, module_id, diagnostics);
+    defer deinitOwnedExecutableMethods(allocator, local_methods);
+    const synthesized_default_methods = try buildSynthesizedDefaultMethods(
+        allocator,
+        active,
+        module_id,
+        imported_method_prototypes,
+        diagnostics,
+    );
+    defer deinitSynthesizedDefaultMethods(allocator, synthesized_default_methods);
+    if (imported_method_prototypes.len == 0 and local_methods.len == 0 and synthesized_default_methods.len == 0) return;
+
+    var global_scope = body_parse.Scope.init(allocator);
+    defer global_scope.deinit();
+    try seedBodyGlobalScope(active, module_id, &global_scope);
+
+    const function_prototypes = try buildResolvedFunctionPrototypes(allocator, active, module_id);
+    defer deinitFunctionPrototypes(allocator, function_prototypes);
+    const method_prototypes = try buildResolvedMethodPrototypes(
+        allocator,
+        imported_method_prototypes,
+        local_methods,
+        synthesized_default_methods,
+    );
+    defer deinitMethodPrototypes(allocator, method_prototypes);
+    const struct_prototypes = try buildResolvedStructPrototypes(allocator, active, module_id);
+    defer if (struct_prototypes.len != 0) allocator.free(struct_prototypes);
+    const enum_prototypes = try buildResolvedEnumPrototypes(allocator, active, module_id);
+    defer if (enum_prototypes.len != 0) allocator.free(enum_prototypes);
+
+    try appendOwnedExecutableMethodControlFlowBatch(
+        allocator,
+        active,
+        module_id,
+        program_module,
+        local_methods,
+        function_prototypes,
+        method_prototypes,
+        &global_scope,
+        struct_prototypes,
+        enum_prototypes,
+        diagnostics,
+    );
+    try appendOwnedExecutableMethodControlFlowBatch(
+        allocator,
+        active,
+        module_id,
+        program_module,
         synthesized_default_methods,
         function_prototypes,
         method_prototypes,
@@ -3500,6 +5910,18 @@ fn buildConstRequiredExprSites(
             active.allocator,
             &sites,
             const_item.type_name,
+            &scope,
+            module_pipeline.prototypes.items,
+            imported_method_prototypes,
+            struct_prototypes,
+            enum_prototypes,
+            item.span,
+            diagnostics,
+        ),
+        .type_alias => |type_alias| try collectTypeConstRequiredExprSites(
+            active.allocator,
+            &sites,
+            type_alias.target_type_name,
             &scope,
             module_pipeline.prototypes.items,
             imported_method_prototypes,
@@ -3965,8 +6387,11 @@ fn enumDiscriminantExpectedType(attributes: []const ast.Attribute) types.TypeRef
 }
 
 const TypeResolutionContext = struct {
+    active: ?*session.Session = null,
+    module_id: session.ModuleId = .{ .index = 0 },
     type_scope: *const NameSet,
     generic_params: []const typed.GenericParam = &.{},
+    where_predicates: []const typed.WherePredicate = &.{},
     allow_self: bool = false,
     self_type_name: ?[]const u8 = null,
 };
@@ -4084,11 +6509,40 @@ fn validateSimpleTypeName(name: []const u8, context: TypeResolutionContext, span
         return;
     }
     if (types.Builtin.fromName(name) != .unsupported) return;
-    if (std.mem.eql(u8, name, "Option") or std.mem.eql(u8, name, "Result") or std.mem.eql(u8, name, "ConvertError")) return;
+    if (types.CAbiAlias.fromName(name) != null) return;
+    if (std.mem.eql(u8, name, "CVaList")) return;
+    if (dynamic_library.isTypeName(name)) return;
+    if (std.mem.eql(u8, name, "Option") or std.mem.eql(u8, name, "Result") or std.mem.eql(u8, name, "Map") or
+        std.mem.eql(u8, name, "List") or std.mem.eql(u8, name, "Eq") or std.mem.eql(u8, name, "Hash") or
+        std.mem.eql(u8, name, "Send") or std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "Bytes") or
+        std.mem.eql(u8, name, "IndexRange") or std.mem.eql(u8, name, "ConvertError") or
+        std.mem.eql(u8, name, "DynamicLibraryError") or std.mem.eql(u8, name, "SymbolLookupError")) return;
     if (context.allow_self and std.mem.eql(u8, name, "Self")) return;
     if (genericParamExists(context.generic_params, name, .type_param)) return;
     if (context.type_scope.contains(name)) return;
     try diagnostics.add(.@"error", "type.name.unknown_type", span, "unknown type name '{s}'", .{name});
+}
+
+fn validateForeignCallableTypeExpression(
+    raw: []const u8,
+    context: TypeResolutionContext,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) anyerror!void {
+    var syntax = try foreign_callable_types.parseSyntax(context.type_scope.allocator, raw) orelse {
+        try diagnostics.add(.@"error", "type.foreign_callable.syntax", span, "malformed foreign function pointer type '{s}'", .{raw});
+        return;
+    };
+    defer syntax.deinit(context.type_scope.allocator);
+
+    for (syntax.parameters) |parameter_type| {
+        try validateTypeExpression(parameter_type, context, span, diagnostics);
+    }
+    if (syntax.variadic_tail) |tail| {
+        try validateTypeExpression(tail, context, span, diagnostics);
+        try diagnostics.add(.@"error", "abi.c.variadic.callback", span, "variadic foreign function pointer types are not implemented in stage0", .{});
+    }
+    try validateTypeExpression(syntax.return_type, context, span, diagnostics);
 }
 
 fn validateTypeExpression(
@@ -4096,11 +6550,20 @@ fn validateTypeExpression(
     context: TypeResolutionContext,
     span: source.Span,
     diagnostics: *diag.Bag,
-) !void {
+) anyerror!void {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) {
         try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type name", .{});
         return;
+    }
+
+    if (rawPointerPointee(trimmed)) |pointee| return validateTypeExpression(pointee, context, span, diagnostics);
+    if (trimmed[0] == '*') {
+        try diagnostics.add(.@"error", "type.raw_pointer.syntax", span, "malformed raw pointer type '{s}'", .{trimmed});
+        return;
+    }
+    if (foreign_callable_types.startsForeignCallableType(trimmed)) {
+        return validateForeignCallableTypeExpression(trimmed, context, span, diagnostics);
     }
 
     if (std.mem.startsWith(u8, trimmed, "hold[")) {
@@ -4149,6 +6612,26 @@ fn validateTypeExpression(
         return;
     }
 
+    if (std.mem.startsWith(u8, trimmed, "(")) {
+        const parts = (try tuple_types.splitTypeParts(context.type_scope.allocator, trimmed)) orelse {
+            try diagnostics.add(.@"error", "type.tuple.syntax", span, "malformed tuple type '{s}'", .{trimmed});
+            return;
+        };
+        defer context.type_scope.allocator.free(parts);
+        if (parts.len < 2) {
+            try diagnostics.add(.@"error", "type.tuple.arity", span, "tuple type '{s}' must have at least two elements", .{trimmed});
+            return;
+        }
+        for (parts) |part| {
+            if (part.len == 0) {
+                try diagnostics.add(.@"error", "type.tuple.syntax", span, "malformed tuple type '{s}'", .{trimmed});
+                continue;
+            }
+            try validateTypeExpression(part, context, span, diagnostics);
+        }
+        return;
+    }
+
     if (std.mem.indexOfScalar(u8, trimmed, '[')) |open_index| {
         const close_index = findMatchingDelimiter(trimmed, open_index, '[', ']') orelse {
             try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type application '{s}'", .{trimmed});
@@ -4173,6 +6656,7 @@ fn validateTypeExpression(
                 try validateTypeExpression(arg, context, span, diagnostics);
             }
         }
+        try validateMapKeyContracts(base_name, args, context, span, diagnostics);
         return;
     }
 
@@ -4192,6 +6676,26 @@ fn validateTypeExpression(
     try validateSimpleTypeName(trimmed, context, span, diagnostics);
 }
 
+fn validateMapKeyContracts(
+    base_name: []const u8,
+    args: []const []const u8,
+    context: TypeResolutionContext,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) !void {
+    if (!std.mem.eql(u8, base_name, "Map")) return;
+    if (args.len != 2) return;
+    const active = context.active orelse return;
+    const key_type = std.mem.trim(u8, args[0], " \t");
+    if (key_type.len == 0) return;
+    if (!trait_solver.typeNameIsEqInEnvironment(active, context.module_id, key_type, context.where_predicates)) {
+        try diagnostics.add(.@"error", "type.map.key_eq", span, "Map key type '{s}' must satisfy Eq", .{key_type});
+    }
+    if (!trait_solver.typeNameIsHashInEnvironment(active, context.module_id, key_type, context.where_predicates)) {
+        try diagnostics.add(.@"error", "type.map.key_hash", span, "Map key type '{s}' must satisfy Hash", .{key_type});
+    }
+}
+
 fn resolveValueTypeWithContext(
     type_name: []const u8,
     context: TypeResolutionContext,
@@ -4206,7 +6710,87 @@ fn resolveValueTypeWithContext(
     if (context.self_type_name) |self_type_name| {
         if (std.mem.eql(u8, trimmed, "Self")) return .{ .named = self_type_name };
     }
+    if (context.active) |active| {
+        var alias_stack = std.array_list.Managed([]const u8).init(diagnostics.allocator);
+        defer alias_stack.deinit();
+        if (try resolveTypeAliasTargetType(active, context.module_id, trimmed, context, span, diagnostics, &alias_stack)) |aliased| {
+            return aliased;
+        }
+    }
     return .{ .named = trimmed };
+}
+
+fn resolveTypeAliasTargetType(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    name: []const u8,
+    context: TypeResolutionContext,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+    alias_stack: *std.array_list.Managed([]const u8),
+) !?types.TypeRef {
+    const alias_source = findTypeAliasSourceItem(active, module_id, name) orelse return null;
+    for (alias_stack.items) |active_name| {
+        if (std.mem.eql(u8, active_name, name)) {
+            try diagnostics.add(.@"error", "type.alias.cycle", span, "type alias cycle involving '{s}'", .{name});
+            return .unsupported;
+        }
+    }
+    try alias_stack.append(name);
+    defer _ = alias_stack.pop();
+
+    const signature = switch (alias_source.item.syntax) {
+        .type_alias => |alias| alias,
+        else => return null,
+    };
+    const alias_target = signature.target orelse return .unsupported;
+    const target_name = std.mem.trim(u8, alias_target.text, " \t");
+    if (target_name.len == 0) return .unsupported;
+
+    const builtin = types.Builtin.fromName(target_name);
+    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+    if (types.CAbiAlias.fromName(target_name) != null) return .{ .named = target_name };
+    if (context.self_type_name) |self_type_name| {
+        if (std.mem.eql(u8, target_name, "Self")) return .{ .named = self_type_name };
+    }
+    var target_context = context;
+    target_context.module_id = alias_source.module_id;
+    if (try resolveTypeAliasTargetType(active, alias_source.module_id, target_name, target_context, span, diagnostics, alias_stack)) |aliased| {
+        return aliased;
+    }
+    return .{ .named = target_name };
+}
+
+const TypeAliasSource = struct {
+    module_id: session.ModuleId,
+    item: hir.Item,
+};
+
+fn findTypeAliasSourceItem(active: *const session.Session, module_id: session.ModuleId, name: []const u8) ?TypeAliasSource {
+    const module_entry = active.semantic_index.moduleEntry(module_id);
+    const source_items = active.pipeline.modules.items[module_entry.pipeline_index].hir.items.items;
+    for (source_items) |source_item| {
+        if (source_item.kind != .type_alias) continue;
+        if (std.mem.eql(u8, source_item.name, name)) return .{ .module_id = module_id, .item = source_item };
+    }
+
+    const module = active.module(module_id);
+    for (module.imports.items) |binding| {
+        if (binding.category != .type_decl) continue;
+        if (!std.mem.eql(u8, binding.local_name, name)) continue;
+        const item_id = findItemIdBySymbol(active, binding.target_symbol) orelse continue;
+        const item = active.item(item_id);
+        if (item.kind != .type_alias) continue;
+        const entry = active.semantic_index.itemEntry(item_id);
+        const source_module_entry = active.semantic_index.moduleEntry(entry.module_id);
+        const source_items_for_module = active.pipeline.modules.items[source_module_entry.pipeline_index].hir.items.items;
+        if (entry.item_index >= source_items_for_module.len) continue;
+        return .{
+            .module_id = entry.module_id,
+            .item = source_items_for_module[entry.item_index],
+        };
+    }
+    return null;
 }
 
 fn duplicateTypeRefIfOwned(allocator: Allocator, value: types.TypeRef) !types.TypeRef {
@@ -4398,8 +6982,11 @@ fn validateTraitMethodSignature(
     defer if (generic_params.len != 0) allocator.free(generic_params);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = type_scope,
         .generic_params = generic_params,
+        .where_predicates = method.where_predicates,
         .allow_self = true,
         .self_type_name = "Self",
     };
@@ -4443,8 +7030,11 @@ fn validateTraitSignature(
     try seedTypeScope(&type_scope, module);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
         .generic_params = trait_type.generic_params,
+        .where_predicates = trait_type.where_predicates,
         .allow_self = true,
         .self_type_name = "Self",
     };
@@ -4467,10 +7057,17 @@ fn validateImplBlock(
     diagnostics: *diag.Bag,
 ) !void {
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = type_scope,
         .generic_params = impl_block.generic_params,
+        .where_predicates = impl_block.where_predicates,
     };
     try validateTypeExpression(impl_block.target_type, context, span, diagnostics);
+    const target_base = baseTypeName(impl_block.target_type);
+    if (target_base.len != 0 and findTypeAliasSourceItem(active, module_id, target_base) != null) {
+        try diagnostics.add(.@"error", "type.alias.impl", span, "type alias '{s}' cannot own impls in v1", .{target_base});
+    }
     if (impl_block.trait_name) |trait_name| {
         try validateTypeExpression(trait_name, context, span, diagnostics);
     } else if (impl_block.associated_types.len != 0) {
@@ -4506,8 +7103,11 @@ fn functionSignatureForItem(
     try seedTypeScope(&type_scope, module);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
         .generic_params = function.generic_params,
+        .where_predicates = function.where_predicates,
         .allow_self = selfTypeNameForFunction(module, item.symbol_name) != null,
         .self_type_name = selfTypeNameForFunction(module, item.symbol_name),
     };
@@ -4530,6 +7130,7 @@ fn functionSignatureForItem(
         .return_type_name = function.return_type_name,
         .return_type = return_type,
         .export_name = function.export_name,
+        .link_name = function.link_name,
         .abi = function.abi,
     };
 }
@@ -4548,8 +7149,11 @@ fn structSignatureForItem(
     try seedTypeScope(&type_scope, module);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
         .generic_params = struct_type.generic_params,
+        .where_predicates = struct_type.where_predicates,
     };
     try validateWherePredicates(active, module_id, module, struct_type.where_predicates, context, span, diagnostics);
 
@@ -4569,6 +7173,8 @@ fn structSignatureForItem(
 
 fn unionSignatureForItem(
     allocator: Allocator,
+    active: *session.Session,
+    module_id: session.ModuleId,
     module: *const typed.Module,
     span: source.Span,
     union_type: *const typed.UnionData,
@@ -4579,6 +7185,8 @@ fn unionSignatureForItem(
     try seedTypeScope(&type_scope, module);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
     };
     const fields = try allocator.alloc(typed.StructField, union_type.fields.len);
@@ -4607,8 +7215,11 @@ fn enumSignatureForItem(
     defer deinitMethodPrototypes(allocator, imported_method_prototypes);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
         .generic_params = enum_type.generic_params,
+        .where_predicates = enum_type.where_predicates,
     };
     try validateWherePredicates(active, module_id, module, enum_type.where_predicates, context, span, diagnostics);
 
@@ -4693,8 +7304,9 @@ fn buildCheckedSignatureFacts(
     return switch (item.kind) {
         .function, .suspend_function, .foreign_function => .{ .function = try functionSignatureFromSyntax(active.allocator, active, module_id, module, item, syntax_item, diagnostics) },
         .const_item => .{ .const_item = try constSignatureFromSyntax(active, active.allocator, module_id, module, prototypes, item.span, syntax_item, &.{}, &.{}, diagnostics) },
+        .type_alias => .{ .type_alias = try typeAliasSignatureFromSyntax(active.allocator, active, module_id, module, item.span, syntax_item, diagnostics) },
         .struct_type => .{ .struct_type = try structSignatureFromSyntax(active.allocator, active, module_id, module, item.span, syntax_item, diagnostics) },
-        .union_type => .{ .union_type = try unionSignatureFromSyntax(active.allocator, module, item.span, syntax_item, diagnostics) },
+        .union_type => .{ .union_type = try unionSignatureFromSyntax(active.allocator, active, module_id, module, item.span, syntax_item, diagnostics) },
         .enum_type => .{ .enum_type = try enumSignatureFromSyntax(active, active.allocator, module_id, module, item.span, syntax_item, item.attributes, diagnostics) },
         .opaque_type => .{ .opaque_type = try opaqueSignatureFromSyntax(active.allocator, item.span, syntax_item, diagnostics) },
         .trait_type => .{ .trait_type = try traitSignatureFromSyntax(active.allocator, active, module_id, module, item.span, syntax_item, diagnostics) },
@@ -4721,11 +7333,8 @@ fn functionSignatureFromSyntax(
     errdefer function.deinit(allocator);
     try item_syntax_bridge.fillFunctionDataFromSyntax(allocator, &function, signature, source_item.span, diagnostics);
     function.export_name = parseExportName(source_item.attributes);
+    function.link_name = parseLinkName(source_item.attributes);
     function.abi = source_item.foreign_abi;
-
-    if (source_item.kind == .foreign_function and function.export_name != null) {
-        try diagnostics.add(.@"error", "type.foreign.export", source_item.span, "foreign declarations do not combine with #export in stage0", .{});
-    }
 
     const result = try functionSignatureForItem(allocator, active, module_id, module, item, &function, diagnostics);
     function.generic_params = &.{};
@@ -4753,6 +7362,46 @@ fn constSignatureFromSyntax(
     var const_item = try item_syntax_bridge.parseConstDataFromSyntax(allocator, signature, span, diagnostics);
     defer const_item.deinit(allocator);
     return constSignatureForItem(active, allocator, module_id, module, prototypes, span, &const_item, generic_params, associated_types, diagnostics);
+}
+
+fn typeAliasSignatureFromSyntax(
+    allocator: Allocator,
+    active: *session.Session,
+    module_id: session.ModuleId,
+    module: *const typed.Module,
+    span: source.Span,
+    source_item: hir.Item,
+    diagnostics: *diag.Bag,
+) !query_types.TypeAliasSignature {
+    const signature = switch (source_item.syntax) {
+        .type_alias => |value| value,
+        else => return error.InvalidParse,
+    };
+    const generic_params = try item_syntax_bridge.parseGenericParamsFromSpan(allocator, signature.generic_params, span, diagnostics);
+    errdefer if (generic_params.len != 0) allocator.free(generic_params);
+    const where_predicates = try item_syntax_bridge.parseWherePredicatesFromClauses(allocator, signature.where_clauses, generic_params, false, span, diagnostics);
+    errdefer if (where_predicates.len != 0) allocator.free(where_predicates);
+
+    var type_scope = NameSet.init(allocator);
+    defer type_scope.deinit();
+    try seedTypeScope(&type_scope, module);
+    const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
+        .type_scope = &type_scope,
+        .generic_params = generic_params,
+        .where_predicates = where_predicates,
+    };
+    try validateWherePredicates(active, module_id, module, where_predicates, context, span, diagnostics);
+
+    const target_type_name = if (signature.target) |alias_target| std.mem.trim(u8, alias_target.text, " \t") else "";
+    const target_type = try resolveValueTypeWithContext(target_type_name, context, span, diagnostics);
+    return .{
+        .generic_params = generic_params,
+        .where_predicates = where_predicates,
+        .target_type_name = target_type_name,
+        .target_type = target_type,
+    };
 }
 
 fn namedDeclDataFromSyntax(
@@ -4801,6 +7450,8 @@ fn structSignatureFromSyntax(
 
 fn unionSignatureFromSyntax(
     allocator: Allocator,
+    active: *session.Session,
+    module_id: session.ModuleId,
     module: *const typed.Module,
     span: source.Span,
     source_item: hir.Item,
@@ -4813,7 +7464,7 @@ fn unionSignatureFromSyntax(
     };
     var union_type = typed.UnionData{ .fields = fields };
     defer union_type.deinit(allocator);
-    return unionSignatureForItem(allocator, module, span, &union_type, diagnostics);
+    return unionSignatureForItem(allocator, active, module_id, module, span, &union_type, diagnostics);
 }
 
 fn enumSignatureFromSyntax(
@@ -5055,6 +7706,8 @@ fn constSignatureForItem(
     try seedTypeScope(&type_scope, module);
 
     const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
         .type_scope = &type_scope,
         .generic_params = generic_params,
     };

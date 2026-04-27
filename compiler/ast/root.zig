@@ -27,6 +27,7 @@ pub const AssignOpSyntax = body_syntax.AssignOp;
 pub const ParameterSyntax = item_syntax.Parameter;
 pub const FunctionSignatureSyntax = item_syntax.FunctionSignature;
 pub const ConstSignatureSyntax = item_syntax.ConstSignature;
+pub const TypeAliasSyntax = item_syntax.TypeAlias;
 pub const NamedDeclSyntax = item_syntax.NamedDecl;
 pub const UseBindingSyntax = item_syntax.UseBinding;
 pub const ImplSignatureSyntax = item_syntax.ImplSignature;
@@ -46,6 +47,7 @@ pub const ItemKind = enum {
     suspend_function,
     foreign_function,
     const_item,
+    type_alias,
     struct_type,
     enum_type,
     union_type,

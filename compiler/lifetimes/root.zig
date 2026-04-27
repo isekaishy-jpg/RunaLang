@@ -777,6 +777,13 @@ fn inferExprOrigins(
                 }
             }
         },
+        .tuple => |tuple| {
+            for (tuple.items) |item| {
+                var item_origins = try inferExprOrigins(allocator, origins, item);
+                defer item_origins.deinit();
+                try inferred.mergeFrom(&item_origins);
+            }
+        },
         .integer,
         .bool_lit,
         .string,

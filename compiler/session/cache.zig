@@ -2,6 +2,10 @@ const std = @import("std");
 const query_types = @import("../query/types.zig");
 const session_ids = @import("ids.zig");
 const typed = @import("../typed/root.zig");
+const abi_model = @import("../abi/root.zig");
+const backend_contract = @import("../backend_contract/root.zig");
+const layout = @import("../layout/root.zig");
+const types = @import("../types/root.zig");
 const array_list = std.array_list;
 
 pub const QueryState = enum {
@@ -30,6 +34,71 @@ pub const ImplLookupEntry = struct {
     value: ?query_types.ImplLookupResult = null,
 };
 
+pub const LayoutEntry = struct {
+    key: layout.LayoutKey,
+    state: QueryState = .not_started,
+    failed: bool = false,
+    value: ?layout.LayoutResult = null,
+
+    pub fn deinit(self: *LayoutEntry, allocator: std.mem.Allocator) void {
+        layout.deinitLayoutKey(allocator, &self.key);
+        if (self.value) |*value| layout.deinitLayoutResult(allocator, value);
+        self.* = undefined;
+    }
+};
+
+pub const AbiTypeEntry = struct {
+    key: abi_model.AbiTypeKey,
+    state: QueryState = .not_started,
+    failed: bool = false,
+    value: ?abi_model.AbiTypeResult = null,
+
+    pub fn deinit(self: *AbiTypeEntry, allocator: std.mem.Allocator) void {
+        abi_model.deinitAbiTypeKey(allocator, &self.key);
+        if (self.value) |*value| abi_model.deinitAbiTypeResult(allocator, value);
+        self.* = undefined;
+    }
+};
+
+pub const AbiCallableEntry = struct {
+    key: abi_model.AbiCallableKey,
+    state: QueryState = .not_started,
+    failed: bool = false,
+    value: ?abi_model.AbiCallableResult = null,
+
+    pub fn deinit(self: *AbiCallableEntry, allocator: std.mem.Allocator) void {
+        abi_model.deinitAbiCallableKey(allocator, &self.key);
+        if (self.value) |*value| abi_model.deinitAbiCallableResult(allocator, value);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredBackendModuleEntry = struct {
+    key: backend_contract.LoweredModuleKey,
+    state: QueryState = .not_started,
+    failed: bool = false,
+    value: ?backend_contract.LoweredModule = null,
+
+    pub fn deinit(self: *LoweredBackendModuleEntry, allocator: std.mem.Allocator) void {
+        backend_contract.deinitLoweredModuleKey(allocator, &self.key);
+        if (self.value) |*value| backend_contract.deinitLoweredModule(allocator, value);
+        self.* = undefined;
+    }
+};
+
+pub const RuntimeRequirementEntry = struct {
+    key: backend_contract.RuntimeRequirementKey,
+    state: QueryState = .not_started,
+    failed: bool = false,
+    value: ?backend_contract.RuntimeRequirementResult = null,
+
+    pub fn deinit(self: *RuntimeRequirementEntry, allocator: std.mem.Allocator) void {
+        backend_contract.deinitRuntimeRequirementKey(allocator, &self.key);
+        if (self.value) |*value| backend_contract.deinitRuntimeRequirementResult(allocator, value);
+        self.* = undefined;
+    }
+};
+
 pub fn Entry(comptime T: type) type {
     return struct {
         state: QueryState = .not_started,
@@ -39,6 +108,12 @@ pub fn Entry(comptime T: type) type {
 }
 
 pub const CacheStore = struct {
+    canonical_types: array_list.Managed(types.CanonicalType),
+    layouts: array_list.Managed(LayoutEntry),
+    abi_types: array_list.Managed(AbiTypeEntry),
+    abi_callables: array_list.Managed(AbiCallableEntry),
+    runtime_requirements: array_list.Managed(RuntimeRequirementEntry),
+    lowered_backend_modules: array_list.Managed(LoweredBackendModuleEntry),
     signatures: []Entry(query_types.CheckedSignature),
     bodies: []Entry(query_types.CheckedBody),
     statements: []Entry(query_types.StatementResult),
@@ -67,6 +142,12 @@ pub const CacheStore = struct {
 
     pub fn init(allocator: std.mem.Allocator, index: *const session_ids.SemanticIndex) !CacheStore {
         return .{
+            .canonical_types = array_list.Managed(types.CanonicalType).init(allocator),
+            .layouts = array_list.Managed(LayoutEntry).init(allocator),
+            .abi_types = array_list.Managed(AbiTypeEntry).init(allocator),
+            .abi_callables = array_list.Managed(AbiCallableEntry).init(allocator),
+            .runtime_requirements = array_list.Managed(RuntimeRequirementEntry).init(allocator),
+            .lowered_backend_modules = array_list.Managed(LoweredBackendModuleEntry).init(allocator),
             .signatures = try allocateEntries(query_types.CheckedSignature, allocator, index.items.items.len),
             .bodies = try allocateEntries(query_types.CheckedBody, allocator, index.bodies.items.len),
             .statements = try allocateEntries(query_types.StatementResult, allocator, index.bodies.items.len),
@@ -96,6 +177,18 @@ pub const CacheStore = struct {
     }
 
     pub fn deinit(self: *CacheStore, allocator: std.mem.Allocator) void {
+        for (self.canonical_types.items) |*canonical| types.deinitCanonicalType(allocator, canonical);
+        self.canonical_types.deinit();
+        for (self.layouts.items) |*entry| entry.deinit(allocator);
+        self.layouts.deinit();
+        for (self.abi_types.items) |*entry| entry.deinit(allocator);
+        self.abi_types.deinit();
+        for (self.abi_callables.items) |*entry| entry.deinit(allocator);
+        self.abi_callables.deinit();
+        for (self.runtime_requirements.items) |*entry| entry.deinit(allocator);
+        self.runtime_requirements.deinit();
+        for (self.lowered_backend_modules.items) |*entry| entry.deinit(allocator);
+        self.lowered_backend_modules.deinit();
         for (self.signatures) |entry| {
             if (entry.value) |value| value.deinit(allocator);
         }
@@ -138,7 +231,7 @@ pub const CacheStore = struct {
         }
         allocator.free(self.package_reflections);
         for (self.module_boundary_apis) |entry| {
-            if (entry.value) |value| allocator.free(value.apis);
+            if (entry.value) |value| deinitModuleBoundaryApiResult(allocator, value);
         }
         allocator.free(self.module_boundary_apis);
         self.trait_goals.deinit();
@@ -159,6 +252,16 @@ pub const CacheStore = struct {
         allocator.free(self.domain_state_bodies);
     }
 };
+
+fn deinitModuleBoundaryApiResult(allocator: std.mem.Allocator, result: query_types.ModuleBoundaryApiResult) void {
+    for (result.apis) |api| {
+        for (api.referenced_capability_families) |family| {
+            if (family.len != 0) allocator.free(family);
+        }
+        if (api.referenced_capability_families.len != 0) allocator.free(api.referenced_capability_families);
+    }
+    if (result.apis.len != 0) allocator.free(result.apis);
+}
 
 fn allocateEntries(comptime T: type, allocator: std.mem.Allocator, len: usize) ![]Entry(T) {
     const entries = try allocator.alloc(Entry(T), len);

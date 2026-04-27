@@ -577,6 +577,7 @@ fn inferExprOrigin(origins: []const NamedOrigin, expr: *const typed.Expr) Bounda
         .enum_construct,
         .call,
         .constructor,
+        .tuple,
         .array,
         .array_repeat,
         .index,

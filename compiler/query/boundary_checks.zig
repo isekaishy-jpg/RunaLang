@@ -217,6 +217,7 @@ fn classifyBuiltin(builtin: types.Builtin) BoundaryCategory {
         .i32,
         .u32,
         .index,
+        .isize,
         .str,
         => .transfer_safe,
         .unsupported => .local_only,

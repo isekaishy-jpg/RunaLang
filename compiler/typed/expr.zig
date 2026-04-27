@@ -52,6 +52,7 @@ pub const Expr = struct {
         constructor: Constructor,
         method_target: MethodTarget,
         field: Field,
+        tuple: Tuple,
         array: Array,
         array_repeat: ArrayRepeat,
         index: Index,
@@ -88,11 +89,16 @@ pub const Expr = struct {
         base: *Expr,
         target_type: []const u8,
         method_name: []const u8,
+        type_arg_name: ?[]const u8 = null,
     };
 
     pub const Field = struct {
         base: *Expr,
         field_name: []const u8,
+    };
+
+    pub const Tuple = struct {
+        items: []*Expr,
     };
 
     pub const Array = struct {
@@ -158,6 +164,13 @@ pub const Expr = struct {
             .field => |field| {
                 field.base.deinit(allocator);
                 allocator.destroy(field.base);
+            },
+            .tuple => |tuple| {
+                for (tuple.items) |item| {
+                    item.deinit(allocator);
+                    allocator.destroy(item);
+                }
+                allocator.free(tuple.items);
             },
             .array => |array| {
                 for (array.items) |item| {
@@ -258,11 +271,20 @@ pub fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
             .base = try cloneExpr(allocator, target.base),
             .target_type = target.target_type,
             .method_name = target.method_name,
+            .type_arg_name = target.type_arg_name,
         } },
         .field => |field| .{ .field = .{
             .base = try cloneExpr(allocator, field.base),
             .field_name = field.field_name,
         } },
+        .tuple => |tuple| blk: {
+            const items = try allocator.alloc(*Expr, tuple.items.len);
+            errdefer allocator.free(items);
+            for (tuple.items, 0..) |item, item_index| {
+                items[item_index] = try cloneExpr(allocator, item);
+            }
+            break :blk .{ .tuple = .{ .items = items } };
+        },
         .array => |array| blk: {
             const items = try allocator.alloc(*Expr, array.items.len);
             errdefer allocator.free(items);

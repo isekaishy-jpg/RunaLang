@@ -470,7 +470,7 @@ fn reportArrayRepetitionLengthError(diagnostics: *diag.Bag, span: ?source.Span, 
 fn constSafeType(env: *LocalEnv, ty: types.TypeRef) bool {
     return switch (ty) {
         .builtin => |builtin| switch (builtin) {
-            .bool, .i32, .u32, .index, .str => true,
+            .bool, .i32, .u32, .index, .isize, .str => true,
             .unit, .unsupported => false,
         },
         .named => |name| constSafeNamedType(env, name),

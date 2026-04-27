@@ -278,6 +278,7 @@ pub fn lowerExpr(allocator: Allocator, expr: *const typed.Expr) anyerror!*Expr {
                 .field_name = field.field_name,
             } };
         },
+        .tuple => .{ .literal = .unsupported },
         .array => |array| .{ .array = .{
             .items = try lowerExprSlice(allocator, array.items),
         } },

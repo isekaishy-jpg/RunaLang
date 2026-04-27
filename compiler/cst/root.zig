@@ -30,6 +30,7 @@ pub const NodeKind = enum {
     return_type,
     const_type,
     const_initializer,
+    type_alias_value,
     use_path,
     use_alias,
     foreign_abi,
@@ -50,6 +51,7 @@ pub const NodeKind = enum {
     suspend_function_item,
     foreign_function_item,
     const_item,
+    type_alias_item,
     struct_item,
     enum_item,
     union_item,
@@ -89,6 +91,7 @@ pub const NodeKind = enum {
     type_lifetime,
     type_apply,
     type_borrow,
+    type_raw_pointer,
     type_assoc,
     expr_name,
     expr_integer,
@@ -97,6 +100,7 @@ pub const NodeKind = enum {
     expr_tuple,
     expr_array,
     expr_array_repeat,
+    expr_raw_pointer,
     expr_unary,
     expr_binary,
     expr_field,
@@ -575,6 +579,7 @@ const Parser = struct {
         return switch (item_kind) {
             .function_item, .suspend_function_item, .foreign_function_item => self.parseFunctionSignature(line_end),
             .const_item => self.parseConstSignature(line_end),
+            .type_alias_item => self.parseTypeAliasSignature(line_end),
             .module_item => self.parseModuleSignature(line_end),
             .use_item => self.parseUseSignature(line_end),
             .impl_item => self.parseImplSignature(line_end),
@@ -677,6 +682,50 @@ const Parser = struct {
                 try children.append(.{ .node = try self.parseExpressionNode(.const_initializer, self.index, line_end) });
                 self.index = line_end;
             }
+        }
+
+        if (self.currentKind() == .newline) {
+            try children.append(.{ .token = self.tokens.refAt(self.index) });
+            self.index += 1;
+        }
+
+        return self.builder.appendNode(.item_signature, children.items);
+    }
+
+    fn parseTypeAliasSignature(self: *Parser, line_end: usize) !NodeId {
+        var children = array_list.Managed(Child).init(self.allocator);
+        defer children.deinit();
+
+        try self.appendVisibilityIfPresent(&children, line_end);
+
+        if (self.currentKind() == .keyword_type) {
+            try children.append(.{ .token = self.tokens.refAt(self.index) });
+            self.index += 1;
+        }
+
+        if (self.currentKind() == .identifier) {
+            try children.append(.{ .node = try self.builder.appendTokenRange(.item_name, self.index, self.index + 1) });
+            self.index += 1;
+        } else {
+            try children.append(.{ .missing_token = .{ .expected = .identifier } });
+        }
+
+        if (self.currentKind() == .l_bracket) {
+            try children.append(.{ .node = try self.parseDelimitedRange(.generic_param_list, .l_bracket, .r_bracket, line_end) });
+        }
+
+        if (self.currentKind() == .equal) {
+            try children.append(.{ .token = self.tokens.refAt(self.index) });
+            self.index += 1;
+            if (self.index < line_end) {
+                try children.append(.{ .node = try self.parseTypeNode(.type_alias_value, self.index, line_end) });
+                self.index = line_end;
+            }
+        }
+
+        if (self.index < line_end) {
+            try children.append(.{ .node = try self.builder.appendTokenRange(.item_signature, self.index, line_end) });
+            self.index = line_end;
         }
 
         if (self.currentKind() == .newline) {
@@ -867,7 +916,13 @@ const Parser = struct {
             self.index += 1;
         }
 
-        if (self.currentKind() == .identifier) {
+        if (self.currentKind() == .range or self.currentKind() == .range_inclusive) {
+            const name_start = self.index;
+            self.index += 1;
+            if (self.currentKind() == .dot) self.index += 1;
+            if (self.currentKind() == .identifier) self.index += 1;
+            try children.append(.{ .node = try self.builder.appendTokenRange(.parameter_name, name_start, self.index) });
+        } else if (self.currentKind() == .identifier) {
             try children.append(.{ .node = try self.builder.appendTokenRange(.parameter_name, self.index, self.index + 1) });
             self.index += 1;
         } else {
@@ -1669,6 +1724,7 @@ const Parser = struct {
             .keyword_fn => .function_item,
             .keyword_extern => .foreign_function_item,
             .keyword_const => .const_item,
+            .keyword_type => .type_alias_item,
             .keyword_struct => .struct_item,
             .keyword_enum => .enum_item,
             .keyword_union => .union_item,
@@ -1961,6 +2017,9 @@ const TypeParser = struct {
     }
 
     fn parseType(self: *TypeParser) anyerror!NodeId {
+        if (self.currentKind() == .star) {
+            return self.parseRawPointer();
+        }
         if (self.currentKind() == .identifier and std.mem.eql(u8, self.parser.tokens.get(self.index).lexeme, "read")) {
             return self.parseBorrowPrefix();
         }
@@ -1989,6 +2048,24 @@ const TypeParser = struct {
             left = try self.parser.builder.appendNode(.type_assoc, children.items);
         }
         return left;
+    }
+
+    fn parseRawPointer(self: *TypeParser) anyerror!NodeId {
+        var children = array_list.Managed(Child).init(self.parser.allocator);
+        defer children.deinit();
+
+        try children.append(.{ .token = self.parser.tokens.refAt(self.index) });
+        self.index += 1;
+
+        if (self.currentKind() == .identifier and (std.mem.eql(u8, self.parser.tokens.get(self.index).lexeme, "read") or std.mem.eql(u8, self.parser.tokens.get(self.index).lexeme, "edit"))) {
+            try children.append(.{ .token = self.parser.tokens.refAt(self.index) });
+            self.index += 1;
+        } else {
+            try children.append(.{ .missing_token = .{ .expected = .identifier } });
+        }
+
+        try children.append(.{ .node = try self.parseType() });
+        return self.parser.builder.appendNode(.type_raw_pointer, children.items);
     }
 
     fn parseBorrowPrefix(self: *TypeParser) anyerror!NodeId {
@@ -2164,6 +2241,7 @@ const ExprParser = struct {
             .string_literal => self.parseLeaf(.expr_string),
             .l_paren => self.parseParenLike(),
             .l_bracket => self.parseArray(),
+            .amp => self.parseAmpPrefix(),
             .bang, .minus, .tilde => self.parseUnary(),
             else => self.parseErrorLeaf(),
         };
@@ -2191,6 +2269,32 @@ const ExprParser = struct {
         try children.append(.{ .token = self.parser.tokens.refAt(operator_index) });
         try children.append(.{ .node = operand });
         return self.parser.builder.appendNode(.expr_unary, children.items);
+    }
+
+    fn parseAmpPrefix(self: *ExprParser) anyerror!NodeId {
+        if (self.index + 2 >= self.end or
+            self.tokenKindAt(self.index + 1) != .identifier or
+            !std.mem.eql(u8, self.parser.tokens.get(self.index + 1).lexeme, "raw") or
+            self.tokenKindAt(self.index + 2) != .identifier or
+            (!std.mem.eql(u8, self.parser.tokens.get(self.index + 2).lexeme, "read") and
+                !std.mem.eql(u8, self.parser.tokens.get(self.index + 2).lexeme, "edit")))
+        {
+            return self.parseErrorLeaf();
+        }
+
+        const amp_index = self.index;
+        const raw_index = self.index + 1;
+        const mode_index = self.index + 2;
+        self.index += 3;
+        const place = try self.parsePrecedence(90);
+
+        var children = array_list.Managed(Child).init(self.parser.allocator);
+        defer children.deinit();
+        try children.append(.{ .token = self.parser.tokens.refAt(amp_index) });
+        try children.append(.{ .token = self.parser.tokens.refAt(raw_index) });
+        try children.append(.{ .token = self.parser.tokens.refAt(mode_index) });
+        try children.append(.{ .node = place });
+        return self.parser.builder.appendNode(.expr_raw_pointer, children.items);
     }
 
     fn parseParenLike(self: *ExprParser) anyerror!NodeId {

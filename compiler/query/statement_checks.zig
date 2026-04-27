@@ -5,6 +5,7 @@ const query_types = @import("types.zig");
 const typed = @import("../typed/root.zig");
 const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
+const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -373,6 +374,10 @@ fn resolveAssignmentTarget(
                 },
             };
             const field_name = std.mem.trim(u8, field.field_name.text, " \t");
+            if (tuple_types.projectionIndex(field_name) != null) {
+                try emit(diagnostics, summary, "type.tuple.assign", target.span, "tuple field assignment is not part of v1", .{});
+                return null;
+            }
             if (!typed_text.isPlainIdentifier(base_name) or !typed_text.isPlainIdentifier(field_name)) {
                 try emit(diagnostics, summary, "type.assign.target", target.span, "stage0 assignment supports only plain locals or one struct field projection", .{});
                 return null;
@@ -412,6 +417,41 @@ fn resolveAssignmentTarget(
             });
             return null;
         },
+        .index => |index| {
+            const base_name = switch (index.base.node) {
+                .name => |name| std.mem.trim(u8, name.text, " \t"),
+                else => {
+                    try emit(diagnostics, summary, "type.assign.target", target.span, "array element assignment requires a local array base", .{});
+                    return null;
+                },
+            };
+            const base_type = scope.get(base_name) orelse {
+                try emit(diagnostics, summary, "type.assign.unknown", target.span, "assignment target '{s}' is not a known local name", .{base_name});
+                return null;
+            };
+            if (!scope.isMutable(base_name)) {
+                try emit(diagnostics, summary, "type.assign.immutable", target.span, "assignment target '{s}' is not mutable in stage0", .{base_name});
+                return null;
+            }
+            const element_type = fixedArrayElementType(base_type) orelse {
+                try emit(diagnostics, summary, "type.assign.target", target.span, "array element assignment requires a fixed array target", .{});
+                return null;
+            };
+            const index_text = simpleIndexTargetText(index.index) orelse {
+                try emit(diagnostics, summary, "type.assign.target", target.span, "stage0 array element assignment requires a simple index key", .{});
+                return null;
+            };
+            if (index.index.node == .name) {
+                const key_type = scope.get(index_text) orelse .unsupported;
+                if (!key_type.eql(types.TypeRef.fromBuiltin(.index)) and !key_type.isUnsupported()) {
+                    try emit(diagnostics, summary, "type.expr.keyed_access.index", target.span, "keyed access requires an Index expression", .{});
+                }
+            }
+            return .{
+                .rendered_name = index_text,
+                .ty = element_type,
+            };
+        },
         else => {
             try emit(diagnostics, summary, "type.assign.target", target.span, "stage0 assignment supports only plain locals or one struct field projection", .{});
             return null;
@@ -428,6 +468,31 @@ fn findStructFields(body: query_types.CheckedBody, name: []const u8) ?[]const ty
         if (std.mem.eql(u8, binding.local_name, name)) return fields;
     }
     return null;
+}
+
+fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
+    const raw = switch (ty) {
+        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
+        else => return null,
+    };
+    if (!std.mem.startsWith(u8, raw, "[")) return null;
+    const close_index = typed_text.findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
+    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t\r\n").len != 0) return null;
+    const inner = raw[1..close_index];
+    const separator = typed_text.findTopLevelHeaderScalar(inner, ';') orelse return null;
+    const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
+    if (element_name.len == 0) return null;
+    const builtin = types.Builtin.fromName(element_name);
+    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+    return .{ .named = element_name };
+}
+
+fn simpleIndexTargetText(expr: *const ast.BodyExprSyntax) ?[]const u8 {
+    return switch (expr.node) {
+        .integer => |integer| std.mem.trim(u8, integer.text, " \t\r\n"),
+        .name => |name| std.mem.trim(u8, name.text, " \t\r\n"),
+        else => null,
+    };
 }
 
 fn blockDefinitelyReturns(block: *const typed.Block) bool {

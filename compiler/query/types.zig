@@ -14,6 +14,12 @@ const typed = @import("../typed/root.zig");
 const types = @import("../types/root.zig");
 
 pub const QueryFamily = enum {
+    canonical_type,
+    layout,
+    abi_type,
+    abi_callable,
+    runtime_requirements,
+    lowered_backend_module,
     signature,
     body,
     statements,
@@ -52,6 +58,8 @@ pub const CanonicalTypeHead = union(enum) {
 
 pub const CanonicalTraitHead = union(enum) {
     builtin_send,
+    builtin_eq,
+    builtin_hash,
     trait_item: session_ids.TraitId,
     opaque_name: intern.SymbolId,
 };
@@ -215,7 +223,31 @@ pub const FunctionSignature = struct {
     return_type_name: []const u8,
     return_type: types.TypeRef,
     export_name: ?[]const u8,
+    link_name: ?[]const u8,
     abi: ?[]const u8,
+};
+
+pub const TypeAliasSignature = struct {
+    generic_params: []const typed.GenericParam,
+    where_predicates: []const typed.WherePredicate,
+    target_type_name: []const u8,
+    target_type: types.TypeRef,
+};
+
+pub const AbiSurfaceRole = enum {
+    none,
+    foreign_import,
+    foreign_export,
+};
+
+pub const SignatureSurfaceFacts = struct {
+    nominal_item_id: ?session_ids.ItemId = null,
+    declared_repr: types.DeclaredRepr = .default,
+    foreign_convention: ?[]const u8 = null,
+    abi_role: AbiSurfaceRole = .none,
+    variadic: bool = false,
+    unsafe_required: bool = false,
+    opaque_incomplete: bool = false,
 };
 
 pub const ConstRequiredExprKind = enum {
@@ -297,6 +329,7 @@ pub const SignatureFacts = union(enum) {
     none,
     function: FunctionSignature,
     const_item: ConstSignature,
+    type_alias: TypeAliasSignature,
     struct_type: StructSignature,
     union_type: UnionSignature,
     enum_type: EnumSignature,
@@ -314,6 +347,7 @@ pub const CheckedSignature = struct {
     reflectable: bool,
     exported: bool,
     unsafe_required: bool,
+    surface: SignatureSurfaceFacts,
     const_required_expr_sites: []const ConstRequiredExprSite,
     facts: SignatureFacts,
 
@@ -335,6 +369,10 @@ pub const CheckedSignature = struct {
                     else => {},
                 }
                 if (const_item.expr) |expr| const_ir.destroyExpr(allocator, expr);
+            },
+            .type_alias => |type_alias| {
+                if (type_alias.generic_params.len != 0) allocator.free(type_alias.generic_params);
+                if (type_alias.where_predicates.len != 0) allocator.free(type_alias.where_predicates);
             },
             .struct_type => |struct_type| {
                 if (struct_type.generic_params.len != 0) allocator.free(struct_type.generic_params);
@@ -507,6 +545,7 @@ pub const BoundaryApiMetadata = struct {
     parameters: []const typed.Parameter,
     return_type: types.TypeRef,
     export_name: ?[]const u8,
+    referenced_capability_families: []const []const u8 = &.{},
 };
 
 pub const ModuleBoundaryApiResult = struct {

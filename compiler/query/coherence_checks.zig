@@ -199,7 +199,7 @@ fn ownerPackageIndexForTraitHead(
 ) ?usize {
     return switch (trait_head) {
         .trait_item => |trait_id| packageIndexForItem(active, active.semantic_index.traitEntry(trait_id).item_id),
-        .builtin_send, .opaque_name => null,
+        .builtin_send, .builtin_eq, .builtin_hash, .opaque_name => null,
     };
 }
 

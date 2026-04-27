@@ -79,6 +79,7 @@ An attribute is valid only on targets explicitly allowed by the spec that define
 The first-wave built-in attribute set is:
 
 - `#unsafe`
+- `#test`
 - `#reflect`
 - `#domain_root`
 - `#domain_context`
@@ -90,6 +91,7 @@ The first-wave built-in attribute set is:
 Their detailed semantics remain in the specs that own them:
 
 - `#unsafe` in `spec/unsafe.md`
+- `#test` in `spec/check-and-test.md`
 - `#reflect` in `spec/reflection.md`
 - `#domain_root` and `#domain_context` in `spec/domain-state-surface.md`
 - `#boundary[...]` in `spec/boundary-contracts.md`
