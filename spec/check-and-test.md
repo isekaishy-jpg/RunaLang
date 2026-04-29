@@ -62,6 +62,26 @@ By default it:
 This is workspace or package validation, not single-file ambient checking by
 default.
 
+For semantic graph loading and dependency validation, `runa check` may read the
+dependencies required by the scoped local packages.
+
+For local structural authoring rules, the first-wave local authoring scope
+matches `spec/formatting.md`.
+
+This local authoring scope includes:
+
+- the root package when the discovered command root is also one package root
+- explicit `[workspace].members` when the discovered command root is one
+  explicit workspace
+- declared vendored path dependencies under workspace-root `vendor/`
+
+This local authoring scope excludes:
+
+- global-store dependencies
+- external path dependencies outside the discovered command root
+- `target/`
+- `dist/`
+
 ## What `check` Validates
 
 `runa check` validates at least:
@@ -111,6 +131,14 @@ This does not authorize full backend or linker execution as part of `check`.
 `runa check` owns first-wave structural source enforcement intended to prevent
 monolithic library layout.
 
+These structural source rules apply only to the first-wave local authoring
+scope defined by this spec.
+
+They do not apply to:
+
+- global-store dependencies
+- external path dependencies outside the discovered command root
+
 ### File Size Limit
 
 Every authored `.rna` source file has a hard physical-line limit of `3000`
@@ -128,7 +156,7 @@ unless later specs explicitly place them under it.
 
 Every `lib` product must contain:
 
-- `lib.rna`
+- its declared root entry file
 - at least one child module entry
 
 This means a library root must not be the entire library by itself.
@@ -151,6 +179,24 @@ They still remain subject to the `3000` physical-line limit.
 ## Failure Policy
 
 Unsupported or invalid check-state must fail loudly.
+
+`runa check` must report semantic and structural failures together when they can
+be computed in one run.
+
+Failure-ordering law:
+
+- shared frontend parsing and semantic checking run for the discovered check
+  scope
+- parse-independent structural checks still run even when semantic checking
+  reports errors elsewhere in scope
+- parse-dependent structural checks run only for local files or products whose
+  required parse bundles succeeded
+
+This means:
+
+- the `3000`-line rule still runs even when semantic checking fails elsewhere
+- the library child-module rule runs only where the relevant declared `lib`
+  product root parsed successfully
 
 `runa check` must not:
 
@@ -268,6 +314,36 @@ This means:
 - workspace `runa test` aggregates package-local test runs across the packages in scope
 - cross-package integration-test law is deferred
 
+The first-wave default package scope for `runa test` matches the local
+authoring scope from `spec/formatting.md`.
+
+This includes:
+
+- the root package when the discovered command root is also one package root
+- explicit `[workspace].members` when the discovered command root is one
+  explicit workspace
+- declared vendored path dependencies under workspace-root `vendor/`
+
+This excludes:
+
+- global-store dependencies
+- external path dependencies outside the discovered command root
+- implicit ambient test discovery outside the discovered command root
+
+## Test Identity
+
+First-wave test identity must be package-unique.
+
+One discovered test is identified by:
+
+- package identity
+- canonical root-module relative path within that package
+- canonical module path beneath that root
+- function name
+
+The toolchain must not collapse distinct tests from different package roots or
+different module trees into one test identity.
+
 ## Harness Model
 
 The first-wave harness model is tool-owned.
@@ -285,21 +361,67 @@ That harness:
 The harness model must not require users to declare test-only `bin` products
 just to run package tests.
 
+Each package harness runs with the package root of the package under test as
+its current working directory.
+
+Generated harness files may live under tool-owned target scratch paths, but
+runtime relative-path behavior uses the package root as cwd.
+
 ## Execution Model
 
-First-wave test execution is deterministic and serial.
+The first-wave default test execution model is deterministic, serial, and
+fail-fast at the package-harness boundary.
 
 This means:
 
 - package execution order must be deterministic
 - test execution order within one package must be deterministic
-- parallel test execution is not part of v1
+- package harnesses run serially by default
+- tests within one package harness run serially by default
 
-The recommended deterministic order is:
+The first-wave required deterministic order is:
 
-- package order from the resolved command scope
-- then canonical module path order
+- package order by canonical manifest-relative path within the discovered
+  command scope
+- then root-module relative path order within one package
+- then canonical module path order within one root-module tree
 - then declaration order within one module
+
+This order is one flattened package-local execution order.
+
+The command-root package, when present, uses `.` as its canonical
+manifest-relative ordering key.
+
+Harness grouping or internal root-module grouping must not change that visible
+flattened test order.
+
+Fail-fast law:
+
+- the default first-wave package-harness execution model is fail-fast
+- if one package harness finishes with one or more failed tests or one or more
+  harness failures, later package harnesses in scope must not start
+- tests inside the current package harness run to that harness's completion
+  before fail-fast stops later package harnesses
+
+## Optional Parallel Mode
+
+The first-wave test surface also standardizes:
+
+- `runa test --parallel`
+
+`--parallel` enables parallel execution within one package harness.
+
+In `--parallel` mode:
+
+- package harnesses still start in deterministic package order
+- package harnesses still run one package at a time in v1
+- tests within the current package harness may execute in parallel
+- start and completion order of tests inside that harness need not be
+  deterministic
+- discovery order, identity, and final summary accounting remain deterministic
+- failure reporting for multiple failed tests remains in discovery order
+- fail-fast still applies at the package-harness boundary after the current
+  harness completes
 
 ## Success And Failure
 
@@ -313,9 +435,29 @@ A first-wave test fails when:
 - a `Result[Unit, Str]` test returns `Result.Err(message)`
 - the test aborts
 - the test terminates abnormally
-- the tool-owned harness exits unsuccessfully
 
-Any one test failure makes `runa test` fail.
+Harness or process failure is separate from one executed test failure.
+
+The first-wave required summary counts are:
+
+- discovered
+- executed
+- passed
+- failed
+- harness_failures
+
+Accounting law:
+
+- `discovered` counts discovered tests in scope
+- `executed` counts only tests that actually began execution
+- `passed` counts executed successful tests
+- `failed` counts executed failing tests
+- `harness_failures` counts unsuccessful harness build, launch, runtime, or
+  result-collection failures
+- tests that were discovered but never executed must not be auto-counted as
+  failed tests
+
+Any one executed test failure or one harness failure makes `runa test` fail.
 
 ## Stage0 Target And Runtime Policy
 
@@ -357,6 +499,45 @@ At minimum:
 - final pass or fail summary goes to stdout
 - any test failure is nonzero
 
+The first-wave child test-process output policy is captured-by-default.
+
+This means:
+
+- child stdout is captured by default
+- child stderr is captured by default
+- successful tests do not stream captured child output by default
+- failed tests must surface captured child output as part of their failure
+  report when captured output exists
+- harness-failure reports must surface captured child output when available
+- surfaced captured output in failure reports is emitted on stderr
+- per-test progress and tool-owned status lines remain on stderr
+- final package and command summaries remain on stdout
+
+The first-wave test surface also standardizes:
+
+- `runa test --no-capture`
+
+In `--no-capture` mode:
+
+- child stdout streams live to stdout
+- child stderr streams live to stderr
+- successful tests may emit visible child output
+- failed-test reports do not need to repeat output already streamed live
+- harness-failure reports may still summarize or surface relevant child output
+  context
+- per-test progress and tool-owned status lines remain on stderr
+- final package and command summaries remain on stdout
+
+In `--parallel --no-capture` mode:
+
+- output from different concurrently executing tests may interleave
+- visible child-output ordering across different tests is not deterministic
+- the tool does not guarantee one stable merged stdout or stderr presentation
+  order across concurrently executing tests
+- per-stream ordering inside one individual test remains preserved
+- deterministic discovery, identity, accounting, and final summaries remain
+  required
+
 ## Relationship To `build`
 
 `runa test` may use ordinary build and artifact-emission stages underneath.
@@ -379,7 +560,7 @@ This spec does not define:
 
 - detailed `build` product orchestration
 - cross-package integration-test law
-- parallel test execution
+- parallel package-harness execution across multiple packages
 - suspend tests
 - ignore or expected-failure test annotations
 - golden bless or update workflow
@@ -416,7 +597,7 @@ The CLI or toolchain must reject:
 - target-sensitive semantic failure hidden as check success
 - artifact emission or linking treated as required for semantic check success
 - an authored `.rna` file exceeding `3000` lines
-- a `lib` product with `lib.rna` but no child module entry
+- a `lib` product whose declared root has no child module entry
 - `#test` on non-function targets
 - `#test` on `suspend fn`, foreign declarations, methods, trait methods, or
   impl members

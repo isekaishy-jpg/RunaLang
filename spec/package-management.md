@@ -1,24 +1,27 @@
 # Package Management
 
-Runa uses a managed package system with a global dependency store and explicit source-versus-artifact provenance.
+Runa uses a managed package system with a global dependency store and explicit
+source-package dependency resolution.
 
 ## Core Model
 
 - Packages are managed units, not ad hoc downloaded blobs.
-- The toolchain owns package acquisition, validation, storage, build selection, and artifact selection.
+- The toolchain owns package acquisition, validation, storage, and build
+  selection.
 - The managed package system uses a global dependency store.
 - The global dependency store is shared across workspaces on one machine or user environment.
 - Managed packages are immutable once stored under one exact identity.
-- No hidden fallback exists between source and artifact resolution.
 - No online package retrieval exists in core `runa`.
 - Managed identities use exact calendar package-version strings.
+- Ordinary dependency resolution is source-package resolution in v1.
+- Managed artifacts remain explicit publication or later distribution outputs,
+  not ordinary dependency inputs.
 
 ## Managed Entries
 
-The managed package system stores two first-wave entry classes:
+The first-wave managed package system stores one entry class:
 
 - source package entries
-- artifact entries
 
 ### Source Package Entries
 
@@ -27,22 +30,12 @@ The managed package system stores two first-wave entry classes:
   - `(registry, name, version)`
 - Source package entries carry manifest metadata, dependency metadata, declared products, source `SHA-256` checksum metadata, and any packaged boundary-surface metadata.
 
-### Artifact Entries
-
-- An artifact entry is one managed built product.
-- Artifact identity is:
-  - `(registry, name, version, product, kind, target)`
-- Artifact entries are first-class managed entries, not hidden cache leftovers.
-- `cdylib` and platform DLL/shared-library outputs are managed artifact entries.
-- Artifact entries preserve packaged boundary-surface metadata when the product exports non-C boundary APIs.
-
 ## Global Dependency Store
 
 - The global dependency store is toolchain-owned.
 - The global dependency store may hold multiple versions of one package at once.
-- The global dependency store may hold multiple targets and product kinds for one package version at once.
-- The global dependency store must distinguish source entries from artifact entries explicitly.
-- The global dependency store is keyed by exact managed identity plus `SHA-256` checksum and provenance metadata.
+- The global dependency store is keyed by exact managed source identity plus
+  `SHA-256` checksum and provenance metadata.
 - Global store root selection, immutable layout, promotion, and corruption law
   are defined in `spec/global-store.md`.
 
@@ -52,12 +45,10 @@ The managed package system stores two first-wave entry classes:
 - Ordinary package dependency resolution selects exact source package identities.
 - Ordinary non-path dependency resolution reads those source package identities
   from the global store.
-- Resolution may target source entries, artifact entries, or a mix, but the chosen provenance must be explicit.
 - Managed resolution must never silently switch:
   - one registry to another
-  - source to artifact
-  - artifact to source
-  - one target artifact to another target artifact
+  - one exact source version to another
+  - one source package identity to one artifact identity
 
 ## Path Dependencies
 
@@ -69,8 +60,10 @@ The managed package system stores two first-wave entry classes:
 ## Product Awareness
 
 - Managed package metadata includes declared product kinds from `spec/product-kinds.md`.
-- Artifact management includes `lib`, `bin`, and `cdylib` products where published or locally built.
-- `cdylib`/DLL products are first-class managed artifacts, not special cases outside the package system.
+- Published artifact outputs may still include `lib`, `bin`, and `cdylib`
+  products where another spec explicitly allows publication or distribution.
+- `cdylib`/DLL products remain explicit published artifacts, not ordinary
+  dependency inputs.
 
 ## Relationship To Locking And Publication
 
@@ -91,10 +84,11 @@ The managed package system stores two first-wave entry classes:
 
 The toolchain must reject:
 
-- hidden fallback between source and artifact resolution
 - hidden fallback between registries
 - hidden fallback between exact calendar versions
+- managed artifacts treated as ordinary dependency-resolution substitutes for
+  source packages
 - online package retrieval as core `runa` behavior
 - mutable overwrite of an existing exact managed identity
 - ambiguous managed identity lookup
-- treating unmanaged ad hoc artifacts as if they were managed package entries
+- treating unmanaged ad hoc artifacts as if they were managed source packages

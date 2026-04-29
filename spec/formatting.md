@@ -52,11 +52,19 @@ Formatting is syntax-owned, not semantics-owned.
 That means:
 
 - semantic type-checking success is not required to format a file
+- dependency-resolution success is not required to format a file
+- import-resolution success is not required to format a file
 - ownership, borrow, ABI, and query diagnostics do not define formatting truth
 - formatting depends on shared frontend structure and trivia preservation
 
 The formatter may therefore operate on semantically invalid code if the shared
 frontend can still produce the required parse bundle.
+
+The formatter must not require:
+
+- full semantic graph finalization
+- successful managed dependency resolution
+- successful import resolution across the command scope
 
 ## Syntax Validity Gate
 
@@ -67,6 +75,19 @@ the CST-backed format result unreliable.
 
 The formatter must fail loudly rather than silently inventing a degraded
 formatting path.
+
+Blocking formatting diagnostics are limited to frontend conditions that prevent
+one reliable CST-backed formatting result for one file.
+
+This means:
+
+- malformed syntax is blocking
+- other parse-bundle failure that prevents one reliable CST-backed file result
+  is blocking
+- semantic diagnostics are not blocking
+- dependency-resolution diagnostics are not blocking
+- import-resolution diagnostics are not blocking when the shared frontend still
+  produced one reliable CST-backed file result
 
 ## Canonical Style
 
@@ -134,6 +155,11 @@ The first-wave formatting surface requires two modes:
 - write mode
 - check-only mode
 
+The standardized first-wave command spellings are:
+
+- `runa fmt`
+- `runa fmt --check`
+
 Write mode:
 
 - computes the canonical formatted file
@@ -145,8 +171,7 @@ Check-only mode:
 - reports mismatch without rewriting
 - fails nonzero when a file is not already formatted
 
-This spec defines the modes.
-Exact flag spelling remains CLI surface detail.
+`--check` is the standardized first-wave check-only flag spelling.
 
 ## Default Command Behavior
 
@@ -157,6 +182,15 @@ The default first-wave behavior is write mode over the discovered command root.
 Later flags may narrow the scope or select check-only mode.
 Those flags do not change the canonical surface defined here.
 
+Write-mode failure is all-or-nothing within the discovered formatting scope.
+
+This means:
+
+- if any scoped file has one blocking formatting diagnostic, `runa fmt` fails
+- if `runa fmt` fails from one blocking formatting diagnostic, it must not
+  rewrite any scoped file contents
+- `runa fmt --check` never rewrites files
+
 ## Scope
 
 Formatting scope is determined by the CLI discovery root and the package or
@@ -164,6 +198,29 @@ workspace source set under that root.
 
 By default, the formatter operates over the discovered command root rather than
 an ambient global source search.
+
+If the discovered command root is one standalone package, the default scope is
+that package's local authoring source set.
+
+If the discovered command root is one explicit workspace, the default scope is
+that workspace's local authoring source set.
+
+The first-wave local authoring source set includes:
+
+- the root package when the discovered command root is also one package root
+- explicit `[workspace].members` when the discovered command root is one
+  explicit workspace
+- declared vendored path dependencies under workspace-root `vendor/`
+
+The first-wave default scope excludes:
+
+- global-store dependencies
+- external path dependencies outside the discovered command root
+- `target/`
+- `dist/`
+
+Formatting scope is one enumerated local source-file set, not only the subset
+of files reachable from one semantic graph root.
 
 Later specs may add explicit file, package, or workspace selection controls.
 They do not change the default shared-root model.

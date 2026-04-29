@@ -19,8 +19,9 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 
 ## Package Roots
 
-- Each package has one declared root.
-- The package root defines the root module tree for that package.
+- Each product has one declared root entry file.
+- A package may therefore have multiple product-root entry files.
+- Each declared product root defines one root module tree for that product.
 - Module law inside the package is defined in `spec/modules-and-visibility.md`.
 
 ## Dependencies
@@ -38,6 +39,10 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 ## Workspace Graph
 
 - A workspace resolves one dependency graph for the current build.
+- An explicit workspace root may also be a package root.
+- A workspace-only root with no local package is also valid.
+- Explicit workspace members come from the relative directory entries listed in
+  `[workspace].members`.
 - Global dependency resolution is workspace-wide, not per-file and not ambient.
 - Workspace resolution must be deterministic under the same inputs.
 - Shared dependency graph state is an intentional build artifact, not an implicit runtime global.
@@ -66,11 +71,31 @@ Runa uses a Rust-like package and build model with deterministic dependency and 
 
 - A package's internal incremental graph is built from declared modules.
 - Each module entry file is one semantic compilation unit.
-- Package roots therefore compile from `lib.rna` or `main.rna`.
+- Product roots therefore compile from the declared manifest product roots.
 - Child modules compile from their `mod.rna` entry files.
 - The anti-monolith module split is therefore also the first-wave incremental split.
 - The toolchain may perform finer internal scheduling, but not by inventing different semantic source ownership.
 - Partial-file compilation units are not part of the source model.
+
+## Package-Instance Identity
+
+- The resolved build graph uses one package-instance identity, not only one
+  package name.
+- Package-instance identity is resolver-owned and deterministic.
+- Different provenance or source roots that produce distinct dependency nodes
+  are distinct package instances even if name and version text match.
+
+The first-wave package-instance identity must distinguish at least:
+
+- provenance class
+- registry when the dependency is one managed registry-backed source package
+- canonical package root path when the dependency is one path-based local
+  package
+- package name
+- exact package version when one version exists for that package class
+
+Internal build caches and local build-output layout must key on package-instance
+identity, not only package name.
 
 ## Interface Shape And Fingerprints
 
@@ -144,6 +169,8 @@ The toolchain must reject:
 - unresolved or ambiguous dependency identities
 - hidden fallback dependency resolution
 - visibility violations across package boundaries
+- internal build or cache identity that collapses distinct package instances
+  into one package-name-only key
 - semantic cache reuse across mismatched toolchain or target state
 - semantic cache reuse across changed dependency-interface fingerprints
 - incremental artifact reuse that ignores changed public interface shape

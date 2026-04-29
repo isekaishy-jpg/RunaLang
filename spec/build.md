@@ -77,13 +77,24 @@ This means:
 
 The default first-wave build scope is:
 
-- all declared products in the discovered command scope
+- all declared products in the discovered selected package scope
 
-For a single-package command root, that means every declared product in that
-package.
+For one standalone package command root, the selected package scope is that
+package only.
 
-For a workspace command root, that means every declared product in every
-package in scope.
+For one explicit workspace command root, the selected package scope is:
+
+- the root package when the workspace root is also one package root
+- every explicit `[workspace].members` package
+
+The first-wave default selected package scope excludes:
+
+- declared vendored path dependencies under `vendor/`
+- external path dependencies outside the discovered command root
+- global-store dependencies
+
+Vendored, external path, and global-store dependencies may still participate as
+transitive dependencies in the build graph when required by selected packages.
 
 No hidden primary-product inference is part of first-wave build law.
 
@@ -93,24 +104,39 @@ First-wave explicit narrowing is part of the build surface.
 
 The standardized first-wave build selectors are:
 
-- `--package <name>`
-- `--product <name>`
-- `--bin <name>`
-- `--cdylib <name>`
+- `--package=<name>`
+- `--product=<name>`
+- `--bin=<name>`
+- `--cdylib=<name>`
 
 Law:
 
-- `--package <name>` narrows the command scope to one exact package identity in
+- `--package=<name>` narrows the command scope to one exact package identity in
   the discovered root
-- `--product <name>` selects one exact product name after package selection
-- `--bin <name>` selects one exact `bin` product by name after package selection
-- `--cdylib <name>` selects one exact `cdylib` product by name after package
+- `--product=<name>` selects one exact product name after package selection
+- `--bin=<name>` selects one exact `bin` product by name after package
+  selection
+- `--cdylib=<name>` selects one exact `cdylib` product by name after package
   selection
 - explicit selectors narrow the build set; they do not add implicit fallback
   behavior
 - conflicting explicit product selectors are rejected
 - missing exact selector matches are rejected
 - ambiguous exact selector matches are rejected
+
+Package and product selection ordering is:
+
+- package selection happens before product selection
+- `--bin=<name>` and `--cdylib=<name>` are product-kind-narrowing selectors
+  after package selection
+- if no package selector is present, product selectors apply within the default
+  selected package scope
+- `--package=<name>` matches only packages in the selected package scope of the
+  discovered command root
+- declared vendored path dependencies under `vendor/` are not selectable by
+  `--package=<name>` unless they are also explicit workspace members
+- external path dependencies outside the discovered command root are not
+  selectable by `--package=<name>`
 
 ## First-Wave Build Modes
 
@@ -134,10 +160,22 @@ and platform specs.
 
 That means:
 
-- build target selection is explicit
+- one build invocation uses one selected target
 - the selected target participates in layout, ABI, runtime, cache, and artifact
   identity
 - unsupported targets or product-target combinations reject loudly
+
+The first-wave target-selection law is:
+
+- one selected package with explicit `[build].target` uses that target
+- one selected package without explicit `[build].target` uses the host target
+- one multi-package build uses one shared selected target across the entire
+  selected package scope
+- if multiple selected packages declare explicit `[build].target` values, those
+  values must agree exactly
+- packages in the selected package scope without explicit `[build].target`
+  inherit the build invocation's selected target
+- conflicting explicit package targets in one build invocation are hard errors
 
 This spec does not standardize explicit CLI target-override flags yet.
 
@@ -178,8 +216,11 @@ where:
 
 - `<target>` is the explicit selected target identity
 - `<mode>` is `debug` or `release`
-- `<package>` is the exact package identity name
+- `<package>` is one deterministic package-instance key
 - `<product>` is the selected product name
+
+Package-instance identity and its minimum distinguishing requirements are
+defined in `spec/packages-and-build.md`.
 
 No build outputs may be sprayed into arbitrary package directories.
 
@@ -187,7 +228,7 @@ No build outputs may be sprayed into arbitrary package directories.
 
 `dist/` is the local deliverable-output root.
 
-`dist/` contains only final release or packageable outputs.
+`dist/` contains only final surfaced release outputs.
 
 `dist/` must not contain:
 
@@ -270,6 +311,17 @@ This means:
 
 Unsupported or invalid build state must fail loudly.
 
+Selected package and product build order must be deterministic.
+
+The first-wave deterministic selected build order is:
+
+- selected packages by canonical manifest-relative path within the discovered
+  command root, with the command-root package ordered as `.`
+- then selected products in manifest declaration order within each selected
+  package
+
+The first-wave default build failure policy is fail-fast.
+
 `runa build` must not:
 
 - silently skip invalid selected products
@@ -279,6 +331,13 @@ Unsupported or invalid build state must fail loudly.
 - silently publish to the managed store
 
 If any selected product fails, the command fails.
+
+Fail-fast law:
+
+- if one selected product fails, later selected products in the deterministic
+  build order must not start
+- already-started internal compilation work may complete only as needed for
+  deterministic diagnostics, but the build must not fabricate success
 
 The toolchain may still collect additional deterministic diagnostics during the
 same build pass where doing so does not fabricate success.

@@ -24,6 +24,12 @@ Workspace manifests may also use:
 
 - `[workspace]`
 
+One manifest may therefore be:
+
+- one standalone package manifest using `[package]`
+- one workspace-only manifest using `[workspace]`
+- one combined workspace-root package manifest using both `[package]` and `[workspace]`
+
 ## `[package]`
 
 The required first-wave package fields are:
@@ -46,6 +52,7 @@ lang_version = "0.00"
 Law:
 
 - `name` is the stable package identity name used by dependency and package law.
+- `name` must satisfy package-name validity law.
 - `version` is the package version, not the language version.
 - `version` uses the calendar package-version model from
   `spec/dependency-resolution.md`.
@@ -56,6 +63,17 @@ Law:
 - The initial first-wave language version for an edition is `0.00`.
 - Package version and language version are separate and must not be conflated.
 - The Runa toolchain itself follows the same package-version model.
+
+## Package Name Validity
+
+- Package names are package identities, not filesystem paths.
+- Package names use lowercase ASCII letters, ASCII digits, `_`, and `-` only.
+- The first character must be a lowercase ASCII letter.
+- Package names must not contain whitespace.
+- Package names must not contain `.`, `/`, or `\\`.
+- Package names must not be empty.
+- Package-name validity is shared by package creation, dependency keys,
+  publication identity, and local vendoring.
 
 ## Package Versions
 
@@ -119,6 +137,16 @@ Law:
 - `{ version = ..., path = ... }` is still path-based local resolution.
 - In `{ version = ..., path = ... }`, `version` is a validation constraint against the dependency package found at `path`, not a second source of package acquisition.
 - `path` may point into workspace-root `vendor/` when vendoring is used.
+- Relative dependency `path` values are resolved relative to the manifest file
+  that declares them.
+- Absolute dependency `path` values are allowed in v1.
+- Dependency `path` values may point outside the current workspace root.
+- After relative or absolute resolution, the toolchain canonicalizes the target
+  path for validation.
+- The final canonical dependency target must resolve to exactly one package root
+  containing `runa.toml`.
+- A dependency `path` is not invalid merely because canonical resolution
+  reaches outside the current workspace root.
 - no dedicated `vendor = ...` dependency key exists in v1.
 - `path` and `registry` must not appear together in one dependency entry.
 - Hidden fallback dependency resolution is not part of the model.
@@ -133,13 +161,21 @@ Example:
 
 ```toml
 [workspace]
-members = ["tools.codegen", "libs.runtime", "apps.demo"]
+members = ["tools/codegen", "libs/runtime", "apps/demo"]
 ```
 
 Law:
 
 - Workspace membership is explicit.
 - A package may exist without `[workspace]`.
+- Package identity names must be unique within one explicit workspace.
+- `members` entries are relative directory paths from the workspace-root
+  manifest.
+- `members` entries must not be package names, dotted logical names, or globs.
+- `members` entries must not be absolute paths.
+- `members` entries must stay within the workspace root after path
+  normalization.
+- Each `members` entry must resolve to one package root containing `runa.toml`.
 - Workspace resolution and incremental graph behavior remain defined by `spec/packages-and-build.md`.
 
 ## `[[products]]`
@@ -166,6 +202,16 @@ name = "demo_native"
 root = "lib.rna"
 ```
 
+```toml
+[[products]]
+kind = "lib"
+
+[[products]]
+kind = "cdylib"
+name = "demo_native"
+root = "lib.rna"
+```
+
 Law:
 
 - `kind` must be one of the standardized product kinds from `spec/product-kinds.md`.
@@ -177,6 +223,17 @@ Law:
   - `bin` defaults to `main.rna`
 - Product roots must name valid module entry files under module-layout law.
 - A package may declare multiple products.
+- A manifest using `[package]` must declare at least one product.
+- A workspace-only manifest using `[workspace]` and no `[package]` may declare
+  zero products.
+- Product names must be unique within one package.
+- Omitted product names default to the package name for every product kind.
+- If one omitted product name would collide with another product name in the
+  same package, the colliding products must declare explicit `name` values.
+- The toolchain must not invent hidden suffixes or kind-based auto-renames to
+  resolve product-name collisions.
+- Duplicate `(kind, root)` product declarations in one package are invalid.
+- `lib` and `cdylib` may intentionally share the same `lib.rna` source root.
 - A product exporting one or more `#boundary[api]` entries must also package explicit boundary-surface metadata under `spec/boundary-runtime-surface.md`.
 
 ## `[build]`
@@ -219,6 +276,7 @@ Law:
 
 - Source-level `#link[...]` still owns per-declaration foreign symbol attachment.
 - `[[native_links]]` is for build-wide native link inputs, not per-item ABI semantics.
+- Native-link names must be unique within one manifest.
 - Advanced linker-script, search-path, and platform-conditional link configuration are not standardized in v1.
 
 ## Source Attributes Versus Manifest
@@ -270,14 +328,22 @@ The toolchain must reject:
 - malformed package version strings
 - malformed `lang_version` strings
 - malformed dependency version strings
+- malformed package names
 - package version treated as language version
 - language version treated as package version
 - unsupported semver-style or range dependency syntax
 - unsupported product kinds
 - invalid product roots
+- zero-product package manifests
+- duplicate product names
+- duplicate `(kind, root)` product declarations
 - missing dependency identity or unsupported dependency forms
 - conflicting dependency source keys such as `path` with `registry`
 - dependency edition or language-version validation mismatch
 - path dependency version mismatch against an explicit `{ version = ..., path = ... }` declaration
+- dependency paths that do not resolve to package roots
+- invalid workspace-member entries
+- duplicate package identity names within one explicit workspace
+- duplicate native-link names
 - hidden fallback target selection
 - hidden fallback product selection

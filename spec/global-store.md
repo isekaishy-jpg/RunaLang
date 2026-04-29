@@ -1,14 +1,15 @@
 # Global Store
 
-Runa uses one explicit global managed-package store.
+Runa uses one explicit global managed-source store.
 
 ## Core Model
 
 - The global store is toolchain-owned.
 - The global store is per-user or per-explicit-root, not per-workspace.
 - The global store stores immutable managed entries.
-- The global store distinguishes source entries from artifact entries explicitly.
 - The global store is not a local workspace output directory.
+- The first-wave global store holds managed source packages only.
+- Built artifacts are not first-wave global-store entries.
 
 ## Root Selection
 
@@ -34,7 +35,6 @@ Law:
 The first-wave global store uses these top-level buckets:
 
 - `sources/`
-- `artifacts/`
 - `tmp/`
 
 Later specs may add:
@@ -55,34 +55,22 @@ Required source-entry contents are:
 - `runa.toml`
 - `sources/`
 
+Optional source-entry contents are:
+
+- `meta.toml` only when another spec explicitly requires packaged source
+  metadata
+- sidecars referenced by `meta.toml` only when another spec explicitly names
+  them
+
 Law:
 
 - `entry.toml` records store-owned source-entry identity and integrity metadata.
 - `runa.toml` is the published package manifest for that source release.
 - `sources/` contains the package source tree in packaged form.
+- `meta.toml` is the packaged metadata index when packaged metadata is required.
+- referenced sidecars named by `meta.toml` are part of the stored source entry
+  only when another spec explicitly requires them.
 - Missing required source-entry files make the entry unusable.
-
-## Artifact Entry Layout
-
-The immutable artifact-entry path is:
-
-- `artifacts/<registry>/<name>/<version>/<product>/<kind>/<target>/`
-
-Required artifact-entry contents are:
-
-- `entry.toml`
-- the final built artifact
-
-Optional artifact-entry contents are:
-
-- explicit deliverable sidecars only when another spec makes them part of the
-  artifact deliverable contract
-
-Law:
-
-- compiler-private receipts or transient build metadata do not belong in one
-  immutable managed artifact entry
-- missing required artifact-entry files make the entry unusable
 
 ## Entry Metadata
 
@@ -96,16 +84,6 @@ For source entries it must record at least:
 - edition
 - lang_version
 - source checksum
-
-For artifact entries it must record at least:
-
-- registry
-- package name
-- package version
-- product name
-- product kind
-- target
-- artifact checksum
 
 Later specs may add more metadata.
 
@@ -145,7 +123,7 @@ No mutable overwrite of one exact identity is permitted.
 
 ## Verification
 
-Source and artifact verification happen before promotion.
+Source verification happens before promotion.
 
 Ordinary entry use must also reject:
 
@@ -153,6 +131,10 @@ Ordinary entry use must also reject:
 - missing required payload files
 - malformed identity metadata
 - checksum mismatch
+
+Missing optional `meta.toml` is invalid only when another spec explicitly
+requires it for that package class.
+Missing sidecars referenced by `meta.toml` is always invalid.
 
 Locked replay and publication flows may impose stricter verification, but never
 weaker verification.
@@ -197,8 +179,10 @@ This means:
 
 - `[dependencies]` resolution in v1 consumes managed source packages
 - managed artifacts are not silently substituted as semantic dependency truth
-- artifact entries serve explicit build, install, distribution, or later
-  package-management flows
+- managed published artifacts, when they exist elsewhere in the ecosystem, are
+  not first-wave global-store entries
+- core `runa` builds must not consume prebuilt managed artifacts as dependency
+  inputs
 
 ## Relationship To Other Specs
 
@@ -219,7 +203,6 @@ The toolchain must reject:
 - missing or unusable configured store root
 - implicit current-directory fallback as permanent store policy
 - missing required source-entry files
-- missing required artifact-entry files
 - malformed `entry.toml`
 - checksum mismatch
 - mutable overwrite of an existing exact identity

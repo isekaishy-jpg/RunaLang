@@ -16,6 +16,7 @@ Runa uses explicit toolchain-generated boundary surfaces and typed bindings for 
 
 - Any product that exports one or more `#boundary[api]` declarations must package explicit boundary-surface metadata.
 - Boundary-surface metadata is toolchain-generated from the exported boundary declarations.
+- Boundary-surface metadata is indexed through packaged `meta.toml`.
 - Boundary-surface metadata records at least:
   - canonical declaration identity
   - owning package and product identity
@@ -25,6 +26,8 @@ Runa uses explicit toolchain-generated boundary surfaces and typed bindings for 
   - referenced `#boundary[capability]` families
 - Boundary-surface metadata is part of the managed package and managed artifact story.
 - Boundary-surface metadata is not runtime reflection and does not imply invoke-by-name.
+- If boundary metadata requires additional sidecar payloads, `meta.toml` must
+  reference those exact packaged sidecars explicitly.
 
 ## Registration And Binding
 

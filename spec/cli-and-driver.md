@@ -56,6 +56,12 @@ The required essential-service commands are:
 Package-lifecycle command semantics are defined separately by
 `spec/package-commands.md`.
 
+Law:
+
+- command names standardized by this spec are recognized CLI surface names
+- a standardized command whose owning implementation is not complete yet must
+  fail loudly as unimplemented, not as an unknown subcommand
+
 Other executables or helper entrypoints may exist during hosted stages.
 They are not the canonical public interface if they duplicate a `runa`
 subcommand.
@@ -64,12 +70,48 @@ subcommand.
 
 This spec reserves later public subcommand space for:
 
+- `doc`
 - `review`
 - `repair`
 
 These names are reserved for future standardization.
 
 This spec does not standardize them yet.
+
+Law:
+
+- reserved-later command names are recognized command names, not unknown-command
+  typos
+- invoking a reserved-later command before its owning spec and implementation
+  land must fail loudly as unimplemented
+- reserved-later commands must not be reported as unknown subcommands
+
+## Standalone Versus Manifest-Rooted Commands
+
+The first-wave CLI distinguishes commands that may run without manifest
+discovery from commands that require one discovered command root.
+
+Standalone command surfaces are:
+
+- bare `runa`
+- top-level help
+- top-level version
+- `runa new`
+- `runa import`
+
+Manifest-rooted command surfaces are:
+
+- `runa check`
+- `runa build`
+- `runa test`
+- `runa fmt`
+- `runa add`
+- `runa remove`
+- `runa vendor`
+- `runa publish`
+
+Manifest-rooted commands must reject loudly when no valid command root is
+discoverable under the command-root law in this spec.
 
 ## Non-Canonical Helper Tools
 
@@ -86,6 +128,13 @@ Such binaries are not the canonical public surface when a corresponding
 
 The standardized public interface remains `runa`.
 
+This means:
+
+- retired helper binaries such as `runac`, `runafmt`, and `runadoc` do not
+  remain part of the canonical public surface
+- later documentation service growth must land as `runa doc`, not as a restored
+  standalone `runadoc`
+
 ## Workspace And Manifest Discovery
 
 The CLI uses Cargo-style manifest discovery by default.
@@ -94,9 +143,33 @@ The default policy is:
 
 - start from the current working directory
 - search upward for `runa.toml`
-- use the nearest valid manifest as the command root
+- treat the nearest discovered `runa.toml` as the first manifest candidate
 
-If no valid manifest is found, the command must reject loudly.
+Cargo-style command-root law:
+
+- if the nearest discovered manifest is invalid, discovery fails there
+- the CLI must not skip one invalid nearer manifest and continue upward looking
+  for a different command root
+- if the nearest discovered manifest is the workspace root package or one
+  explicit `[workspace].members` package of an enclosing explicit workspace,
+  the command root becomes that enclosing workspace root
+- if no enclosing explicit workspace claims that package as a member, the
+  command root is the nearest package root itself
+
+Cargo-style lockfile law:
+
+- a command rooted at one explicit workspace uses that workspace root for
+  lockfile behavior
+- a command rooted at one standalone package uses that package root for lockfile
+  behavior
+- a workspace-member invocation must not create or prefer a separate member-local
+  lockfile over the enclosing workspace lockfile
+
+If no valid manifest is found:
+
+- manifest-rooted commands must reject loudly
+- standalone commands continue to follow their own command law without
+  requiring manifest discovery
 
 Later specs may add explicit override flags such as manifest-path or package
 selection flags.
@@ -106,14 +179,31 @@ Those flags do not change the default discovery model defined here.
 
 The CLI is command-oriented, not ambient-session-oriented.
 
-Each invocation:
+For manifest-rooted commands, each invocation:
 
 - discovers the workspace or package root
 - loads the required manifest and package graph inputs
+- uses the lockfile behavior associated with that discovered command root
 - executes the requested subcommand
 - reports diagnostics, progress, and final result
 
+For standalone commands, each invocation:
+
+- parses the requested standalone surface
+- executes that command without requiring manifest discovery by default
+- uses manifest or lockfile state only if the owning command spec later adds one
+  explicit reason to do so
+- reports diagnostics, progress, and final result
+
 The CLI must not invent hidden fallback roots or hidden command retargeting.
+
+## Bare Invocation
+
+Invoking:
+
+- `runa`
+
+with no subcommand must print the top-level help surface to stdout and exit `0`.
 
 ## Driver Boundary
 
@@ -214,6 +304,56 @@ Exact help text formatting is not frozen by this spec.
 
 The existence of these surfaces is required.
 
+The first-wave required accepted spellings are:
+
+- top-level help: `runa help`, `runa -h`, `runa --help`
+- top-level version: `runa version`, `runa -V`, `runa --version`
+- subcommand help: `runa <subcommand> --help`
+
+Help and version surfaces write to stdout.
+
+Reserved-later commands may appear in help output, but if they do they must be
+identified as reserved or unimplemented rather than presented as available
+implemented commands.
+
+Reserved-later help behavior:
+
+- `runa <reserved-command> --help` may print one normal placeholder help
+  surface describing the reserved or unimplemented status
+- placeholder reserved-command help may exit `0`
+- invoking the reserved command for execution must still fail loudly as
+  unimplemented
+
+## Global Flags
+
+The first-wave CLI does not standardize general global flags beyond help and
+version.
+
+This means:
+
+- command-specific flags belong to the owning command specs
+- the CLI must not grow ambient top-level flag behavior without explicit spec
+  growth
+
+## Argument Parsing
+
+The first-wave CLI uses explicit, non-guessing argument parsing.
+
+Law:
+
+- long flags with values use `--flag=value`
+- long flags without values use `--flag`
+- only explicitly standardized short flags exist
+- unknown flags are hard errors
+- duplicate singleton flags are hard errors
+- missing required flag values are hard errors
+- missing required positional arguments are hard errors
+- unexpected extra positional arguments are hard errors
+- flag abbreviation is not allowed
+- the CLI must not guess between similar command or flag names
+- rich human-readable error text is encouraged where appropriate
+- exact error prose is not frozen by this spec
+
 ## Environment Control Namespace
 
 The CLI reserves the `RUNA_*` environment-variable namespace for future
@@ -285,9 +425,11 @@ Those remain for the owning service specs.
 
 The CLI or toolchain must reject:
 
-- unknown standardized subcommands
+- unknown subcommands
+- reserved-later subcommands treated as unknown instead of unimplemented
 - missing manifest discovery root for commands that require a package or
   workspace
+- invalid nearer manifest skipped in favor of a different outer manifest
 - hidden fallback to a different manifest root
 - hidden fallback to a different product or target
 - command success reported after hard semantic, build, or test failure

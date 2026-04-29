@@ -8,8 +8,8 @@ Runa uses exact calendar-version dependency resolution in v1.
 - Version matching is exact in v1.
 - Ordinary package dependencies resolve to source packages, not managed artifacts.
 - Ordinary non-path package dependencies resolve from the global store.
-- Managed artifact consumption is an explicit later lane, not hidden semantic
-  dependency fallback.
+- Managed artifacts are not an ordinary dependency-consumption lane in core
+  `runa`.
 - Registry identity is part of dependency identity.
 - Online package retrieval is not part of core `runa`.
 

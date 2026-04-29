@@ -39,7 +39,7 @@ The canonical logical source package tree contains:
 - `entry.toml`
 - `runa.toml`
 - `sources/`
-- optional `metadata/`
+- optional `meta.toml`
 
 ### `entry.toml`
 
@@ -68,17 +68,22 @@ It must record at least:
 - published source files are stored under their normalized relative package
   paths
 
-### `metadata/`
+### `meta.toml`
 
-`metadata/` is optional.
+`meta.toml` is optional.
 
 It exists only when another spec explicitly requires packaged metadata.
 
-Examples include:
+Law:
 
-- packaged boundary-surface metadata
-
-No unrelated compiler-private receipts belong here by default.
+- `meta.toml` is a toolchain-generated packaged metadata index
+- `meta.toml` is consumer-facing packaged metadata, not compiler-private scratch
+- `meta.toml` is not a second user-authored manifest
+- `meta.toml` may reference explicit packaged sidecars only when another spec
+  names them
+- referenced sidecars must live inside the same package tree
+- referenced sidecars must not use URLs, absolute paths, or `..` escape
+- no unrelated compiler-private receipts belong here by default
 
 ## Source Package Inclusion
 
@@ -86,7 +91,8 @@ The first-wave source package includes:
 
 - `runa.toml`
 - all published source files under the package root
-- explicitly required packaged metadata payloads
+- `meta.toml` when present
+- explicitly required packaged metadata sidecars when another spec names them
 
 The first-wave source package excludes at least:
 
@@ -106,7 +112,7 @@ The canonical logical artifact package tree contains:
 
 - `entry.toml`
 - `payload/`
-- optional `metadata/`
+- optional `meta.toml`
 
 ### Artifact `entry.toml`
 
@@ -142,18 +148,21 @@ This means:
 - no generated C in `payload/`
 - no internal build receipts in `payload/`
 
-### Artifact `metadata/`
+### Artifact `meta.toml`
 
-`metadata/` is optional.
+Artifact `meta.toml` is optional.
 
-It exists only when another spec explicitly requires packaged artifact metadata.
+It exists only when another spec explicitly requires packaged artifact
+metadata.
 
-Examples may include:
+Law:
 
-- packaged boundary-surface metadata
-- explicitly deliverable sidecars required by product law
-
-Compiler-private or transient build metadata does not belong here by default.
+- artifact `meta.toml` is a toolchain-generated packaged metadata index
+- artifact `meta.toml` may reference explicit packaged sidecars only when
+  another spec names them
+- referenced sidecars must live inside the same artifact package tree
+- referenced sidecars must not use URLs, absolute paths, or `..` escape
+- compiler-private or transient build metadata does not belong here by default
 
 ## Dist Versus Artifact Packages
 
@@ -189,14 +198,16 @@ The source checksum covers:
 
 - `runa.toml`
 - all files under `sources/`
-- all files under `metadata/` when `metadata/` exists
+- `meta.toml` when present
+- all explicitly referenced packaged sidecars when present
 
 ### Artifact Package Checksum Surface
 
 The artifact checksum covers:
 
 - all files under `payload/`
-- all files under `metadata/` when `metadata/` exists
+- `meta.toml` when present
+- all explicitly referenced packaged sidecars when present
 
 ### Canonical Hashing Rules
 
@@ -224,8 +235,9 @@ An artifact package is invalid when it is missing:
 - `payload/`
 - the required final built artifact
 
-Missing optional `metadata/` is only invalid when another spec requires it for
+Missing optional `meta.toml` is only invalid when another spec requires it for
 that package or product class.
+Missing sidecars referenced by `meta.toml` is always invalid.
 
 ## Relationship To Other Specs
 
@@ -250,6 +262,8 @@ The toolchain or registry must reject:
 - artifact packages missing the required final built artifact
 - manifest or metadata files appearing in artifact `payload/` without explicit
   opt-in from another spec
+- `meta.toml` references using URLs, absolute paths, or `..` escape
+- missing sidecars referenced by `meta.toml`
 - `dist/` treated as if it were the managed package format
 - checksum validation that includes `entry.toml`
 - nondeterministic package hashing order

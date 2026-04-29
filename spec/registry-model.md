@@ -16,10 +16,69 @@ Runa registries store immutable published source packages and immutable publishe
 ## Named Registries
 
 - A registry has one stable registry identity name.
+- Registry names use lowercase ASCII letters, ASCII digits, `_`, and `-` only.
+- The first character of one registry name must be a lowercase ASCII letter.
+- Registry names must not contain whitespace.
+- Registry names must not contain `.`, `/`, or `\\`.
+- Registry names must not be empty.
 - A configured registry name maps to one local filesystem root.
 - Toolchains may support one default configured registry, but dependency and lock metadata must still preserve registry identity where it matters.
 - No silent fallback across registries is part of the model.
 - Online registry endpoints are outside core v1 law.
+
+## Registry Configuration
+
+The first-wave registry configuration source is one per-user config file.
+
+The default config roots are:
+
+- Windows: `%APPDATA%\\Runa\\config.toml`
+- later Unix-family hosts: XDG-style user config root
+
+The first-wave override is:
+
+- `RUNA_CONFIG_PATH`
+
+The first-wave config file records:
+
+- optional `default_registry = "<name>"`
+- one `[registries.<name>]` table per configured registry
+- one required `root = "<absolute-path>"` field inside each registry table
+
+Example:
+
+```toml
+default_registry = "default"
+
+[registries.default]
+root = "D:\\Runa\\registry"
+
+[registries.company]
+root = "E:\\Company\\runa-registry"
+```
+
+Law:
+
+- `RUNA_CONFIG_PATH` names one exact config-file path override
+- v1 does not standardize workspace-local or project-local registry config
+- v1 does not standardize layered config merge
+- one configured default registry name is optional
+- if a command requires the default registry and no default is configured, the
+  command must fail loudly
+- if a command names one registry and that registry is not configured, the
+  command must fail loudly
+- registry roots in config are local filesystem paths, not URLs
+- registry roots should be absolute paths in v1
+- registry config is toolchain configuration, not package-manifest state
+
+## Registry Integrity
+
+- Published source and artifact checksums are integrity and security data, not
+  primary identity keys.
+- Registry publish, import, and replay flows must verify recorded `SHA-256`
+  values exactly.
+- The registry must not treat equal names and versions with different checksums
+  as one valid published entry.
 
 ## Published Source Identity
 
@@ -54,6 +113,8 @@ Runa registries store immutable published source packages and immutable publishe
 - Artifact entries are target-specific managed outputs.
 - Artifact entries do not replace source entries silently.
 - A registry may store one without the other, but resolution provenance must remain explicit.
+- Core `runa` dependency resolution and ordinary builds must not consume
+  published artifact entries as dependency inputs.
 
 ## DLL / Shared-Library Products
 
@@ -88,6 +149,7 @@ The registry or toolchain must reject:
 
 - duplicate publication of one exact source identity with different contents
 - duplicate publication of one exact artifact identity with different contents
+- malformed registry names
 - source entries missing required manifest-derived metadata
 - artifact entries missing source package identity, product kind, or target metadata
 - silent registry fallback during resolution

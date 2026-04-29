@@ -37,6 +37,8 @@ separate external tool.
 - One configured local registry root represents one registry identity.
 - Registry roots are publication and import sources, not compile-time source
   roots.
+- One configured default registry may exist, but commands must not guess one
+  unnamed registry when no default is configured.
 - No silent fallback across registries is part of the model.
 
 ## Local Registry Layout
@@ -85,7 +87,7 @@ Publication into a local registry must validate:
 
 Import must:
 
-1. locate one exact source or artifact identity in the selected local registry
+1. locate one exact source identity in the selected local registry
 2. verify required files and checksums
 3. promote the verified entry into the global store under the existing
    temp-verify-atomic-promote law
@@ -95,6 +97,9 @@ Law:
 - no implicit import during ordinary `check`, `build`, `test`, or `fmt`
 - no implicit import during dependency resolution
 - missing global-store entry for a non-path dependency is a hard error
+- artifact import into the global store is not a standardized first-wave core
+  `runa` dependency-management path
+- `runa import` is the normal first-wave writer into the global store
 
 ## Managed Dependency Resolution
 
@@ -103,6 +108,8 @@ Law:
   being present.
 - Registry roots are import sources, not ambient build inputs.
 - No silent fallback exists from global-store miss to one local registry root.
+- Ordinary `check`, `build`, `test`, and `fmt` remain read-only with respect to
+  the global store.
 
 ## Workspace Vendoring
 

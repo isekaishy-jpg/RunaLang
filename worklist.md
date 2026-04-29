@@ -240,7 +240,7 @@ The goal is to implement all specs, not a partial showcase subset.
 - [ ] `runa build` product orchestration gaps
 - [ ] `runa test` execution path
 - [ ] `runa fmt` formatting surface
-- [ ] Documentation surface from `runadoc`
+- [ ] `runa doc` surface
 - [ ] LSP surface from `runals`
 - [ ] Manifest semantics from `spec/manifest-and-products.md`
 - [ ] Product kind enforcement from `spec/product-kinds.md`
@@ -260,7 +260,7 @@ The goal is to implement all specs, not a partial showcase subset.
 - [ ] Compiler and std self-host gates from `spec/bootstrap-and-self-host-gates.md`
 - [ ] Self-rebuild and bootstrap-stability gates from `spec/bootstrap-and-self-host-gates.md`
 - [ ] CLI, `check`, `build`, `test`, and `fmt` self-host gates from `spec/bootstrap-and-self-host-gates.md`
-- [ ] Post-self-host `review` and `fix` service gates from `spec/bootstrap-and-self-host-gates.md`
+- [ ] Post-self-host `review` and `repair` service gates from `spec/bootstrap-and-self-host-gates.md`
 
 ## Queue Discipline
 - [ ] Re-audit `spec/` after each major tranche and extend this queue

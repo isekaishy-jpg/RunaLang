@@ -62,8 +62,9 @@ Some services may land after the essential-service gate.
 
 The first-wave post-self-host services are:
 
+- `doc`
 - `review`
-- `fix`
+- `repair`
 
 These are important long-term services.
 They are not on the critical path to first compiler self-host.
@@ -202,10 +203,11 @@ long-term self-host and service posture for the core language environment.
 
 This stage may include:
 
+- Runa-owned `doc`
 - Runa-owned packaging flow
 - Runa-owned registry/publication flow
 - Runa-owned `review`
-- Runa-owned `fix`
+- Runa-owned `repair`
 
 This stage does not require the translator/discovery tool to become
 self-host-critical unless a later spec explicitly says so.

@@ -44,6 +44,7 @@ The toolchain or registry must validate:
 - Artifact publication is explicit and separate from source publication.
 - Artifact publication must bind to one already-identified source package release.
 - Artifact publication is first-wave valid for declared products including `cdylib`.
+- Published artifacts are distribution outputs, not ordinary dependency inputs.
 
 ## Artifact Publication Metadata
 
@@ -71,6 +72,8 @@ Additional provenance may be recorded by the toolchain or registry, but source p
 - Publishing artifacts does not silently replace source publication.
 - Registries may hold both source and artifact entries for one package version.
 - Toolchain resolution must keep those lanes explicit.
+- Core `runa` build and dependency resolution must not consume published
+  artifacts as ordinary dependency inputs.
 
 ## Path Dependencies And Publication
 
