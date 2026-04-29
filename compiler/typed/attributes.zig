@@ -73,6 +73,7 @@ pub fn isAllowedAttribute(name: []const u8) bool {
         std.mem.eql(u8, name, "domain_context") or
         std.mem.eql(u8, name, "boundary") or
         std.mem.eql(u8, name, "repr") or
+        std.mem.eql(u8, name, "test") or
         std.mem.eql(u8, name, "link") or
         std.mem.eql(u8, name, "export");
 }

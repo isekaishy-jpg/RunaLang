@@ -1,0 +1,16 @@
+pub enum Option[T]:
+    None
+    Some(T)
+
+impl[T] Option[T]:
+    fn is_some(read self) -> Bool:
+        select self:
+            when Option.Some(value) => return true
+            when Option.None => return false
+        return false
+
+    fn is_none(read self) -> Bool:
+        select self:
+            when Option.None => return true
+            when Option.Some(value) => return false
+        return false

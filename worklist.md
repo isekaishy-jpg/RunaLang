@@ -215,9 +215,10 @@ The goal is to implement all specs, not a partial showcase subset.
   - [x] Capability handle values move through owned bindings, owned parameters, and owned aggregate formation
   - [x] Implicit handle duplication through repeated aggregate formation is rejected
   - [ ] Canonical package-owner/re-alias checks and explicit duplication contracts
-- [ ] Result and Option surface from `spec/result-and-option.md`
+- [x] Result and Option surface from `spec/result-and-option.md`
   - [x] Canonical Option/Result type identity, constructors, patterns, helpers, and C ABI rejection
-  - [ ] Runtime/codegen representation and full ownership law for standard enum payloads
+  - [x] Std-authored snake_case Option/Result helper surfaces
+  - [x] Runtime/codegen representation and full ownership law for standard enum payloads
 - [ ] Text and bytes surface from `spec/text-and-bytes.md`
 - [ ] Char family support from `spec/char-family.md`
 - [ ] Collections and capabilities from `spec/collections.md`

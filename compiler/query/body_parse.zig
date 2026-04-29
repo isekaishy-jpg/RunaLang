@@ -1118,8 +1118,13 @@ fn resolveDeclaredValueType(
     if (types.CAbiAlias.fromName(type_name) != null) return .{ .named = type_name };
     if (rawPointerPointee(type_name) != null) return .{ .named = type_name };
     if (foreign_callable_types.startsForeignCallableType(type_name)) return .{ .named = type_name };
-    if (std.mem.startsWith(u8, std.mem.trim(u8, type_name, " \t"), "Result[")) return .{ .named = type_name };
-    if (std.mem.startsWith(u8, std.mem.trim(u8, type_name, " \t"), "[")) return .{ .named = type_name };
+    const trimmed_type_name = std.mem.trim(u8, type_name, " \t");
+    if (std.mem.startsWith(u8, trimmed_type_name, "Option[") or
+        std.mem.startsWith(u8, trimmed_type_name, "Result["))
+    {
+        return .{ .named = type_name };
+    }
+    if (std.mem.startsWith(u8, trimmed_type_name, "[")) return .{ .named = type_name };
     if (try tuple_types.isTupleTypeName(diagnostics.allocator, type_name)) return .{ .named = type_name };
     if (findStructPrototype(struct_prototypes, type_name) != null) return .{ .named = type_name };
     if (findEnumPrototype(enum_prototypes, type_name) != null) return .{ .named = type_name };

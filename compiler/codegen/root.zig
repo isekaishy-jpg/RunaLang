@@ -47,8 +47,8 @@ pub fn emitCModule(
         try out.appendSlice(dynamic_support);
     }
 
-    try emitNominalDefinitions(allocator, &out, module, diagnostics);
-    if (hasNominalItems(module)) try out.appendSlice("\n");
+    try emitAggregateDefinitions(allocator, &out, module, diagnostics);
+    if (hasAggregateDefinitions(module)) try out.appendSlice("\n");
 
     for (module.items.items) |item| {
         switch (item.payload) {
@@ -780,13 +780,25 @@ fn emitExpr(
                 try out.appendSlice(name);
             }
         },
-        .enum_variant => |value| try emitEnumValueLiteral(allocator, out, module, parameter_context, value.enum_symbol, value.variant_name, null, diagnostics, span),
+        .enum_variant => |value| {
+            if (isStandardEnumValueType(expr.ty)) {
+                try emitStandardEnumValueLiteral(allocator, out, module, parameter_context, expr.ty, value.variant_name, null, diagnostics, span);
+            } else {
+                try emitEnumValueLiteral(allocator, out, module, parameter_context, value.enum_symbol, value.variant_name, null, diagnostics, span);
+            }
+        },
         .enum_tag => |value| try appendEnumVariantTagName(out, value.enum_symbol, value.variant_name),
         .enum_constructor_target => {
             try diagnostics.add(.@"error", "codegen.enum.ctor_target", span, "internal stage0 error: enum constructor target reached codegen", .{});
             return error.CodegenFailed;
         },
-        .enum_construct => |construct| try emitEnumValueLiteral(allocator, out, module, parameter_context, construct.enum_symbol, construct.variant_name, construct.args, diagnostics, span),
+        .enum_construct => |construct| {
+            if (isStandardEnumValueType(expr.ty)) {
+                try emitStandardEnumValueLiteral(allocator, out, module, parameter_context, expr.ty, construct.variant_name, construct.args, diagnostics, span);
+            } else {
+                try emitEnumValueLiteral(allocator, out, module, parameter_context, construct.enum_symbol, construct.variant_name, construct.args, diagnostics, span);
+            }
+        },
         .constructor => |constructor| {
             if (global_const_context) {
                 try diagnostics.add(.@"error", "codegen.const.constructor", span, "stage0 const initializers do not support constructor expressions in generated C", .{});
@@ -1263,24 +1275,33 @@ fn appendEscapedCString(out: *array_list.Managed(u8), value: []const u8) !void {
     try out.appendSlice("\"");
 }
 
-fn emitNominalDefinitions(
+fn emitAggregateDefinitions(
     allocator: Allocator,
     out: *array_list.Managed(u8),
     module: *const program.Module,
     diagnostics: *diag.Bag,
 ) !void {
-    var emitted = std.StringHashMap(void).init(allocator);
-    defer emitted.deinit();
+    var emitted_nominal = std.StringHashMap(void).init(allocator);
+    defer emitted_nominal.deinit();
 
-    var remaining = countNominalItems(module);
-    while (remaining > 0) {
+    var emitted_standard = std.StringHashMap(void).init(allocator);
+    defer emitted_standard.deinit();
+
+    if (moduleUsesStandardEnumValueTypes(module)) {
+        try emitStandardEnumTagConstants(out);
+    }
+
+    var remaining_nominal = countNominalItems(module);
+    while (remaining_nominal > 0 or hasPendingStandardValueTypes(module, &emitted_standard)) {
         var progress = false;
+        try emitStandardDefinitionsFromModule(allocator, out, module, &emitted_standard, &emitted_nominal, diagnostics, &progress);
+
         for (module.items.items) |*item| {
-            if (emitted.contains(item.symbol_name)) continue;
+            if (emitted_nominal.contains(item.symbol_name)) continue;
 
             switch (item.payload) {
                 .struct_type => |*struct_type| {
-                    if (!structFieldsReady(module, &emitted, struct_type.fields)) continue;
+                    if (!structFieldsReady(module, &emitted_nominal, &emitted_standard, struct_type.fields)) continue;
 
                     try out.appendSlice("typedef struct ");
                     try appendStructTypeName(out, item.symbol_name);
@@ -1300,12 +1321,12 @@ fn emitNominalDefinitions(
                     try out.appendSlice("} ");
                     try appendStructTypeName(out, item.symbol_name);
                     try out.appendSlice(";\n");
-                    try emitted.put(item.symbol_name, {});
-                    remaining -= 1;
+                    try emitted_nominal.put(item.symbol_name, {});
+                    remaining_nominal -= 1;
                     progress = true;
                 },
                 .enum_type => |*enum_type| {
-                    if (!enumVariantsReady(module, &emitted, enum_type.variants)) continue;
+                    if (!enumVariantsReady(module, &emitted_nominal, &emitted_standard, enum_type.variants)) continue;
 
                     try out.appendSlice("typedef enum ");
                     try appendEnumTagTypeName(out, item.symbol_name);
@@ -1366,8 +1387,8 @@ fn emitNominalDefinitions(
                     try out.appendSlice("} ");
                     try appendStructTypeName(out, item.symbol_name);
                     try out.appendSlice(";\n");
-                    try emitted.put(item.symbol_name, {});
-                    remaining -= 1;
+                    try emitted_nominal.put(item.symbol_name, {});
+                    remaining_nominal -= 1;
                     progress = true;
                 },
                 .opaque_type => {
@@ -1376,8 +1397,8 @@ fn emitNominalDefinitions(
                     try out.appendSlice(" {\n    void* runa_opaque_handle;\n} ");
                     try appendStructTypeName(out, item.symbol_name);
                     try out.appendSlice(";\n");
-                    try emitted.put(item.symbol_name, {});
-                    remaining -= 1;
+                    try emitted_nominal.put(item.symbol_name, {});
+                    remaining_nominal -= 1;
                     progress = true;
                 },
                 else => {},
@@ -1385,41 +1406,39 @@ fn emitNominalDefinitions(
         }
 
         if (progress) continue;
-        try diagnostics.add(.@"error", "codegen.nominal.dependencies", null, "stage0 nominal type emission requires acyclic local by-value dependencies", .{});
+        try diagnostics.add(.@"error", "codegen.aggregate.dependencies", null, "stage0 aggregate type emission requires acyclic by-value dependencies", .{});
         return error.CodegenFailed;
     }
 }
 
-fn structFieldsReady(module: *const program.Module, emitted: *const std.StringHashMap(void), fields: []const program.StructField) bool {
+fn structFieldsReady(
+    module: *const program.Module,
+    emitted_nominal: *const std.StringHashMap(void),
+    emitted_standard: *const std.StringHashMap(void),
+    fields: []const program.StructField,
+) bool {
     for (fields) |field| {
-        if (valueTypeReady(field.ty)) continue;
-        if (field.ty.kind == .nominal) {
-            const item = findNominalTypeByCName(module, field.ty.c_name) orelse return false;
-            if (!emitted.contains(item.symbol_name)) return false;
-            continue;
-        }
-        return false;
+        if (!aggregateValueTypeReady(module, emitted_nominal, emitted_standard, field.ty)) return false;
     }
     return true;
 }
 
-fn enumVariantsReady(module: *const program.Module, emitted: *const std.StringHashMap(void), variants: []const program.EnumVariant) bool {
+fn enumVariantsReady(
+    module: *const program.Module,
+    emitted_nominal: *const std.StringHashMap(void),
+    emitted_standard: *const std.StringHashMap(void),
+    variants: []const program.EnumVariant,
+) bool {
     for (variants) |variant| {
         switch (variant.payload) {
             .none => {},
             .tuple_fields => |tuple_fields| {
                 for (tuple_fields) |field| {
-                    if (valueTypeReady(field.ty)) continue;
-                    if (field.ty.kind == .nominal) {
-                        const item = findNominalTypeByCName(module, field.ty.c_name) orelse return false;
-                        if (!emitted.contains(item.symbol_name)) return false;
-                        continue;
-                    }
-                    return false;
+                    if (!aggregateValueTypeReady(module, emitted_nominal, emitted_standard, field.ty)) return false;
                 }
             },
             .named_fields => |named_fields| {
-                if (!structFieldsReady(module, emitted, named_fields)) return false;
+                if (!structFieldsReady(module, emitted_nominal, emitted_standard, named_fields)) return false;
             },
         }
     }
@@ -1429,8 +1448,264 @@ fn enumVariantsReady(module: *const program.Module, emitted: *const std.StringHa
 fn valueTypeReady(ty: program.ValueType) bool {
     return switch (ty.kind) {
         .builtin, .c_abi_alias, .raw_pointer, .callable, .foreign_callable, .dynamic_library, .c_va_list => true,
-        .nominal, .tuple, .unsupported => false,
+        .nominal, .tuple, .option, .result, .unsupported => false,
     };
+}
+
+fn aggregateValueTypeReady(
+    module: *const program.Module,
+    emitted_nominal: *const std.StringHashMap(void),
+    emitted_standard: *const std.StringHashMap(void),
+    ty: program.ValueType,
+) bool {
+    if (valueTypeReady(ty)) return true;
+    return switch (ty.kind) {
+        .nominal => {
+            const item = findNominalTypeByCName(module, ty.c_name) orelse return false;
+            return emitted_nominal.contains(item.symbol_name);
+        },
+        .option, .result => emitted_standard.contains(ty.c_name),
+        else => false,
+    };
+}
+
+fn emitStandardDefinitionsFromModule(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    emitted_standard: *std.StringHashMap(void),
+    emitted_nominal: *const std.StringHashMap(void),
+    diagnostics: *diag.Bag,
+    progress: *bool,
+) !void {
+    for (module.imports.items) |binding| {
+        if (binding.const_type) |ty| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, ty);
+        if (binding.function_return_type) |ty| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, ty);
+        if (binding.function_parameter_types) |types| {
+            for (types) |ty| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, ty);
+        }
+    }
+
+    for (module.items.items) |item| {
+        switch (item.payload) {
+            .function => |function| {
+                try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, function.return_type);
+                for (function.parameters) |parameter| {
+                    try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, parameter.ty);
+                }
+                try emitStandardDefinitionsFromBlock(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, &function.body);
+            },
+            .const_item => |const_item| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, const_item.type_ref),
+            .struct_type => |struct_type| {
+                for (struct_type.fields) |field| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, field.ty);
+            },
+            .enum_type => |enum_type| {
+                for (enum_type.variants) |variant| {
+                    switch (variant.payload) {
+                        .none => {},
+                        .tuple_fields => |fields| for (fields) |field| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, field.ty),
+                        .named_fields => |fields| for (fields) |field| try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, field.ty),
+                    }
+                }
+            },
+            .opaque_type, .none => {},
+        }
+    }
+}
+
+fn emitStandardDefinitionsFromBlock(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    emitted_standard: *std.StringHashMap(void),
+    emitted_nominal: *const std.StringHashMap(void),
+    diagnostics: *diag.Bag,
+    progress: *bool,
+    block: *const program.Block,
+) !void {
+    for (block.statements.items) |statement| {
+        switch (statement) {
+            .let_decl, .const_decl => |binding| {
+                try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, binding.ty);
+                try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, binding.expr);
+            },
+            .assign_stmt => |assign| {
+                try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, assign.ty);
+                try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, assign.expr);
+            },
+            .select_stmt => |select_data| {
+                if (select_data.subject) |subject| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, subject);
+                for (select_data.arms) |arm| {
+                    try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, arm.condition);
+                    for (arm.bindings) |binding| {
+                        try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, binding.ty);
+                        try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, binding.expr);
+                    }
+                    try emitStandardDefinitionsFromBlock(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, arm.body);
+                }
+                if (select_data.else_body) |body| try emitStandardDefinitionsFromBlock(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, body);
+            },
+            .loop_stmt => |loop_data| {
+                if (loop_data.condition) |condition| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, condition);
+                try emitStandardDefinitionsFromBlock(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, loop_data.body);
+            },
+            .unsafe_block => |body| try emitStandardDefinitionsFromBlock(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, body),
+            .defer_stmt, .expr_stmt => |expr| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, expr),
+            .return_stmt => |maybe_expr| if (maybe_expr) |expr| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, expr),
+            .placeholder, .break_stmt, .continue_stmt => {},
+        }
+    }
+}
+
+fn emitStandardDefinitionsFromExpr(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    emitted_standard: *std.StringHashMap(void),
+    emitted_nominal: *const std.StringHashMap(void),
+    diagnostics: *diag.Bag,
+    progress: *bool,
+    expr: *const program.Expr,
+) !void {
+    try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, expr.ty);
+    switch (expr.node) {
+        .call => |call| for (call.args) |arg| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, arg),
+        .enum_construct => |construct| for (construct.args) |arg| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, arg),
+        .constructor => |constructor| for (constructor.args) |arg| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, arg),
+        .field => |field| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, field.base),
+        .tuple => |tuple| for (tuple.items) |item| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, item),
+        .array => |array| for (array.items) |item| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, item),
+        .array_repeat => |array_repeat| {
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, array_repeat.value);
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, array_repeat.length);
+        },
+        .index => |index| {
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, index.base);
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, index.index);
+        },
+        .conversion => |conversion| {
+            try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, conversion.target_type);
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, conversion.operand);
+        },
+        .unary => |unary| try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, unary.operand),
+        .binary => |binary| {
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, binary.lhs);
+            try emitStandardDefinitionsFromExpr(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, binary.rhs);
+        },
+        .integer, .bool_lit, .string, .identifier, .enum_variant, .enum_tag, .enum_constructor_target => {},
+    }
+}
+
+fn emitStandardDefinitionForValueType(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    emitted_standard: *std.StringHashMap(void),
+    emitted_nominal: *const std.StringHashMap(void),
+    diagnostics: *diag.Bag,
+    progress: *bool,
+    ty: program.ValueType,
+) !void {
+    if (ty.callable) |callable| {
+        try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, callable.return_type.*);
+        for (callable.parameters) |parameter| {
+            try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, parameter);
+        }
+    }
+
+    switch (ty.kind) {
+        .option => {
+            const option = ty.option orelse return;
+            try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, option.payload.*);
+            if (emitted_standard.contains(ty.c_name)) return;
+            if (!aggregateValueTypeReady(module, emitted_nominal, emitted_standard, option.payload.*)) return;
+            try emitStandardOptionDefinition(allocator, out, module, ty, option, diagnostics);
+            try emitted_standard.put(ty.c_name, {});
+            progress.* = true;
+        },
+        .result => {
+            const result = ty.result orelse return;
+            try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, result.ok.*);
+            try emitStandardDefinitionForValueType(allocator, out, module, emitted_standard, emitted_nominal, diagnostics, progress, result.err.*);
+            if (emitted_standard.contains(ty.c_name)) return;
+            if (!aggregateValueTypeReady(module, emitted_nominal, emitted_standard, result.ok.*)) return;
+            if (!aggregateValueTypeReady(module, emitted_nominal, emitted_standard, result.err.*)) return;
+            try emitStandardResultDefinition(allocator, out, module, ty, result, diagnostics);
+            try emitted_standard.put(ty.c_name, {});
+            progress.* = true;
+        },
+        else => {},
+    }
+}
+
+fn emitStandardOptionDefinition(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    ty: program.ValueType,
+    option: program.OptionValueType,
+    diagnostics: *diag.Bag,
+) !void {
+    try out.appendSlice("typedef struct ");
+    try out.appendSlice(ty.c_name);
+    try out.appendSlice(" {\n    int32_t tag;\n");
+    if (!isUnitValueType(option.payload.*)) {
+        try out.appendSlice("    union {\n");
+        try emitStandardPayloadStruct(allocator, out, module, "Some", "value", option.payload.*, diagnostics);
+        try out.appendSlice("    } payload;\n");
+    }
+    try out.appendSlice("} ");
+    try out.appendSlice(ty.c_name);
+    try out.appendSlice(";\n");
+}
+
+fn emitStandardResultDefinition(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    ty: program.ValueType,
+    result: program.ResultValueType,
+    diagnostics: *diag.Bag,
+) !void {
+    try out.appendSlice("typedef struct ");
+    try out.appendSlice(ty.c_name);
+    try out.appendSlice(" {\n    int32_t tag;\n");
+    if (!isUnitValueType(result.ok.*) or !isUnitValueType(result.err.*)) {
+        try out.appendSlice("    union {\n");
+        if (!isUnitValueType(result.ok.*)) try emitStandardPayloadStruct(allocator, out, module, "Ok", "value", result.ok.*, diagnostics);
+        if (!isUnitValueType(result.err.*)) try emitStandardPayloadStruct(allocator, out, module, "Err", "error", result.err.*, diagnostics);
+        try out.appendSlice("    } payload;\n");
+    }
+    try out.appendSlice("} ");
+    try out.appendSlice(ty.c_name);
+    try out.appendSlice(";\n");
+}
+
+fn emitStandardPayloadStruct(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    variant_name: []const u8,
+    field_name: []const u8,
+    payload_ty: program.ValueType,
+    diagnostics: *diag.Bag,
+) !void {
+    _ = allocator;
+    try out.appendSlice("        struct {\n            ");
+    if (isCallableValueType(payload_ty)) {
+        try emitCallableDeclarator(out, payload_ty, field_name);
+    } else {
+        try emitValueTypeName(out, module, payload_ty, diagnostics, null);
+        try out.appendSlice(" ");
+        try out.appendSlice(field_name);
+    }
+    try out.appendSlice(";\n        } ");
+    try out.appendSlice(variant_name);
+    try out.appendSlice(";\n");
+}
+
+fn isUnitValueType(ty: program.ValueType) bool {
+    return ty.kind == .builtin and ty.builtin == .unit;
 }
 
 fn emitValueTypeName(
@@ -1477,6 +1752,19 @@ fn appendEnumVariantTagName(out: *array_list.Managed(u8), enum_symbol: []const u
     try out.appendSlice(enum_symbol);
     try out.appendSlice("_");
     try out.appendSlice(variant_name);
+}
+
+fn emitStandardEnumTagConstants(out: *array_list.Managed(u8)) !void {
+    try out.appendSlice("enum {\n    ");
+    try appendEnumVariantTagName(out, "Option", "None");
+    try out.appendSlice(" = 0,\n    ");
+    try appendEnumVariantTagName(out, "Option", "Some");
+    try out.appendSlice(" = 1,\n};\n");
+    try out.appendSlice("enum {\n    ");
+    try appendEnumVariantTagName(out, "Result", "Ok");
+    try out.appendSlice(" = 0,\n    ");
+    try appendEnumVariantTagName(out, "Result", "Err");
+    try out.appendSlice(" = 1,\n};\n");
 }
 
 fn emitEnumValueLiteral(
@@ -1567,6 +1855,89 @@ fn emitEnumValueLiteral(
     try out.appendSlice("})");
 }
 
+fn emitStandardEnumValueLiteral(
+    allocator: Allocator,
+    out: *array_list.Managed(u8),
+    module: *const program.Module,
+    parameter_context: []const program.Parameter,
+    ty: program.ValueType,
+    variant_name: []const u8,
+    maybe_args: ?[]*program.Expr,
+    diagnostics: *diag.Bag,
+    span: ?source.Span,
+) anyerror!void {
+    const args = maybe_args orelse &.{};
+    const Payload = struct {
+        family_name: []const u8,
+        field_name: ?[]const u8 = null,
+        ty: ?*program.ValueType = null,
+    };
+    const payload: Payload = switch (ty.kind) {
+        .option => blk: {
+            const option = ty.option orelse return error.CodegenFailed;
+            if (std.mem.eql(u8, variant_name, "None")) break :blk .{ .family_name = "Option" };
+            if (std.mem.eql(u8, variant_name, "Some")) break :blk .{
+                .family_name = "Option",
+                .field_name = "value",
+                .ty = option.payload,
+            };
+            try diagnostics.add(.@"error", "codegen.standard.variant", span, "unknown Option variant '{s}'", .{variant_name});
+            return error.CodegenFailed;
+        },
+        .result => blk: {
+            const result = ty.result orelse return error.CodegenFailed;
+            if (std.mem.eql(u8, variant_name, "Ok")) break :blk .{
+                .family_name = "Result",
+                .field_name = "value",
+                .ty = result.ok,
+            };
+            if (std.mem.eql(u8, variant_name, "Err")) break :blk .{
+                .family_name = "Result",
+                .field_name = "error",
+                .ty = result.err,
+            };
+            try diagnostics.add(.@"error", "codegen.standard.variant", span, "unknown Result variant '{s}'", .{variant_name});
+            return error.CodegenFailed;
+        },
+        else => return error.CodegenFailed,
+    };
+
+    try out.appendSlice("((");
+    try out.appendSlice(ty.c_name);
+    try out.appendSlice("){ .tag = ");
+    try appendEnumVariantTagName(out, payload.family_name, variant_name);
+
+    if (payload.ty) |payload_ty| {
+        if (isUnitValueType(payload_ty.*)) {
+            if (args.len != 0) {
+                try diagnostics.add(.@"error", "codegen.standard.unit_payload", span, "stage0 standard enum unit payloads lower through zero-argument constructors", .{});
+                return error.CodegenFailed;
+            }
+        } else {
+            if (args.len != 1) {
+                try diagnostics.add(.@"error", "codegen.standard.ctor_arity", span, "standard enum payload constructor has wrong arity in codegen", .{});
+                return error.CodegenFailed;
+            }
+            try out.appendSlice(", .payload = { .");
+            try out.appendSlice(variant_name);
+            try out.appendSlice(" = { .");
+            try out.appendSlice(payload.field_name.?);
+            try out.appendSlice(" = ");
+            try emitExpr(allocator, out, module, parameter_context, args[0], false, diagnostics, span);
+            try out.appendSlice(" } }");
+        }
+    } else if (args.len != 0) {
+        try diagnostics.add(.@"error", "codegen.standard.ctor_arity", span, "standard enum unit variant has wrong arity in codegen", .{});
+        return error.CodegenFailed;
+    }
+
+    try out.appendSlice("})");
+}
+
+fn isStandardEnumValueType(ty: program.ValueType) bool {
+    return ty.kind == .option or ty.kind == .result;
+}
+
 fn hasConstItems(module: *const program.Module) bool {
     for (module.items.items) |item| {
         switch (item.payload) {
@@ -1575,6 +1946,10 @@ fn hasConstItems(module: *const program.Module) bool {
         }
     }
     return false;
+}
+
+fn hasAggregateDefinitions(module: *const program.Module) bool {
+    return hasNominalItems(module) or moduleUsesStandardEnumValueTypes(module);
 }
 
 fn hasNominalItems(module: *const program.Module) bool {
@@ -1626,6 +2001,228 @@ fn countOpaqueItems(module: *const program.Module) usize {
         }
     }
     return count;
+}
+
+fn moduleUsesStandardEnumValueTypes(module: *const program.Module) bool {
+    for (module.imports.items) |binding| {
+        if (binding.const_type) |ty| if (valueTypeUsesStandardEnum(ty)) return true;
+        if (binding.function_return_type) |ty| if (valueTypeUsesStandardEnum(ty)) return true;
+        if (binding.function_parameter_types) |types| {
+            for (types) |ty| if (valueTypeUsesStandardEnum(ty)) return true;
+        }
+    }
+
+    for (module.items.items) |item| {
+        switch (item.payload) {
+            .function => |function| {
+                if (valueTypeUsesStandardEnum(function.return_type)) return true;
+                for (function.parameters) |parameter| if (valueTypeUsesStandardEnum(parameter.ty)) return true;
+                if (blockUsesStandardEnum(&function.body)) return true;
+            },
+            .const_item => |const_item| if (valueTypeUsesStandardEnum(const_item.type_ref)) return true,
+            .struct_type => |struct_type| {
+                for (struct_type.fields) |field| if (valueTypeUsesStandardEnum(field.ty)) return true;
+            },
+            .enum_type => |enum_type| {
+                for (enum_type.variants) |variant| {
+                    switch (variant.payload) {
+                        .none => {},
+                        .tuple_fields => |fields| for (fields) |field| if (valueTypeUsesStandardEnum(field.ty)) return true,
+                        .named_fields => |fields| for (fields) |field| if (valueTypeUsesStandardEnum(field.ty)) return true,
+                    }
+                }
+            },
+            .opaque_type, .none => {},
+        }
+    }
+    return false;
+}
+
+fn hasPendingStandardValueTypes(module: *const program.Module, emitted_standard: *const std.StringHashMap(void)) bool {
+    for (module.imports.items) |binding| {
+        if (binding.const_type) |ty| if (valueTypeHasPendingStandardEnum(ty, emitted_standard)) return true;
+        if (binding.function_return_type) |ty| if (valueTypeHasPendingStandardEnum(ty, emitted_standard)) return true;
+        if (binding.function_parameter_types) |types| {
+            for (types) |ty| if (valueTypeHasPendingStandardEnum(ty, emitted_standard)) return true;
+        }
+    }
+
+    for (module.items.items) |item| {
+        switch (item.payload) {
+            .function => |function| {
+                if (valueTypeHasPendingStandardEnum(function.return_type, emitted_standard)) return true;
+                for (function.parameters) |parameter| if (valueTypeHasPendingStandardEnum(parameter.ty, emitted_standard)) return true;
+                if (blockHasPendingStandardEnum(&function.body, emitted_standard)) return true;
+            },
+            .const_item => |const_item| if (valueTypeHasPendingStandardEnum(const_item.type_ref, emitted_standard)) return true,
+            .struct_type => |struct_type| {
+                for (struct_type.fields) |field| if (valueTypeHasPendingStandardEnum(field.ty, emitted_standard)) return true;
+            },
+            .enum_type => |enum_type| {
+                for (enum_type.variants) |variant| {
+                    switch (variant.payload) {
+                        .none => {},
+                        .tuple_fields => |fields| for (fields) |field| if (valueTypeHasPendingStandardEnum(field.ty, emitted_standard)) return true,
+                        .named_fields => |fields| for (fields) |field| if (valueTypeHasPendingStandardEnum(field.ty, emitted_standard)) return true,
+                    }
+                }
+            },
+            .opaque_type, .none => {},
+        }
+    }
+    return false;
+}
+
+fn blockUsesStandardEnum(block: *const program.Block) bool {
+    for (block.statements.items) |statement| {
+        switch (statement) {
+            .let_decl, .const_decl => |binding| {
+                if (valueTypeUsesStandardEnum(binding.ty) or exprUsesStandardEnum(binding.expr)) return true;
+            },
+            .assign_stmt => |assign| {
+                if (valueTypeUsesStandardEnum(assign.ty) or exprUsesStandardEnum(assign.expr)) return true;
+            },
+            .select_stmt => |select_data| {
+                if (select_data.subject) |subject| if (exprUsesStandardEnum(subject)) return true;
+                for (select_data.arms) |arm| {
+                    if (exprUsesStandardEnum(arm.condition)) return true;
+                    for (arm.bindings) |binding| {
+                        if (valueTypeUsesStandardEnum(binding.ty) or exprUsesStandardEnum(binding.expr)) return true;
+                    }
+                    if (blockUsesStandardEnum(arm.body)) return true;
+                }
+                if (select_data.else_body) |body| if (blockUsesStandardEnum(body)) return true;
+            },
+            .loop_stmt => |loop_data| {
+                if (loop_data.condition) |condition| if (exprUsesStandardEnum(condition)) return true;
+                if (blockUsesStandardEnum(loop_data.body)) return true;
+            },
+            .unsafe_block => |body| if (blockUsesStandardEnum(body)) return true,
+            .defer_stmt, .expr_stmt => |expr| if (exprUsesStandardEnum(expr)) return true,
+            .return_stmt => |maybe_expr| if (maybe_expr) |expr| if (exprUsesStandardEnum(expr)) return true,
+            .placeholder, .break_stmt, .continue_stmt => {},
+        }
+    }
+    return false;
+}
+
+fn blockHasPendingStandardEnum(block: *const program.Block, emitted_standard: *const std.StringHashMap(void)) bool {
+    for (block.statements.items) |statement| {
+        switch (statement) {
+            .let_decl, .const_decl => |binding| {
+                if (valueTypeHasPendingStandardEnum(binding.ty, emitted_standard) or exprHasPendingStandardEnum(binding.expr, emitted_standard)) return true;
+            },
+            .assign_stmt => |assign| {
+                if (valueTypeHasPendingStandardEnum(assign.ty, emitted_standard) or exprHasPendingStandardEnum(assign.expr, emitted_standard)) return true;
+            },
+            .select_stmt => |select_data| {
+                if (select_data.subject) |subject| if (exprHasPendingStandardEnum(subject, emitted_standard)) return true;
+                for (select_data.arms) |arm| {
+                    if (exprHasPendingStandardEnum(arm.condition, emitted_standard)) return true;
+                    for (arm.bindings) |binding| {
+                        if (valueTypeHasPendingStandardEnum(binding.ty, emitted_standard) or exprHasPendingStandardEnum(binding.expr, emitted_standard)) return true;
+                    }
+                    if (blockHasPendingStandardEnum(arm.body, emitted_standard)) return true;
+                }
+                if (select_data.else_body) |body| if (blockHasPendingStandardEnum(body, emitted_standard)) return true;
+            },
+            .loop_stmt => |loop_data| {
+                if (loop_data.condition) |condition| if (exprHasPendingStandardEnum(condition, emitted_standard)) return true;
+                if (blockHasPendingStandardEnum(loop_data.body, emitted_standard)) return true;
+            },
+            .unsafe_block => |body| if (blockHasPendingStandardEnum(body, emitted_standard)) return true,
+            .defer_stmt, .expr_stmt => |expr| if (exprHasPendingStandardEnum(expr, emitted_standard)) return true,
+            .return_stmt => |maybe_expr| if (maybe_expr) |expr| if (exprHasPendingStandardEnum(expr, emitted_standard)) return true,
+            .placeholder, .break_stmt, .continue_stmt => {},
+        }
+    }
+    return false;
+}
+
+fn exprUsesStandardEnum(expr: *const program.Expr) bool {
+    if (valueTypeUsesStandardEnum(expr.ty)) return true;
+    return switch (expr.node) {
+        .call => |call| for (call.args) |arg| {
+            if (exprUsesStandardEnum(arg)) return true;
+        } else false,
+        .enum_construct => |construct| for (construct.args) |arg| {
+            if (exprUsesStandardEnum(arg)) return true;
+        } else false,
+        .constructor => |constructor| for (constructor.args) |arg| {
+            if (exprUsesStandardEnum(arg)) return true;
+        } else false,
+        .field => |field| exprUsesStandardEnum(field.base),
+        .tuple => |tuple| for (tuple.items) |item| {
+            if (exprUsesStandardEnum(item)) return true;
+        } else false,
+        .array => |array| for (array.items) |item| {
+            if (exprUsesStandardEnum(item)) return true;
+        } else false,
+        .array_repeat => |array_repeat| exprUsesStandardEnum(array_repeat.value) or exprUsesStandardEnum(array_repeat.length),
+        .index => |index| exprUsesStandardEnum(index.base) or exprUsesStandardEnum(index.index),
+        .conversion => |conversion| valueTypeUsesStandardEnum(conversion.target_type) or exprUsesStandardEnum(conversion.operand),
+        .unary => |unary| exprUsesStandardEnum(unary.operand),
+        .binary => |binary| exprUsesStandardEnum(binary.lhs) or exprUsesStandardEnum(binary.rhs),
+        .integer, .bool_lit, .string, .identifier, .enum_variant, .enum_tag, .enum_constructor_target => false,
+    };
+}
+
+fn exprHasPendingStandardEnum(expr: *const program.Expr, emitted_standard: *const std.StringHashMap(void)) bool {
+    if (valueTypeHasPendingStandardEnum(expr.ty, emitted_standard)) return true;
+    return switch (expr.node) {
+        .call => |call| for (call.args) |arg| {
+            if (exprHasPendingStandardEnum(arg, emitted_standard)) return true;
+        } else false,
+        .enum_construct => |construct| for (construct.args) |arg| {
+            if (exprHasPendingStandardEnum(arg, emitted_standard)) return true;
+        } else false,
+        .constructor => |constructor| for (constructor.args) |arg| {
+            if (exprHasPendingStandardEnum(arg, emitted_standard)) return true;
+        } else false,
+        .field => |field| exprHasPendingStandardEnum(field.base, emitted_standard),
+        .tuple => |tuple| for (tuple.items) |item| {
+            if (exprHasPendingStandardEnum(item, emitted_standard)) return true;
+        } else false,
+        .array => |array| for (array.items) |item| {
+            if (exprHasPendingStandardEnum(item, emitted_standard)) return true;
+        } else false,
+        .array_repeat => |array_repeat| exprHasPendingStandardEnum(array_repeat.value, emitted_standard) or exprHasPendingStandardEnum(array_repeat.length, emitted_standard),
+        .index => |index| exprHasPendingStandardEnum(index.base, emitted_standard) or exprHasPendingStandardEnum(index.index, emitted_standard),
+        .conversion => |conversion| valueTypeHasPendingStandardEnum(conversion.target_type, emitted_standard) or exprHasPendingStandardEnum(conversion.operand, emitted_standard),
+        .unary => |unary| exprHasPendingStandardEnum(unary.operand, emitted_standard),
+        .binary => |binary| exprHasPendingStandardEnum(binary.lhs, emitted_standard) or exprHasPendingStandardEnum(binary.rhs, emitted_standard),
+        .integer, .bool_lit, .string, .identifier, .enum_variant, .enum_tag, .enum_constructor_target => false,
+    };
+}
+
+fn valueTypeUsesStandardEnum(ty: program.ValueType) bool {
+    if (ty.kind == .option or ty.kind == .result) return true;
+    if (ty.callable) |callable| {
+        if (valueTypeUsesStandardEnum(callable.return_type.*)) return true;
+        for (callable.parameters) |parameter| if (valueTypeUsesStandardEnum(parameter)) return true;
+    }
+    return false;
+}
+
+fn valueTypeHasPendingStandardEnum(ty: program.ValueType, emitted_standard: *const std.StringHashMap(void)) bool {
+    if (ty.callable) |callable| {
+        if (valueTypeHasPendingStandardEnum(callable.return_type.*, emitted_standard)) return true;
+        for (callable.parameters) |parameter| if (valueTypeHasPendingStandardEnum(parameter, emitted_standard)) return true;
+    }
+    switch (ty.kind) {
+        .option => {
+            if (!emitted_standard.contains(ty.c_name)) return true;
+            const option = ty.option orelse return false;
+            return valueTypeHasPendingStandardEnum(option.payload.*, emitted_standard);
+        },
+        .result => {
+            if (!emitted_standard.contains(ty.c_name)) return true;
+            const result = ty.result orelse return false;
+            return valueTypeHasPendingStandardEnum(result.ok.*, emitted_standard) or
+                valueTypeHasPendingStandardEnum(result.err.*, emitted_standard);
+        },
+        else => return false,
+    }
 }
 
 fn hasFunctionItems(module: *const program.Module) bool {

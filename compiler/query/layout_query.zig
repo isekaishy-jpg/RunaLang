@@ -43,8 +43,8 @@ pub fn build(active: *session.Session, key: layout.LayoutKey, resolvers: Resolve
         .callable => layoutPointer(active, key, model, true),
         .c_va_list => layout.unsupportedResult(active.allocator, key, "CVaList layout is backend target-owned"),
         .handle => layout.unsupportedResult(active.allocator, key, "handle layout is not implemented"),
-        .option => layout.unsupportedResult(active.allocator, key, "Option layout is not implemented"),
-        .result => layout.unsupportedResult(active.allocator, key, "Result layout is not implemented"),
+        .option => |option_type| layoutOption(active, key, model, option_type, resolvers),
+        .result => |result_type| layoutResult(active, key, model, result_type, resolvers),
         .unsupported => layout.unsupportedResult(active.allocator, key, "unsupported canonical type key"),
     };
 }
@@ -278,6 +278,134 @@ fn layoutEnum(
     });
 }
 
+fn layoutOption(
+    active: *session.Session,
+    key: layout.LayoutKey,
+    model: TargetLayoutModel,
+    option_type: types.OptionType,
+    resolvers: Resolvers,
+) !layout.LayoutResult {
+    _ = model;
+    const tag = try standardEnumTagLayout(active, key, resolvers);
+    var variants = array_list.Managed(layout.VariantLayout).init(active.allocator);
+    defer variants.deinit();
+    defer deinitVariantItems(active.allocator, variants.items);
+
+    try appendVariantWithPayload(active.allocator, &variants, "None", 0, null);
+    try appendVariantWithPayload(active.allocator, &variants, "Some", 1, option_type.payload);
+
+    const payload_storage = standardEnumPayloadStorage(active, key, &.{option_type.payload}, resolvers) catch |err| switch (err) {
+        error.UnsupportedStandardEnumPayloadLayout => return layout.unsupportedResult(active.allocator, key, "standard enum payload has no sized layout"),
+        else => return err,
+    };
+    const size = try standardEnumSize(tag.size, tag.@"align", payload_storage.size, payload_storage.@"align", payload_storage.has_payload);
+    const alignment = if (payload_storage.has_payload) @max(tag.@"align", payload_storage.@"align") else tag.@"align";
+
+    var fields = array_list.Managed(layout.FieldLayout).init(active.allocator);
+    defer fields.deinit();
+    defer deinitFieldItems(active.allocator, fields.items);
+    try appendField(active.allocator, &fields, "tag", tag.repr_type_id, 0, tag.size, tag.@"align");
+
+    return aggregateResult(active, key, size, alignment, .@"enum", false, &fields, &variants, tag);
+}
+
+fn layoutResult(
+    active: *session.Session,
+    key: layout.LayoutKey,
+    model: TargetLayoutModel,
+    result_type: types.ResultType,
+    resolvers: Resolvers,
+) !layout.LayoutResult {
+    _ = model;
+    const tag = try standardEnumTagLayout(active, key, resolvers);
+    var variants = array_list.Managed(layout.VariantLayout).init(active.allocator);
+    defer variants.deinit();
+    defer deinitVariantItems(active.allocator, variants.items);
+
+    try appendVariantWithPayload(active.allocator, &variants, "Ok", 0, result_type.ok);
+    try appendVariantWithPayload(active.allocator, &variants, "Err", 1, result_type.err);
+
+    const payload_storage = standardEnumPayloadStorage(active, key, &.{ result_type.ok, result_type.err }, resolvers) catch |err| switch (err) {
+        error.UnsupportedStandardEnumPayloadLayout => return layout.unsupportedResult(active.allocator, key, "standard enum payload has no sized layout"),
+        else => return err,
+    };
+    const size = try standardEnumSize(tag.size, tag.@"align", payload_storage.size, payload_storage.@"align", payload_storage.has_payload);
+    const alignment = if (payload_storage.has_payload) @max(tag.@"align", payload_storage.@"align") else tag.@"align";
+
+    var fields = array_list.Managed(layout.FieldLayout).init(active.allocator);
+    defer fields.deinit();
+    defer deinitFieldItems(active.allocator, fields.items);
+    try appendField(active.allocator, &fields, "tag", tag.repr_type_id, 0, tag.size, tag.@"align");
+
+    return aggregateResult(active, key, size, alignment, .@"enum", false, &fields, &variants, tag);
+}
+
+const StandardEnumPayloadStorage = struct {
+    has_payload: bool = false,
+    size: u64 = 0,
+    @"align": u32 = 1,
+};
+
+fn standardEnumTagLayout(
+    active: *session.Session,
+    key: layout.LayoutKey,
+    resolvers: Resolvers,
+) !layout.TagLayout {
+    const tag_type = try resolvers.canonical_key(active, .{ .builtin_scalar = .i32 });
+    const tag_layout = try layoutForType(active, key, tag_type, resolvers);
+    if (tag_layout.status != .sized) {
+        return error.InvalidLayoutTag;
+    }
+    return .{
+        .repr_type_id = tag_type,
+        .size = tag_layout.size orelse return error.InvalidLayoutTag,
+        .@"align" = tag_layout.@"align" orelse return error.InvalidLayoutTag,
+    };
+}
+
+fn standardEnumPayloadStorage(
+    active: *session.Session,
+    key: layout.LayoutKey,
+    payloads: []const types.CanonicalTypeId,
+    resolvers: Resolvers,
+) !StandardEnumPayloadStorage {
+    var result = StandardEnumPayloadStorage{};
+    for (payloads) |payload| {
+        if (isUnitCanonical(active, payload)) continue;
+        const payload_layout = try layoutForType(active, key, payload, resolvers);
+        if (payload_layout.status != .sized) {
+            return error.UnsupportedStandardEnumPayloadLayout;
+        }
+        const payload_size = payload_layout.size orelse return error.UnsupportedStandardEnumPayloadLayout;
+        const payload_alignment = payload_layout.@"align" orelse return error.UnsupportedStandardEnumPayloadLayout;
+        result.has_payload = true;
+        result.size = @max(result.size, payload_size);
+        result.@"align" = @max(result.@"align", payload_alignment);
+    }
+    return result;
+}
+
+fn standardEnumSize(
+    tag_size: u64,
+    tag_alignment: u32,
+    payload_size: u64,
+    payload_alignment: u32,
+    has_payload: bool,
+) !u64 {
+    if (!has_payload) return alignForward(tag_size, tag_alignment);
+    const payload_offset = try alignForward(tag_size, payload_alignment);
+    const unaligned_size = try std.math.add(u64, payload_offset, payload_size);
+    return alignForward(unaligned_size, @max(tag_alignment, payload_alignment));
+}
+
+fn isUnitCanonical(active: *session.Session, type_id: types.CanonicalTypeId) bool {
+    if (type_id.index >= active.caches.canonical_types.items.len) return false;
+    return switch (active.caches.canonical_types.items[type_id.index].key) {
+        .builtin_scalar => |scalar| scalar == .unit,
+        else => false,
+    };
+}
+
 fn layoutForType(
     active: *session.Session,
     parent_key: layout.LayoutKey,
@@ -397,11 +525,22 @@ fn appendVariant(
     name: []const u8,
     tag_value: i128,
 ) !void {
+    return appendVariantWithPayload(allocator, variants, name, tag_value, null);
+}
+
+fn appendVariantWithPayload(
+    allocator: std.mem.Allocator,
+    variants: *array_list.Managed(layout.VariantLayout),
+    name: []const u8,
+    tag_value: i128,
+    payload_layout: ?types.CanonicalTypeId,
+) !void {
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
     try variants.append(.{
         .name = owned_name,
         .tag_value = tag_value,
+        .payload_layout = payload_layout,
     });
 }
 

@@ -47,9 +47,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const runa = addTool(b, target, optimize, "runa", "cmd/runa/main.zig", app_imports);
-    _ = addTool(b, target, optimize, "runac", "cmd/runac/main.zig", app_imports);
-    _ = addTool(b, target, optimize, "runafmt", "cmd/runafmt/main.zig", app_imports);
-    _ = addTool(b, target, optimize, "runadoc", "cmd/runadoc/main.zig", app_imports);
     _ = addTool(b, target, optimize, "runals", "cmd/runals/main.zig", app_imports);
 
     const run_step = b.step("run", "Run the primary runa CLI");

@@ -113,14 +113,6 @@ pub fn buildAtPathWithOptions(
     defer allocator.free(out_dir);
     try ensureDirPath(io, out_dir);
 
-    var lock_artifacts = array_list.Managed(package.LockfileArtifactRecord).init(allocator);
-    defer {
-        for (lock_artifacts.items) |artifact| {
-            if (artifact.checksum) |checksum| allocator.free(checksum);
-        }
-        lock_artifacts.deinit();
-    }
-
     for (result.workspace.products.items, 0..) |product, index| {
         if (product.kind == .lib) {
             try result.pipeline.diagnostics.add(.@"error", "build.kind.unsupported", null, "stage0 build supports only 'bin' and 'cdylib'; product '{s}' is 'lib'", .{product.name});
@@ -222,17 +214,10 @@ pub fn buildAtPathWithOptions(
             .metadata_path = metadata_path,
         });
         keep_paths = true;
-
-        try lock_artifacts.append(.{
-            .product = product.name,
-            .kind = product.kind,
-            .target = compiler.target.hostName(),
-            .checksum = try computeFileChecksumHex(allocator, io, out_path),
-        });
     }
 
     if (!result.pipeline.diagnostics.hasErrors()) {
-        try workspace.writeLockfile(allocator, io, &result.workspace, lock_artifacts.items);
+        try workspace.writeLockfile(allocator, io, &result.workspace);
     }
 
     return result;

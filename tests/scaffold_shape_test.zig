@@ -137,7 +137,10 @@ test "ownership and reflection reservations are explicit" {
 }
 
 test "toolchain and std reflection surfaces exist" {
-    try std.testing.expectEqual(@as(usize, 7), toolchain.workflow_subcommands.len);
+    try std.testing.expectEqual(@as(usize, 13), toolchain.cli.command_specs.len);
+    try std.testing.expect(@hasDecl(toolchain.cli.Context, "CommandContext"));
+    try std.testing.expect(toolchain.testing.product_name_heuristics_are_removed);
+    try std.testing.expectEqualStrings("#test", toolchain.testing.discovery_attribute);
     try std.testing.expect(libraries.std.reflect.public_api);
     try std.testing.expect(libraries.std.reflect.runtime_metadata_opt_in);
     try std.testing.expect(libraries.std.reflect.exported_only_runtime_metadata);
@@ -149,16 +152,92 @@ test "std option and result helpers behave" {
 
     const some_value: MaybeInt = .{ .some = 4 };
     const none_value: MaybeInt = .none;
-    try std.testing.expect(some_value.isSome());
-    try std.testing.expect(!some_value.isNone());
-    try std.testing.expect(none_value.isNone());
-    try std.testing.expectEqual(@as(i32, 9), none_value.unwrapOr(9));
+    try std.testing.expect(some_value.is_some());
+    try std.testing.expect(!some_value.is_none());
+    try std.testing.expect(none_value.is_none());
+    try std.testing.expectEqual(@as(i32, 9), none_value.unwrap_or(9));
 
     const ok_value: IntResult = .{ .ok = 7 };
     const err_value: IntResult = .{ .err = "boom" };
-    try std.testing.expect(ok_value.isOk());
-    try std.testing.expect(!ok_value.isErr());
-    try std.testing.expect(err_value.isErr());
+    try std.testing.expect(ok_value.is_ok());
+    try std.testing.expect(!ok_value.is_err());
+    try std.testing.expect(err_value.is_err());
+}
+
+test "std option and result language surfaces declare canonical helpers" {
+    try std.testing.expectEqual(@as(usize, 4), compiler.query.standard_families.helper_surfaces.len);
+
+    for (compiler.query.standard_families.helper_surfaces) |surface| {
+        const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, surface.source_path, std.testing.allocator, .limited(16 * 1024));
+        defer std.testing.allocator.free(contents);
+
+        const impl_needle: []const u8 = switch (surface.family) {
+            .option => "impl[T] Option[T]:",
+            .result => "impl[T, E] Result[T, E]:",
+        };
+        try std.testing.expect(std.mem.indexOf(u8, contents, impl_needle) != null);
+
+        const method_needle = try std.fmt.allocPrint(std.testing.allocator, "fn {s}(read self) -> Bool", .{surface.method_name});
+        defer std.testing.allocator.free(method_needle);
+        try std.testing.expect(std.mem.indexOf(u8, contents, method_needle) != null);
+
+        const variant_needle = try std.fmt.allocPrint(std.testing.allocator, "when {s}.{s}", .{
+            surface.family.name(),
+            surface.true_variant_name,
+        });
+        defer std.testing.allocator.free(variant_needle);
+        try std.testing.expect(std.mem.indexOf(u8, contents, variant_needle) != null);
+
+        const concrete_type_name: []const u8 = switch (surface.family) {
+            .option => "Option[I32]",
+            .result => "Result[I32, Bool]",
+        };
+        try std.testing.expectEqualStrings(
+            surface.true_variant_name,
+            compiler.query.standard_families.helperVariant(concrete_type_name, surface.method_name).?,
+        );
+    }
+
+    const option_zig = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "libraries/std/option.zig", std.testing.allocator, .limited(16 * 1024));
+    defer std.testing.allocator.free(option_zig);
+    const result_zig = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "libraries/std/result.zig", std.testing.allocator, .limited(16 * 1024));
+    defer std.testing.allocator.free(result_zig);
+
+    const removed_option_names = [_]struct { []const u8, []const u8 }{
+        .{ "is", "Some" },
+        .{ "is", "None" },
+        .{ "unwrap", "Or" },
+    };
+    for (removed_option_names) |parts| {
+        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", parts);
+        defer std.testing.allocator.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, option_zig, needle) == null);
+    }
+
+    const removed_result_names = [_]struct { []const u8, []const u8 }{
+        .{ "is", "Ok" },
+        .{ "is", "Err" },
+    };
+    for (removed_result_names) |parts| {
+        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", parts);
+        defer std.testing.allocator.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, result_zig, needle) == null);
+    }
+}
+
+test "std option and result language surfaces parse through package graph" {
+    var graph = try toolchain.workspace.loadGraphAtPath(std.testing.allocator, std.testing.io, "libraries/std");
+    defer graph.deinit();
+    try std.testing.expectEqual(@as(usize, 1), graph.root_products.items.len);
+    try std.testing.expectEqualStrings("std", graph.root_products.items[0].name);
+
+    var compiler_graph = try toolchain.workspace.toCompilerGraph(std.testing.allocator, &graph);
+    defer compiler_graph.deinit();
+
+    var active = try compiler.semantic.openGraph(std.testing.allocator, std.testing.io, compiler_graph.graph);
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
 }
 
 test "std list and map surfaces behave" {
@@ -171,7 +250,7 @@ test "std list and map surfaces behave" {
     try std.testing.expectEqual(@as(usize, 3), list.count());
     try std.testing.expectEqual(@as(i32, 3), list.remove(1));
     const popped = list.pop();
-    try std.testing.expect(popped.isSome());
+    try std.testing.expect(popped.is_some());
     try std.testing.expectEqual(@as(i32, 2), popped.some);
     list.clear();
     try std.testing.expect(list.isEmpty());
@@ -181,13 +260,13 @@ test "std list and map surfaces behave" {
 
     try std.testing.expect(map.isEmpty());
     const first = try map.insert(1, 10);
-    try std.testing.expect(first.isNone());
+    try std.testing.expect(first.is_none());
     const replaced = try map.insert(1, 11);
-    try std.testing.expect(replaced.isSome());
+    try std.testing.expect(replaced.is_some());
     try std.testing.expectEqual(@as(i32, 10), replaced.some);
     try std.testing.expect(map.containsKey(1));
     const removed = map.remove(1);
-    try std.testing.expect(removed.isSome());
+    try std.testing.expect(removed.is_some());
     try std.testing.expectEqual(@as(i32, 11), removed.some);
 }
 
@@ -270,6 +349,147 @@ test "bootstrap and primary cli stay wired" {
     }
 }
 
+test "canonical cli parses reserved commands without project discovery" {
+    const allocator = std.testing.allocator;
+
+    const parsed_doc = try toolchain.cli.parseArgs(allocator, &.{"doc"});
+    switch (parsed_doc) {
+        .ok => |ok| switch (ok) {
+            .command => |command| try std.testing.expect(std.meta.activeTag(command) == .doc),
+            else => return error.UnexpectedTestResult,
+        },
+        .failure => |failure| {
+            defer allocator.free(failure.message);
+            return error.UnexpectedTestResult;
+        },
+    }
+
+    const parsed_bad = try toolchain.cli.parseArgs(allocator, &.{ "build", "--release", "--release" });
+    try std.testing.expect(parsed_bad == .failure);
+    allocator.free(parsed_bad.failure.message);
+}
+
+test "manifest-rooted remove context does not require global store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "2026.0.01"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        ,
+    });
+
+    const original = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(original);
+    try std.process.setCurrentPath(std.testing.io, root);
+    defer std.process.setCurrentPath(std.testing.io, original) catch unreachable;
+
+    var command_context = try toolchain.cli.Context.build(std.testing.allocator, std.testing.io, toolchain.cli.Command.remove);
+    defer command_context.deinit();
+
+    switch (command_context) {
+        .manifest_rooted => |manifest_rooted| {
+            try std.testing.expect(manifest_rooted.global_store == null);
+            try std.testing.expectEqualStrings("demo", manifest_rooted.target_package.?.name);
+        },
+        .standalone => return error.UnexpectedTestResult,
+    }
+}
+
+test "standalone and reserved run paths bypass manifest discovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    const original = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(original);
+    try std.process.setCurrentPath(std.testing.io, root);
+    defer std.process.setCurrentPath(std.testing.io, original) catch unreachable;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const new_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "new", "demo" });
+    switch (new_outcome) {
+        .unimplemented => |command| try std.testing.expect(command == .new),
+        else => return error.UnexpectedTestResult,
+    }
+
+    const doc_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "doc" });
+    switch (doc_outcome) {
+        .reserved_unimplemented => |command| try std.testing.expect(command == .doc),
+        else => return error.UnexpectedTestResult,
+    }
+
+    const import_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "import", "fmt", "--version=2026.0.56" });
+    switch (import_outcome) {
+        .unimplemented => |command| try std.testing.expect(command == .import),
+        .command_failure => |line| {
+            try std.testing.expect(std.mem.indexOf(u8, line, "MissingManifest") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "InvalidManifest") == null);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "standalone and reserved run paths ignore invalid nearest manifest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "Bad"
+        ,
+    });
+
+    const original = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(original);
+    try std.process.setCurrentPath(std.testing.io, root);
+    defer std.process.setCurrentPath(std.testing.io, original) catch unreachable;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const new_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "new", "demo" });
+    switch (new_outcome) {
+        .unimplemented => |command| try std.testing.expect(command == .new),
+        else => return error.UnexpectedTestResult,
+    }
+
+    const doc_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "doc" });
+    switch (doc_outcome) {
+        .reserved_unimplemented => |command| try std.testing.expect(command == .doc),
+        else => return error.UnexpectedTestResult,
+    }
+
+    const import_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "import", "fmt", "--version=2026.0.56" });
+    switch (import_outcome) {
+        .unimplemented => |command| try std.testing.expect(command == .import),
+        .command_failure => |line| {
+            try std.testing.expect(std.mem.indexOf(u8, line, "MissingManifest") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "InvalidManifest") == null);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
 fn expectPathExists(path: []const u8) !void {
     try std.Io.Dir.cwd().access(std.testing.io, path, .{});
 }
@@ -312,7 +532,7 @@ test "manifest parsing loads package identity and products" {
     try std.testing.expectEqual(toolchain.package.ProductKind.bin, manifest.products.items[0].kind);
 }
 
-test "lockfile parsing loads source and artifact provenance" {
+test "lockfile parsing is source-only" {
     const contents =
         \\[[sources]]
         \\registry = "primary"
@@ -321,24 +541,17 @@ test "lockfile parsing loads source and artifact provenance" {
         \\edition = "2026"
         \\lang_version = "0.00"
         \\checksum = "abc123"
-        \\
-        \\[[artifacts]]
-        \\registry = "primary"
-        \\name = "demo"
-        \\version = "0.1.0"
-        \\product = "demo_native"
-        \\kind = "cdylib"
-        \\target = "x86_64-pc-windows-msvc"
-        \\checksum = "def456"
     ;
 
     var lockfile = try toolchain.package.Lockfile.parse(std.testing.allocator, contents);
     defer lockfile.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), lockfile.sources.items.len);
-    try std.testing.expectEqual(@as(usize, 1), lockfile.artifacts.items.len);
     try std.testing.expectEqualStrings("primary", lockfile.sources.items[0].registry);
-    try std.testing.expectEqual(toolchain.package.ProductKind.cdylib, lockfile.artifacts.items[0].kind);
+    try std.testing.expectError(error.InvalidLockfile, toolchain.package.Lockfile.parse(std.testing.allocator,
+        \\[[artifacts]]
+        \\registry = "primary"
+    ));
 }
 
 test "workspace loads optional runa.lock" {
@@ -387,6 +600,361 @@ test "workspace loads optional runa.lock" {
 
     try std.testing.expect(loaded.lockfile != null);
     try std.testing.expectEqual(@as(usize, 1), loaded.lockfile.?.sources.items.len);
+}
+
+test "workspace-only root discovery promotes member invocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const packages_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "packages" });
+    defer std.testing.allocator.free(packages_dir);
+    const member_dir = try std.fs.path.join(std.testing.allocator, &.{ packages_dir, "app" });
+    defer std.testing.allocator.free(member_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, packages_dir, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, member_dir, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[workspace]
+        \\members = ["packages/app"]
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/app/runa.toml",
+        .data =
+        \\[package]
+        \\name = "app"
+        \\version = "2026.0.01"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\[build]
+        \\target = "x86_64-pc-windows-msvc"
+        ,
+    });
+
+    var discovered = try toolchain.workspace.discoverCommandRoot(std.testing.allocator, std.testing.io, member_dir);
+    defer discovered.deinit();
+
+    try std.testing.expectEqual(toolchain.workspace.CommandRootKind.workspace_only_root, discovered.kind);
+    try std.testing.expectEqualStrings(root, discovered.root_dir);
+    try std.testing.expectEqualStrings("app", discovered.target_package.?.name);
+    try std.testing.expect(std.mem.endsWith(u8, discovered.lockfile_path, "runa.lock"));
+}
+
+test "workspace-only compiler prep loads explicit member packages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const packages_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "packages" });
+    defer std.testing.allocator.free(packages_dir);
+    const app_dir = try std.fs.path.join(std.testing.allocator, &.{ packages_dir, "app" });
+    defer std.testing.allocator.free(app_dir);
+    const tool_dir = try std.fs.path.join(std.testing.allocator, &.{ packages_dir, "tool" });
+    defer std.testing.allocator.free(tool_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, packages_dir, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, app_dir, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, tool_dir, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[workspace]
+        \\members = ["packages/app", "packages/tool"]
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/app/runa.toml",
+        .data =
+        \\[package]
+        \\name = "app"
+        \\version = "2026.0.01"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/app/main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/tool/runa.toml",
+        .data =
+        \\[package]
+        \\name = "tool"
+        \\version = "2026.0.01"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/tool/main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    var discovered = try toolchain.workspace.discoverCommandRoot(std.testing.allocator, std.testing.io, root);
+    defer discovered.deinit();
+    try std.testing.expectError(error.MissingLocalAuthoringScope, toolchain.workspace.localAuthoringScope(std.testing.allocator, &discovered));
+
+    const default_scope = try toolchain.workspace.selectedBuildPackageScope(std.testing.allocator, std.testing.io, &discovered, null);
+    defer {
+        for (default_scope) |scope_root| std.testing.allocator.free(scope_root);
+        std.testing.allocator.free(default_scope);
+    }
+    try std.testing.expectEqual(@as(usize, 1), default_scope.len);
+    try std.testing.expectEqualStrings(root, default_scope[0]);
+
+    var prep = try toolchain.workspace.prepareCompilerInputs(std.testing.allocator, std.testing.io, &discovered, .{ .selected_build_package = null }, .{});
+    defer prep.deinit();
+
+    try std.testing.expectEqual(toolchain.workspace.CommandRootKind.workspace_only_root, discovered.kind);
+    try std.testing.expectEqual(@as(usize, 2), prep.graph.packages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), prep.graph.root_products.items.len);
+    try std.testing.expectEqual(@as(usize, 2), prep.compiler_graph.roots.len);
+    try std.testing.expectEqual(@as(usize, 0), prep.compiler_graph.roots[0].package_index);
+    try std.testing.expectEqual(@as(usize, 1), prep.compiler_graph.roots[1].package_index);
+
+    var member_discovered = try toolchain.workspace.discoverCommandRoot(std.testing.allocator, std.testing.io, app_dir);
+    defer member_discovered.deinit();
+
+    const local_scope = try toolchain.workspace.localAuthoringScope(std.testing.allocator, &member_discovered);
+    defer {
+        for (local_scope) |scope_root| std.testing.allocator.free(scope_root);
+        std.testing.allocator.free(local_scope);
+    }
+    try std.testing.expectEqual(@as(usize, 1), local_scope.len);
+    try std.testing.expectEqualStrings(app_dir, local_scope[0]);
+
+    const selected_scope = try toolchain.workspace.selectedBuildPackageScope(std.testing.allocator, std.testing.io, &member_discovered, null);
+    defer {
+        for (selected_scope) |scope_root| std.testing.allocator.free(scope_root);
+        std.testing.allocator.free(selected_scope);
+    }
+    try std.testing.expectEqual(@as(usize, 1), selected_scope.len);
+    try std.testing.expectEqualStrings(root, selected_scope[0]);
+
+    var local_prep = try toolchain.workspace.prepareCompilerInputs(std.testing.allocator, std.testing.io, &member_discovered, .local_authoring, .{});
+    defer local_prep.deinit();
+    try std.testing.expectEqual(@as(usize, 1), local_prep.graph.root_products.items.len);
+
+    var selected_tool_prep = try toolchain.workspace.prepareCompilerInputs(std.testing.allocator, std.testing.io, &member_discovered, .{ .selected_build_package = "tool" }, .{});
+    defer selected_tool_prep.deinit();
+    try std.testing.expectEqual(@as(usize, 1), selected_tool_prep.graph.root_products.items.len);
+    try std.testing.expectEqualStrings("tool", selected_tool_prep.graph.root_products.items[0].name);
+}
+
+test "command root discovery fails on invalid nearest manifest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const inner_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "inner" });
+    defer std.testing.allocator.free(inner_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, inner_dir, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "2026.0.01"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "inner/runa.toml",
+        .data =
+        \\[package]
+        \\name = "Demo"
+        \\version = "2026.0.01"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        ,
+    });
+
+    try std.testing.expectError(error.InvalidManifest, toolchain.workspace.discoverCommandRoot(std.testing.allocator, std.testing.io, inner_dir));
+}
+
+test "atomic rewrite replaces an existing file after verification" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "runa.lock" });
+    defer std.testing.allocator.free(path);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "runa.lock", .data = "old\n" });
+    try toolchain.workspace.atomicRewriteFile(std.testing.allocator, std.testing.io, path, "new\n");
+
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("new\n", contents);
+}
+
+test "atomic rewrite leaves original content on temp collision failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "runa.lock" });
+    defer std.testing.allocator.free(path);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "runa.lock", .data = "old\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "runa.lock.tmp", .data = "busy\n" });
+
+    try std.testing.expectError(error.AtomicRewriteTempExists, toolchain.workspace.atomicRewriteFile(std.testing.allocator, std.testing.io, path, "new\n"));
+
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("old\n", contents);
+}
+
+test "package origin keeps workspace vendored and external roots distinct" {
+    const root = "C:\\work\\demo";
+    try std.testing.expectEqual(toolchain.workspace.PackageOrigin.workspace, toolchain.workspace.packageOrigin(root, root));
+    try std.testing.expectEqual(toolchain.workspace.PackageOrigin.vendored, toolchain.workspace.packageOrigin(root, "C:\\work\\demo\\vendor\\fmt"));
+    try std.testing.expectEqual(toolchain.workspace.PackageOrigin.external_path, toolchain.workspace.packageOrigin(root, "C:\\work\\external\\fmt"));
+    try std.testing.expectEqual(toolchain.workspace.PackageOrigin.external_path, toolchain.workspace.packageOrigin(root, "C:\\work\\demo2\\fmt"));
+    try std.testing.expectEqual(toolchain.workspace.PackageOrigin.global_store, toolchain.workspace.packageOriginWithStore(root, "C:\\Users\\me\\Runa\\store", "C:\\Users\\me\\Runa\\store\\sources\\primary\\fmt\\1.0.0"));
+}
+
+test "registry config parses defaults and named roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const registry_root = try std.fs.path.join(std.testing.allocator, &.{ root, "registry" });
+    defer std.testing.allocator.free(registry_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const registry_root_abs = try std.fs.path.join(std.testing.allocator, &.{ cwd, registry_root });
+    defer std.testing.allocator.free(registry_root_abs);
+
+    const config_text = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\default_registry = "default"
+        \\
+        \\[registries.default]
+        \\root = "{s}"
+    ,
+        .{registry_root_abs},
+    );
+    defer std.testing.allocator.free(config_text);
+
+    var config = try toolchain.package.RegistryConfig.parse(std.testing.allocator, "config.toml", config_text);
+    defer config.deinit();
+
+    try std.testing.expectEqualStrings("default", config.default_registry.?);
+    try std.testing.expectEqualStrings(registry_root_abs, config.registryRoot("default").?);
+    try std.testing.expectError(error.InvalidRegistryName, toolchain.package.RegistryConfig.parse(std.testing.allocator, "config.toml",
+        \\[registries.Bad]
+        \\root = "C:\\bad"
+    ));
+}
+
+test "registry config loads from RUNA_CONFIG_PATH and requires defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const registry_root = try std.fs.path.join(std.testing.allocator, &.{ root, "registry" });
+    defer std.testing.allocator.free(registry_root);
+    try std.Io.Dir.cwd().createDir(std.testing.io, registry_root, .default_dir);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ root, "config.toml" });
+    defer std.testing.allocator.free(config_path);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const registry_root_abs = try std.fs.path.join(std.testing.allocator, &.{ cwd, registry_root });
+    defer std.testing.allocator.free(registry_root_abs);
+
+    const config_text = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\default_registry = "default"
+        \\
+        \\[registries.default]
+        \\root = "{s}"
+    ,
+        .{registry_root_abs},
+    );
+    defer std.testing.allocator.free(config_text);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = config_path, .data = config_text });
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("RUNA_CONFIG_PATH", config_path);
+
+    var config = try toolchain.package.RegistryConfig.loadWithEnvMap(std.testing.allocator, std.testing.io, &env_map);
+    defer config.deinit();
+
+    try std.testing.expectEqualStrings(registry_root_abs, try config.defaultRegistryRoot());
+    var missing_default = try toolchain.package.RegistryConfig.parse(std.testing.allocator, "config.toml",
+        \\[registries.default]
+        \\root = "C:\\registry"
+    );
+    defer missing_default.deinit();
+    try std.testing.expectError(error.MissingDefaultRegistry, missing_default.defaultRegistryRoot());
+}
+
+test "registry config supports xdg config roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const config_home = try std.fs.path.join(std.testing.allocator, &.{ root, "xdg-config" });
+    defer std.testing.allocator.free(config_home);
+    const runa_config_dir = try std.fs.path.join(std.testing.allocator, &.{ config_home, "runa" });
+    defer std.testing.allocator.free(runa_config_dir);
+    const registry_root = try std.fs.path.join(std.testing.allocator, &.{ root, "registry" });
+    defer std.testing.allocator.free(registry_root);
+    try std.Io.Dir.cwd().createDir(std.testing.io, config_home, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, runa_config_dir, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, registry_root, .default_dir);
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const registry_root_abs = try std.fs.path.join(std.testing.allocator, &.{ cwd, registry_root });
+    defer std.testing.allocator.free(registry_root_abs);
+    const config_text = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\default_registry = "default"
+        \\
+        \\[registries.default]
+        \\root = "{s}"
+    ,
+        .{registry_root_abs},
+    );
+    defer std.testing.allocator.free(config_text);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ runa_config_dir, "config.toml" });
+    defer std.testing.allocator.free(config_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = config_path,
+        .data = config_text,
+    });
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("XDG_CONFIG_HOME", config_home);
+
+    var config = try toolchain.package.RegistryConfig.loadWithEnvMap(std.testing.allocator, std.testing.io, &env_map);
+    defer config.deinit();
+    try std.testing.expectEqualStrings(registry_root_abs, try config.defaultRegistryRoot());
 }
 
 test "workspace validates path dependency manifests" {
@@ -653,6 +1221,79 @@ test "compiler semantic wrappers finalize query-backed sessions" {
     try std.testing.expectEqual(@as(i32, 9), value.value.i32);
     try std.testing.expectEqual(compiler.session.QueryState.complete, active.caches.consts[value_id.index].state);
     try std.testing.expect(active.pipeline.modules.items[0].mir != null);
+}
+
+test "#test semantic validation and discovery are query-owned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#test
+        \\fn ok() -> Unit:
+        \\    return
+        \\
+        \\#test
+        \\fn ok_result() -> Result[Unit, Str]:
+        \\    return Result.Ok :: :: call
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), active.pipeline.diagnostics.errorCount());
+    const packages = try compiler.query.discoverAllPackageTests(std.testing.allocator, &active);
+    defer {
+        for (packages) |package_result| package_result.deinit(std.testing.allocator);
+        std.testing.allocator.free(packages);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), packages.len);
+    try std.testing.expectEqual(@as(usize, 2), packages[0].tests.len);
+    try std.testing.expectEqualStrings("ok", packages[0].tests[0].function_name);
+    try std.testing.expectEqualStrings("ok", packages[0].tests[0].call_path);
+    try std.testing.expectEqualStrings("ok_result", packages[0].tests[1].function_name);
+    try std.testing.expectEqualStrings("ok_result", packages[0].tests[1].call_path);
+}
+
+test "#test rejects unsupported signatures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#test
+        \\fn bad(value: I32) -> Unit:
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_test_error = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.test.params")) {
+            saw_test_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_test_error);
 }
 
 test "semantic ids stay dense and stable within one session" {
@@ -1021,6 +1662,17 @@ test "canonical type query interns standard option and result families" {
     try std.testing.expect(!result_abi.safe);
     try std.testing.expect(!result_abi.passable);
     try std.testing.expect(!result_abi.returnable);
+
+    const nested_result_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Result[Result[I32, Bool], Option[Bool]]");
+    const nested_key = compiler.query.testing.canonicalTypeKey(&active, nested_result_type) orelse return error.UnexpectedStructure;
+    switch (nested_key) {
+        .result => |result| {
+            try std.testing.expect(result.ok.eql(result_type));
+            const option_bool_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Option[Bool]");
+            try std.testing.expect(result.err.eql(option_bool_type));
+        },
+        else => return error.UnexpectedStructure,
+    }
 }
 
 test "canonical type query marks capability handles as handle families" {
@@ -1476,6 +2128,27 @@ test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" 
     try std.testing.expectEqual(@as(usize, 2), status_layout.variants.len);
     try std.testing.expectEqual(@as(i128, 0), status_layout.variants[0].tag_value);
     try std.testing.expectEqual(@as(i128, 1), status_layout.variants[1].tag_value);
+
+    const option_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Option[I32]");
+    const option_layout = try compiler.query.layoutForCanonicalType(&active, option_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, option_layout.status);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"enum", option_layout.storage);
+    try std.testing.expect(!option_layout.foreign_stable);
+    try std.testing.expectEqual(@as(u64, 8), option_layout.size.?);
+    try std.testing.expectEqual(@as(usize, 2), option_layout.variants.len);
+    try std.testing.expectEqual(@as(i128, 0), option_layout.variants[0].tag_value);
+    try std.testing.expectEqual(@as(i128, 1), option_layout.variants[1].tag_value);
+    try std.testing.expectEqual(option_type.index, option_layout.key.type_id.index);
+
+    const result_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Result[I32, Bool]");
+    const result_layout = try compiler.query.layoutForCanonicalType(&active, result_type, target_name, .default);
+    try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, result_layout.status);
+    try std.testing.expectEqual(compiler.layout.StorageShape.@"enum", result_layout.storage);
+    try std.testing.expect(!result_layout.foreign_stable);
+    try std.testing.expectEqual(@as(u64, 8), result_layout.size.?);
+    try std.testing.expectEqual(@as(usize, 2), result_layout.variants.len);
+    try std.testing.expectEqual(@as(i128, 0), result_layout.variants[0].tag_value);
+    try std.testing.expectEqual(@as(i128, 1), result_layout.variants[1].tag_value);
 
     const token_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Token");
     const token_layout = try compiler.query.layoutForCanonicalType(&active, token_type, target_name, .default);
@@ -5954,7 +6627,7 @@ test "publication validation rejects unresolved path dependencies" {
     ;
     var parsed_bad = try toolchain.package.Manifest.parse(std.testing.allocator, bad_manifest);
     defer parsed_bad.deinit();
-    try std.testing.expectError(error.InvalidPublication, toolchain.package.validateManifestForPublication(&parsed_bad));
+    try std.testing.expectError(error.InvalidPublication, toolchain.publish.validateManifestForPublication(&parsed_bad));
 
     const good_manifest =
         \\[package]
@@ -5972,12 +6645,25 @@ test "publication validation rejects unresolved path dependencies" {
     ;
     var parsed_good = try toolchain.package.Manifest.parse(std.testing.allocator, good_manifest);
     defer parsed_good.deinit();
-    try toolchain.package.validateManifestForPublication(&parsed_good);
-    try toolchain.package.validateArtifactPublication(&parsed_good, "demo_native", .cdylib, "x86_64-pc-windows-msvc");
+    try toolchain.publish.validateManifestForPublication(&parsed_good);
+    try toolchain.publish.validateArtifactPublication(&parsed_good, "demo_native", .cdylib, "x86_64-pc-windows-msvc");
 }
 
-test "global store pathing keeps source and artifact identity explicit" {
-    var store = try toolchain.package.GlobalStore.init(std.testing.allocator, std.testing.io);
+test "global store pathing is source-only and publication owns artifact paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const override_root = try std.fs.path.join(std.testing.allocator, &.{ root, "override-store" });
+    defer std.testing.allocator.free(override_root);
+    try std.Io.Dir.cwd().createDir(std.testing.io, override_root, .default_dir);
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("RUNA_STORE_ROOT", override_root);
+
+    var store = try toolchain.package.GlobalStore.initWithEnvMap(std.testing.allocator, std.testing.io, &env_map);
     defer store.deinit(std.testing.allocator);
 
     var source_id: toolchain.package.SourceIdentity = .{
@@ -5990,7 +6676,7 @@ test "global store pathing keeps source and artifact identity explicit" {
     const source_path = try store.pathForSource(std.testing.allocator, source_id);
     defer std.testing.allocator.free(source_path);
 
-    var artifact_id: toolchain.package.ArtifactIdentity = .{
+    var artifact_id: toolchain.publish.ArtifactIdentity = .{
         .registry = try std.testing.allocator.dupe(u8, "primary"),
         .name = try std.testing.allocator.dupe(u8, "demo"),
         .version = try std.testing.allocator.dupe(u8, "0.1.0"),
@@ -6000,10 +6686,11 @@ test "global store pathing keeps source and artifact identity explicit" {
     };
     defer artifact_id.deinit(std.testing.allocator);
 
-    const artifact_path = try store.pathForArtifact(std.testing.allocator, artifact_id);
+    const artifact_path = try toolchain.publish.artifactEntryRoot(std.testing.allocator, override_root, artifact_id);
     defer std.testing.allocator.free(artifact_path);
 
-    try std.testing.expect(std.mem.indexOf(u8, source_path, "\\source\\") != null or std.mem.indexOf(u8, source_path, "/source/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source_path, "\\sources\\") != null or std.mem.indexOf(u8, source_path, "/sources/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_path, "\\artifacts\\") != null or std.mem.indexOf(u8, artifact_path, "/artifacts/") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact_path, "demo_native") != null);
 }
 
@@ -6015,6 +6702,7 @@ test "global store honors RUNA_STORE_ROOT override" {
     defer std.testing.allocator.free(root);
     const override_root = try std.fs.path.join(std.testing.allocator, &.{ root, "override-store" });
     defer std.testing.allocator.free(override_root);
+    try std.Io.Dir.cwd().createDir(std.testing.io, override_root, .default_dir);
 
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
@@ -6024,6 +6712,32 @@ test "global store honors RUNA_STORE_ROOT override" {
     defer store.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(override_root, store.root);
+}
+
+test "global store supports xdg data roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const data_home = try std.fs.path.join(std.testing.allocator, &.{ root, "xdg-data" });
+    defer std.testing.allocator.free(data_home);
+    const runa_dir = try std.fs.path.join(std.testing.allocator, &.{ data_home, "Runa" });
+    defer std.testing.allocator.free(runa_dir);
+    const store_root = try std.fs.path.join(std.testing.allocator, &.{ runa_dir, "store" });
+    defer std.testing.allocator.free(store_root);
+    try std.Io.Dir.cwd().createDir(std.testing.io, data_home, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, runa_dir, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, store_root, .default_dir);
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("XDG_DATA_HOME", data_home);
+
+    var store = try toolchain.package.GlobalStore.initWithEnvMap(std.testing.allocator, std.testing.io, &env_map);
+    defer store.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(store_root, store.root);
 }
 
 test "global store publishes source manifest entries" {
@@ -6141,7 +6855,7 @@ test "global store rejects duplicate source publication" {
     ));
 }
 
-test "global store publishes built artifact entries" {
+test "publication publishes built artifact entries" {
     if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -6191,7 +6905,7 @@ test "global store publishes built artifact entries" {
     for (build_result.artifacts.items) |artifact| {
         if (artifact.kind != .cdylib) continue;
 
-        var identity: toolchain.package.ArtifactIdentity = .{
+        var identity: toolchain.publish.ArtifactIdentity = .{
             .registry = try std.testing.allocator.dupe(u8, "primary"),
             .name = try std.testing.allocator.dupe(u8, build_result.workspace.manifest.name.?),
             .version = try std.testing.allocator.dupe(u8, build_result.workspace.manifest.version.?),
@@ -6202,18 +6916,19 @@ test "global store publishes built artifact entries" {
         };
         defer identity.deinit(std.testing.allocator);
 
-        const published_root = try store.publishBuiltArtifact(
+        const published_root = try toolchain.publish.publishBuiltArtifact(
             std.testing.allocator,
             std.testing.io,
+            store.root,
             identity,
             artifact.path,
             artifact.metadata_path,
         );
         defer std.testing.allocator.free(published_root);
 
-        const artifact_copy = try std.fs.path.join(std.testing.allocator, &.{ published_root, std.fs.path.basename(artifact.path) });
+        const artifact_copy = try std.fs.path.join(std.testing.allocator, &.{ published_root, "payload", std.fs.path.basename(artifact.path) });
         defer std.testing.allocator.free(artifact_copy);
-        const metadata_copy = try std.fs.path.join(std.testing.allocator, &.{ published_root, std.fs.path.basename(artifact.metadata_path) });
+        const metadata_copy = try std.fs.path.join(std.testing.allocator, &.{ published_root, "meta.toml" });
         defer std.testing.allocator.free(metadata_copy);
         try std.Io.Dir.cwd().access(std.testing.io, artifact_copy, .{});
         try std.Io.Dir.cwd().access(std.testing.io, metadata_copy, .{});
@@ -6278,9 +6993,7 @@ test "publish workflow copies loaded source tree into managed store" {
     try std.Io.Dir.cwd().access(std.testing.io, root_source, .{});
     try std.Io.Dir.cwd().access(std.testing.io, child_source, .{});
 
-    var store = try toolchain.package.GlobalStore.initAtRoot(std.testing.allocator, store_root);
-    defer store.deinit(std.testing.allocator);
-    var artifact_identity: toolchain.package.ArtifactIdentity = .{
+    var artifact_identity: toolchain.publish.ArtifactIdentity = .{
         .registry = try std.testing.allocator.dupe(u8, "primary"),
         .name = try std.testing.allocator.dupe(u8, "demo"),
         .version = try std.testing.allocator.dupe(u8, "0.1.0"),
@@ -6290,7 +7003,7 @@ test "publish workflow copies loaded source tree into managed store" {
         .checksum = null,
     };
     defer artifact_identity.deinit(std.testing.allocator);
-    const artifact_root = try store.pathForArtifact(std.testing.allocator, artifact_identity);
+    const artifact_root = try toolchain.publish.artifactEntryRoot(std.testing.allocator, store_root, artifact_identity);
     defer std.testing.allocator.free(artifact_root);
     try std.Io.Dir.cwd().access(std.testing.io, artifact_root, .{});
 }
@@ -7749,7 +8462,6 @@ test "stage0 build emits windows exe and dll artifacts" {
     try std.testing.expectEqual(@as(usize, 2), result.artifacts.items.len);
     try std.testing.expect(result.workspace.lockfile != null);
     try std.testing.expectEqual(@as(usize, 1), result.workspace.lockfile.?.sources.items.len);
-    try std.testing.expectEqual(@as(usize, 2), result.workspace.lockfile.?.artifacts.items.len);
     for (result.artifacts.items) |artifact| {
         try std.Io.Dir.cwd().access(std.testing.io, artifact.path, .{});
         try std.Io.Dir.cwd().access(std.testing.io, artifact.c_path, .{});
@@ -7811,6 +8523,36 @@ test "stage0 build records managed source dependencies in runa.lock" {
 
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer std.testing.allocator.free(root);
+    const store_root = try std.fs.path.join(std.testing.allocator, &.{ root, "managed-store" });
+    defer std.testing.allocator.free(store_root);
+    const core_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "core_pkg" });
+    defer std.testing.allocator.free(core_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, store_root, .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, core_dir, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "core_pkg/runa.toml",
+        .data =
+        \\[package]
+        \\name = "core"
+        \\version = "1.2.3"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "lib"
+        \\root = "lib.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "core_pkg/lib.rna",
+        .data =
+        \\pub const VALUE: I32 = 1
+        ,
+    });
+
+    var published = try toolchain.publish.publishAtPath(std.testing.allocator, std.testing.io, core_dir, "primary", store_root);
+    defer published.deinit(std.testing.allocator);
 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "runa.toml",
@@ -7838,7 +8580,9 @@ test "stage0 build records managed source dependencies in runa.lock" {
         ,
     });
 
-    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    var result = try toolchain.build.buildAtPathWithOptions(std.testing.allocator, std.testing.io, root, .{
+        .store_root_override = store_root,
+    });
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
@@ -7848,6 +8592,47 @@ test "stage0 build records managed source dependencies in runa.lock" {
     try std.testing.expectEqualStrings("primary", result.workspace.lockfile.?.sources.items[1].registry);
     try std.testing.expectEqualStrings("core", result.workspace.lockfile.?.sources.items[1].name);
     try std.testing.expectEqualStrings("1.2.3", result.workspace.lockfile.?.sources.items[1].version);
+}
+
+test "workspace graph rejects missing managed sources loudly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const store_root = try std.fs.path.join(std.testing.allocator, &.{ root, "managed-store" });
+    defer std.testing.allocator.free(store_root);
+    try std.Io.Dir.cwd().createDir(std.testing.io, store_root, .default_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[dependencies]
+        \\core = { version = "1.2.3", registry = "primary" }
+        \\
+        \\[[products]]
+        \\kind = "bin"
+        \\name = "demo_app"
+        \\root = "main.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn main() -> I32:
+        \\    return 0
+        ,
+    });
+
+    try std.testing.expectError(error.MissingManagedSource, toolchain.workspace.loadGraphAtPathWithOptions(std.testing.allocator, std.testing.io, root, .{
+        .store_root_override = store_root,
+    }));
 }
 
 test "stage0 build emits unary operators" {
@@ -11017,6 +11802,69 @@ test "ownership query rejects implicit capability handle duplication in aggregat
     try std.testing.expect(saw_repeat_copy);
 }
 
+test "ownership query moves capability handles through standard result payloads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#boundary[capability]
+        \\pub opaque type Handle
+        \\
+        \\fn observe(read handle: Handle) -> I32:
+        \\    return 1
+        \\
+        \\fn take_result(value: Result[Handle, I32]) -> Unit:
+        \\    return
+        \\
+        \\fn ok_payload(take handle: Handle) -> I32:
+        \\    let value: Result[Handle, I32] = Result.Ok :: handle :: call
+        \\    return observe :: handle :: call
+        \\
+        \\fn err_payload(take handle: Handle) -> I32:
+        \\    let value: Result[I32, Handle] = Result.Err :: handle :: call
+        \\    return observe :: handle :: call
+        \\
+        \\fn result_value(take handle: Handle) -> Unit:
+        \\    let value: Result[Handle, I32] = Result.Ok :: handle :: call
+        \\    take_result :: value :: call
+        \\    take_result :: value :: call
+        \\    return
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const ok_id = compiler.query.testing.findItemIdByName(&active, "ok_payload").?;
+    const ok_body = active.semantic_index.itemEntry(ok_id).body_id.?;
+    const ok_ownership = try compiler.query.ownershipByBody(&active, ok_body);
+    try std.testing.expectEqual(@as(usize, 1), ok_ownership.summary.move_after_take);
+
+    const err_id = compiler.query.testing.findItemIdByName(&active, "err_payload").?;
+    const err_body = active.semantic_index.itemEntry(err_id).body_id.?;
+    const err_ownership = try compiler.query.ownershipByBody(&active, err_body);
+    try std.testing.expectEqual(@as(usize, 1), err_ownership.summary.move_after_take);
+
+    const result_id = compiler.query.testing.findItemIdByName(&active, "result_value").?;
+    const result_body = active.semantic_index.itemEntry(result_id).body_id.?;
+    const result_ownership = try compiler.query.ownershipByBody(&active, result_body);
+    try std.testing.expectEqual(@as(usize, 1), result_ownership.summary.move_after_take);
+
+    var move_after_take: usize = 0;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "ownership.move_after_take")) move_after_take += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), move_after_take);
+}
+
 test "ownership query keeps mutually exclusive select-arm states independent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11895,6 +12743,161 @@ test "stage0 build emits local named enum payload construction and subject selec
     }
 }
 
+test "stage0 build emits standard result representation and subject select" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "bin"
+        \\name = "demo_result"
+        \\root = "main.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn ok() -> Result[I32, Bool]:
+        \\    return Result.Ok :: 9 :: call
+        \\
+        \\fn err() -> Result[I32, Bool]:
+        \\    return Result.Err :: false :: call
+        \\
+        \\fn read(take value: Result[I32, Bool]) -> I32:
+        \\    let ok_tag: Bool = value.is_ok :: :: method
+        \\    select value:
+        \\        when Result.Ok(found) => return found
+        \\        when Result.Err(flag) => return 1
+        \\    return 0
+        \\
+        \\fn main() -> I32:
+        \\    let first: Result[I32, Bool] = ok :: :: call
+        \\    let second: Result[I32, Bool] = err :: :: call
+        \\    let ignored: I32 = read :: second :: call
+        \\    return read :: first :: call
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        if (artifact.kind != .bin) continue;
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "typedef struct runa_type_std_result_") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "runa_tag_Result_Ok") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "runa_tag_Result_Err") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, ".payload = { .Ok = { .value = 9 } }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, ".payload).Ok).value") != null);
+
+        const run_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &.{artifact.path},
+            .cwd = .inherit,
+        });
+        defer std.testing.allocator.free(run_result.stdout);
+        defer std.testing.allocator.free(run_result.stderr);
+
+        switch (run_result.term) {
+            .exited => |code| try std.testing.expectEqual(@as(u8, 9), code),
+            else => return error.UnexpectedTestResult,
+        }
+    }
+}
+
+test "stage0 build emits standard option representation and subject select" {
+    if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "runa.toml",
+        .data =
+        \\[package]
+        \\name = "demo"
+        \\version = "0.1.0"
+        \\edition = "2026"
+        \\lang_version = "0.00"
+        \\
+        \\[[products]]
+        \\kind = "bin"
+        \\name = "demo_option"
+        \\root = "main.rna"
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\fn some() -> Option[I32]:
+        \\    return Option.Some :: 6 :: call
+        \\
+        \\fn none() -> Option[I32]:
+        \\    return Option.None
+        \\
+        \\fn read(take value: Option[I32]) -> I32:
+        \\    let has_value: Bool = value.is_some :: :: method
+        \\    let empty: Bool = value.is_none :: :: method
+        \\    select value:
+        \\        when Option.Some(found) => return found
+        \\        when Option.None => return 2
+        \\    return 0
+        \\
+        \\fn main() -> I32:
+        \\    let first: Option[I32] = some :: :: call
+        \\    let second: Option[I32] = none :: :: call
+        \\    let ignored: I32 = read :: second :: call
+        \\    return read :: first :: call
+        ,
+    });
+
+    var result = try toolchain.build.buildAtPath(std.testing.allocator, std.testing.io, root);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.pipeline.diagnostics.errorCount());
+
+    for (result.artifacts.items) |artifact| {
+        if (artifact.kind != .bin) continue;
+        const c_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.c_path, std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(c_source);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "typedef struct runa_type_std_option_") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "runa_tag_Option_None") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, "runa_tag_Option_Some") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, ".payload = { .Some = { .value = 6 } }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c_source, ".payload).Some).value") != null);
+
+        const run_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &.{artifact.path},
+            .cwd = .inherit,
+        });
+        defer std.testing.allocator.free(run_result.stdout);
+        defer std.testing.allocator.free(run_result.stderr);
+
+        switch (run_result.term) {
+            .exited => |code| try std.testing.expectEqual(@as(u8, 6), code),
+            else => return error.UnexpectedTestResult,
+        }
+    }
+}
+
 test "stage0 build emits local struct parameter and return types" {
     if (!compiler.target.stage0WindowsHostSupported()) return error.SkipZigTest;
 
@@ -12639,6 +13642,12 @@ test "stage0 check accepts standard option and result variants patterns and help
         \\fn err() -> Result[I32, Bool]:
         \\    return Result.Err :: false :: call
         \\
+        \\fn ok_bool() -> Result[Bool, I32]:
+        \\    return Result.Ok :: true :: call
+        \\
+        \\fn err_code() -> Result[Bool, I32]:
+        \\    return Result.Err :: 42 :: call
+        \\
         \\fn read_option(take value: Option[I32]) -> I32:
         \\    let a: Bool = value.is_some :: :: method
         \\    let b: Bool = value.is_none :: :: method
@@ -12654,6 +13663,14 @@ test "stage0 check accepts standard option and result variants patterns and help
         \\        when Result.Ok(found) => return found
         \\        when Result.Err(flag) => return 0
         \\    return 0
+        \\
+        \\fn read_result_swapped(take value: Result[Bool, I32]) -> I32:
+        \\    let a: Bool = value.is_ok :: :: method
+        \\    let b: Bool = value.is_err :: :: method
+        \\    select value:
+        \\        when Result.Ok(flag) => return 1
+        \\        when Result.Err(code) => return code
+        \\    return 0
         ,
     });
 
@@ -12663,7 +13680,7 @@ test "stage0 check accepts standard option and result variants patterns and help
     var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
     defer active.deinit();
 
-    const function_names = [_][]const u8{ "some", "none", "ok", "err", "read_option", "read_result" };
+    const function_names = [_][]const u8{ "some", "none", "ok", "err", "ok_bool", "err_code", "read_option", "read_result", "read_result_swapped" };
     for (function_names) |name| {
         const item_id = compiler.query.testing.findItemIdByName(&active, name).?;
         const body_id = active.semantic_index.itemEntry(item_id).body_id.?;

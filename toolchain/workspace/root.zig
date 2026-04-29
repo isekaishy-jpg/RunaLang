@@ -12,6 +12,7 @@ pub const ResolvedProduct = struct {
     kind: package.ProductKind,
     name: []const u8,
     root_path: []const u8,
+    package_index: ?usize = null,
 
     fn deinit(self: ResolvedProduct, allocator: Allocator) void {
         allocator.free(self.name);
@@ -102,6 +103,71 @@ pub const CompilerGraph = struct {
 
 pub const LoadOptions = struct {
     store_root_override: ?[]const u8 = null,
+    include_workspace_members: bool = true,
+};
+
+pub const CompilerPrepScope = union(enum) {
+    workspace,
+    local_authoring,
+    selected_build_package: ?[]const u8,
+};
+
+pub const CommandRootKind = enum {
+    standalone_package,
+    workspace_root,
+    workspace_only_root,
+};
+
+pub const PackageOrigin = enum {
+    workspace,
+    vendored,
+    external_path,
+    global_store,
+};
+
+pub const DiscoveredTargetPackage = struct {
+    name: []const u8,
+    root_dir: []const u8,
+    manifest_path: []const u8,
+
+    fn deinit(self: DiscoveredTargetPackage, allocator: Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.root_dir);
+        allocator.free(self.manifest_path);
+    }
+};
+
+pub const CommandRootDiscovery = struct {
+    allocator: Allocator,
+    cwd: []const u8,
+    nearest_manifest_path: []const u8,
+    nearest_manifest_dir: []const u8,
+    root_dir: []const u8,
+    root_manifest_path: []const u8,
+    lockfile_path: []const u8,
+    kind: CommandRootKind,
+    target_package: ?DiscoveredTargetPackage,
+
+    pub fn deinit(self: *CommandRootDiscovery) void {
+        if (self.target_package) |target| target.deinit(self.allocator);
+        self.allocator.free(self.cwd);
+        self.allocator.free(self.nearest_manifest_path);
+        self.allocator.free(self.nearest_manifest_dir);
+        self.allocator.free(self.root_dir);
+        self.allocator.free(self.root_manifest_path);
+        self.allocator.free(self.lockfile_path);
+    }
+};
+
+pub const CompilerPrep = struct {
+    allocator: Allocator,
+    graph: Graph,
+    compiler_graph: CompilerGraph,
+
+    pub fn deinit(self: *CompilerPrep) void {
+        self.compiler_graph.deinit();
+        self.graph.deinit();
+    }
 };
 
 pub fn loadAtPath(allocator: Allocator, io: std.Io, root_dir: []const u8) !Loaded {
@@ -118,7 +184,7 @@ pub fn loadAtPath(allocator: Allocator, io: std.Io, root_dir: []const u8) !Loade
 
     loaded.manifest.deinit();
     loaded.manifest = try package.Manifest.loadAtPath(allocator, io, loaded.manifest_path);
-    try validateDependencies(io, &loaded);
+    if (loaded.manifest.has_package) try validateDependencies(io, &loaded);
     loadOptionalLockfile(io, &loaded) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -126,6 +192,240 @@ pub fn loadAtPath(allocator: Allocator, io: std.Io, root_dir: []const u8) !Loade
     try resolveProductsForLoaded(io, &loaded);
 
     return loaded;
+}
+
+pub fn discoverCommandRoot(allocator: Allocator, io: std.Io, cwd: []const u8) !CommandRootDiscovery {
+    const start = try std.fs.path.resolve(allocator, &.{cwd});
+    defer allocator.free(start);
+
+    const nearest_dir = (try findNearestManifestDir(allocator, io, start)) orelse return error.MissingManifest;
+    errdefer allocator.free(nearest_dir);
+    const nearest_manifest_path = try std.fs.path.join(allocator, &.{ nearest_dir, "runa.toml" });
+    errdefer allocator.free(nearest_manifest_path);
+
+    var nearest_manifest = try package.Manifest.loadAtPath(allocator, io, nearest_manifest_path);
+    defer nearest_manifest.deinit();
+
+    var root_dir: []const u8 = try allocator.dupe(u8, nearest_dir);
+    errdefer allocator.free(root_dir);
+    var kind: CommandRootKind = if (nearest_manifest.has_workspace)
+        if (nearest_manifest.has_package) .workspace_root else .workspace_only_root
+    else
+        .standalone_package;
+
+    if (!nearest_manifest.has_workspace) {
+        if (try findEnclosingWorkspaceRoot(allocator, io, nearest_dir)) |enclosing| {
+            allocator.free(root_dir);
+            root_dir = enclosing.root_dir;
+            kind = if (enclosing.has_package) .workspace_root else .workspace_only_root;
+        }
+    }
+
+    const root_manifest_path = try std.fs.path.join(allocator, &.{ root_dir, "runa.toml" });
+    errdefer allocator.free(root_manifest_path);
+    const lockfile_path = try std.fs.path.join(allocator, &.{ root_dir, "runa.lock" });
+    errdefer allocator.free(lockfile_path);
+
+    const target_package = if (nearest_manifest.has_package)
+        try discoveredTargetPackage(allocator, &nearest_manifest, nearest_dir, nearest_manifest_path)
+    else
+        null;
+    errdefer if (target_package) |target| target.deinit(allocator);
+
+    return .{
+        .allocator = allocator,
+        .cwd = try allocator.dupe(u8, start),
+        .nearest_manifest_path = nearest_manifest_path,
+        .nearest_manifest_dir = nearest_dir,
+        .root_dir = root_dir,
+        .root_manifest_path = root_manifest_path,
+        .lockfile_path = lockfile_path,
+        .kind = kind,
+        .target_package = target_package,
+    };
+}
+
+pub fn prepareCompilerInputs(
+    allocator: Allocator,
+    io: std.Io,
+    discovery: *const CommandRootDiscovery,
+    scope: CompilerPrepScope,
+    options: LoadOptions,
+) !CompilerPrep {
+    return prepareCompilerInputsForCommandRoot(allocator, io, .{
+        .root_dir = discovery.root_dir,
+        .kind = discovery.kind,
+        .target_package_root = if (discovery.target_package) |target| target.root_dir else null,
+    }, scope, options);
+}
+
+pub const CompilerPrepCommandRoot = struct {
+    root_dir: []const u8,
+    kind: CommandRootKind,
+    target_package_root: ?[]const u8 = null,
+};
+
+pub fn prepareCompilerInputsForCommandRoot(
+    allocator: Allocator,
+    io: std.Io,
+    command_root: CompilerPrepCommandRoot,
+    scope: CompilerPrepScope,
+    options: LoadOptions,
+) !CompilerPrep {
+    var scoped_options = options;
+    const prep_root = try compilerPrepRoot(allocator, io, command_root, scope, &scoped_options);
+    defer allocator.free(prep_root);
+
+    var graph = try loadGraphAtPathWithOptions(allocator, io, prep_root, scoped_options);
+    errdefer graph.deinit();
+    var compiler_graph = try toCompilerGraph(allocator, &graph);
+    errdefer compiler_graph.deinit();
+    return .{
+        .allocator = allocator,
+        .graph = graph,
+        .compiler_graph = compiler_graph,
+    };
+}
+
+pub fn packageOrigin(command_root: []const u8, package_root: []const u8) PackageOrigin {
+    return packageOriginWithStore(command_root, null, package_root);
+}
+
+pub fn packageOriginWithStore(command_root: []const u8, store_root: ?[]const u8, package_root: []const u8) PackageOrigin {
+    if (store_root) |root| {
+        if (relativePathText(root, package_root) != null) return .global_store;
+    }
+    const relative = relativePathText(command_root, package_root) orelse return .external_path;
+    if (std.mem.eql(u8, relative, ".") or relative.len == 0) return .workspace;
+    if (std.mem.startsWith(u8, relative, "vendor/") or std.mem.startsWith(u8, relative, "vendor\\")) return .vendored;
+    return .workspace;
+}
+
+pub fn localAuthoringScope(allocator: Allocator, discovery: *const CommandRootDiscovery) ![][]const u8 {
+    const root = if (discovery.target_package) |target|
+        target.root_dir
+    else switch (discovery.kind) {
+        .standalone_package, .workspace_root => discovery.root_dir,
+        .workspace_only_root => return error.MissingLocalAuthoringScope,
+    };
+    return singleScopeRoot(allocator, root);
+}
+
+pub fn selectedBuildPackageScope(
+    allocator: Allocator,
+    io: std.Io,
+    discovery: *const CommandRootDiscovery,
+    package_name: ?[]const u8,
+) ![][]const u8 {
+    if (package_name) |name| {
+        const root = try findWorkspacePackageRootByName(allocator, io, discovery.root_dir, name);
+        errdefer allocator.free(root);
+        var roots = try allocator.alloc([]const u8, 1);
+        roots[0] = root;
+        return roots;
+    }
+    return singleScopeRoot(allocator, discovery.root_dir);
+}
+
+pub fn packageCommandTargetPackage(discovery: *const CommandRootDiscovery) ?DiscoveredTargetPackage {
+    return discovery.target_package;
+}
+
+fn compilerPrepRoot(
+    allocator: Allocator,
+    io: std.Io,
+    command_root: CompilerPrepCommandRoot,
+    scope: CompilerPrepScope,
+    options: *LoadOptions,
+) ![]const u8 {
+    return switch (scope) {
+        .workspace => blk: {
+            options.include_workspace_members = true;
+            break :blk allocator.dupe(u8, command_root.root_dir);
+        },
+        .local_authoring => blk: {
+            options.include_workspace_members = false;
+            if (command_root.target_package_root) |root| break :blk allocator.dupe(u8, root);
+            switch (command_root.kind) {
+                .standalone_package, .workspace_root => break :blk allocator.dupe(u8, command_root.root_dir),
+                .workspace_only_root => return error.MissingLocalAuthoringScope,
+            }
+        },
+        .selected_build_package => |package_name| blk: {
+            if (package_name) |name| {
+                options.include_workspace_members = false;
+                break :blk findWorkspacePackageRootByName(allocator, io, command_root.root_dir, name);
+            }
+            options.include_workspace_members = true;
+            break :blk allocator.dupe(u8, command_root.root_dir);
+        },
+    };
+}
+
+fn singleScopeRoot(allocator: Allocator, root: []const u8) ![][]const u8 {
+    var roots = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(roots);
+    roots[0] = try allocator.dupe(u8, root);
+    return roots;
+}
+
+fn findWorkspacePackageRootByName(
+    allocator: Allocator,
+    io: std.Io,
+    command_root: []const u8,
+    package_name: []const u8,
+) ![]const u8 {
+    const root_manifest_path = try std.fs.path.join(allocator, &.{ command_root, "runa.toml" });
+    defer allocator.free(root_manifest_path);
+    var root_manifest = try package.Manifest.loadAtPath(allocator, io, root_manifest_path);
+    defer root_manifest.deinit();
+
+    if (root_manifest.has_package) {
+        if (std.mem.eql(u8, root_manifest.name.?, package_name)) return allocator.dupe(u8, command_root);
+    }
+
+    if (root_manifest.has_workspace) {
+        for (root_manifest.workspace_members.items) |member| {
+            const member_root = try std.fs.path.join(allocator, &.{ command_root, member });
+            errdefer allocator.free(member_root);
+
+            const member_manifest_path = try std.fs.path.join(allocator, &.{ member_root, "runa.toml" });
+            defer allocator.free(member_manifest_path);
+            var member_manifest = try package.Manifest.loadAtPath(allocator, io, member_manifest_path);
+            defer member_manifest.deinit();
+            if (!member_manifest.has_package) {
+                allocator.free(member_root);
+                continue;
+            }
+            if (std.mem.eql(u8, member_manifest.name.?, package_name)) return member_root;
+            allocator.free(member_root);
+        }
+    }
+
+    return error.UnknownWorkspacePackage;
+}
+
+pub fn atomicRewriteFile(allocator: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    if (std.Io.Dir.cwd().access(io, tmp_path, .{})) |_| {
+        return error.AtomicRewriteTempExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = tmp_path,
+        .data = contents,
+    });
+    const verify = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, allocator, .limited(contents.len + 1));
+    defer allocator.free(verify);
+    if (!std.mem.eql(u8, verify, contents)) return error.AtomicRewriteVerifyFailed;
+
+    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
 }
 
 pub fn loadGraphAtPath(allocator: Allocator, io: std.Io, root_dir: []const u8) !Graph {
@@ -149,19 +449,54 @@ pub fn loadGraphAtPathWithOptions(
     var visited = std.StringHashMap(usize).init(allocator);
     defer visited.deinit();
 
-    graph.root_package_index = try loadPathPackage(allocator, io, &graph, &visited, root_dir, null, options);
+    const root_manifest_path = try std.fs.path.join(allocator, &.{ root_dir, "runa.toml" });
+    defer allocator.free(root_manifest_path);
+    var root_manifest = try package.Manifest.loadAtPath(allocator, io, root_manifest_path);
+    defer root_manifest.deinit();
 
-    var root_loaded = try loadAtPath(allocator, io, root_dir);
-    defer root_loaded.deinit();
-    for (root_loaded.products.items) |product| {
+    var loaded_any = false;
+    if (root_manifest.has_package) {
+        graph.root_package_index = try loadPathPackage(allocator, io, &graph, &visited, root_dir, null, options);
+        loaded_any = true;
+        try appendRootProductsFromPath(allocator, io, &graph, root_dir, graph.root_package_index);
+    }
+
+    if (root_manifest.has_workspace and options.include_workspace_members) {
+        for (root_manifest.workspace_members.items) |member| {
+            const member_root = try std.fs.path.join(allocator, &.{ root_dir, member });
+            defer allocator.free(member_root);
+            if (std.mem.eql(u8, member_root, root_dir)) continue;
+
+            const member_index = try loadPathPackage(allocator, io, &graph, &visited, member_root, null, options);
+            if (!loaded_any) {
+                graph.root_package_index = member_index;
+                loaded_any = true;
+            }
+            try appendRootProductsFromPath(allocator, io, &graph, member_root, member_index);
+        }
+    }
+    if (!loaded_any) return error.EmptyWorkspace;
+
+    return graph;
+}
+
+fn appendRootProductsFromPath(
+    allocator: Allocator,
+    io: std.Io,
+    graph: *Graph,
+    root_dir: []const u8,
+    package_index: usize,
+) !void {
+    var loaded = try loadAtPath(allocator, io, root_dir);
+    defer loaded.deinit();
+    for (loaded.products.items) |product| {
         try graph.root_products.append(.{
             .kind = product.kind,
             .name = try allocator.dupe(u8, product.name),
             .root_path = try allocator.dupe(u8, product.root_path),
+            .package_index = package_index,
         });
     }
-
-    return graph;
 }
 
 pub fn toCompilerGraph(allocator: Allocator, graph: *const Graph) !CompilerGraph {
@@ -192,7 +527,7 @@ pub fn toCompilerGraph(allocator: Allocator, graph: *const Graph) !CompilerGraph
     for (graph.root_products.items, 0..) |product, index| {
         roots[index] = .{
             .root_path = product.root_path,
-            .package_index = graph.root_package_index,
+            .package_index = product.package_index orelse graph.root_package_index,
         };
     }
 
@@ -227,7 +562,7 @@ pub fn createPackageAtPath(allocator: Allocator, io: std.Io, parent_dir: []const
     const manifest = try std.fmt.allocPrint(allocator,
         \\[package]
         \\name = "{s}"
-        \\version = "0.1.0"
+        \\version = "2026.0.01"
         \\edition = "{s}"
         \\lang_version = "{s}"
         \\
@@ -258,9 +593,8 @@ pub fn writeLockfile(
     allocator: Allocator,
     io: std.Io,
     loaded: *Loaded,
-    artifacts: []const package.LockfileArtifactRecord,
 ) !void {
-    const contents = try package.renderRootLockfile(allocator, &loaded.manifest, artifacts);
+    const contents = try package.renderRootLockfile(allocator, &loaded.manifest);
     defer allocator.free(contents);
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = loaded.lockfile_path,
@@ -308,6 +642,8 @@ fn resolveProductsForManifest(
     source_root: []const u8,
     out_products: *array_list.Managed(ResolvedProduct),
 ) !void {
+    if (!manifest.has_package) return;
+
     if (manifest.products.items.len == 0) {
         try inferDefaultProductsForManifest(io, allocator, manifest, source_root, out_products);
         return;
@@ -486,75 +822,13 @@ fn loadRegistryPackage(
     const entry_root = try store.pathForSource(allocator, source_id);
     defer allocator.free(entry_root);
     std.Io.Dir.cwd().access(io, entry_root, .{}) catch |err| switch (err) {
-        error.FileNotFound => return loadRegistryStubPackage(allocator, graph, visited, entry_root, try allocator.dupe(u8, identity), package_name, version),
+        error.FileNotFound => return error.MissingManagedSource,
         else => return err,
     };
 
     const source_root = try std.fs.path.join(allocator, &.{ entry_root, "sources" });
     defer allocator.free(source_root);
     return loadPublishedPackage(allocator, io, graph, visited, entry_root, source_root, try allocator.dupe(u8, identity), options);
-}
-
-fn loadRegistryStubPackage(
-    allocator: Allocator,
-    graph: *Graph,
-    visited: *std.StringHashMap(usize),
-    expected_root: []const u8,
-    identity_key: []const u8,
-    package_name: []const u8,
-    version: []const u8,
-) anyerror!usize {
-    var own_identity_key = true;
-    errdefer if (own_identity_key) allocator.free(identity_key);
-    const entry = try visited.getOrPut(identity_key);
-    if (entry.found_existing) {
-        allocator.free(identity_key);
-        return entry.value_ptr.*;
-    }
-    entry.key_ptr.* = identity_key;
-
-    var manifest = package.Manifest.init(allocator);
-    var own_manifest = true;
-    errdefer if (own_manifest) manifest.deinit();
-    manifest.name = try allocator.dupe(u8, package_name);
-    manifest.version = try allocator.dupe(u8, version);
-    manifest.edition = try allocator.dupe(u8, default_edition);
-    manifest.lang_version = try allocator.dupe(u8, default_lang_version);
-
-    const root_dir_copy = try allocator.dupe(u8, expected_root);
-    var own_root_dir_copy = true;
-    errdefer if (own_root_dir_copy) allocator.free(root_dir_copy);
-    const source_root_copy = try allocator.dupe(u8, expected_root);
-    var own_source_root_copy = true;
-    errdefer if (own_source_root_copy) allocator.free(source_root_copy);
-    const manifest_path = try std.fs.path.join(allocator, &.{ expected_root, "runa.toml" });
-    var own_manifest_path = true;
-    errdefer if (own_manifest_path) allocator.free(manifest_path);
-
-    var node = PackageNode{
-        .allocator = allocator,
-        .identity_key = identity_key,
-        .package_name = manifest.name.?,
-        .root_dir = root_dir_copy,
-        .source_root = source_root_copy,
-        .manifest_path = manifest_path,
-        .import_root_path = null,
-        .manifest = manifest,
-        .dependencies = array_list.Managed(DependencyEdge).init(allocator),
-    };
-    own_identity_key = false;
-    own_manifest = false;
-    own_root_dir_copy = false;
-    own_source_root_copy = false;
-    own_manifest_path = false;
-    var node_owned_by_graph = false;
-    errdefer if (!node_owned_by_graph) node.deinit();
-
-    const index = graph.packages.items.len;
-    try graph.packages.append(node);
-    node_owned_by_graph = true;
-    entry.value_ptr.* = index;
-    return index;
 }
 
 fn loadPublishedPackage(
@@ -648,15 +922,103 @@ fn loadDependencyEdges(
     }
 }
 
-fn isValidPackageName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |byte| {
-        const ok = (byte >= 'a' and byte <= 'z') or
-            (byte >= 'A' and byte <= 'Z') or
-            (byte >= '0' and byte <= '9') or
-            byte == '_' or
-            byte == '-';
-        if (!ok) return false;
+fn findNearestManifestDir(allocator: Allocator, io: std.Io, start_dir: []const u8) !?[]const u8 {
+    var current = try allocator.dupe(u8, start_dir);
+    defer allocator.free(current);
+
+    while (true) {
+        const manifest_path = try std.fs.path.join(allocator, &.{ current, "runa.toml" });
+        defer allocator.free(manifest_path);
+        if (std.Io.Dir.cwd().access(io, manifest_path, .{})) |_| {
+            return try allocator.dupe(u8, current);
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
     }
-    return true;
+}
+
+const EnclosingWorkspace = struct {
+    root_dir: []const u8,
+    has_package: bool,
+};
+
+fn findEnclosingWorkspaceRoot(allocator: Allocator, io: std.Io, package_dir: []const u8) !?EnclosingWorkspace {
+    var current = if (std.fs.path.dirname(package_dir)) |parent|
+        try allocator.dupe(u8, parent)
+    else
+        return null;
+    defer allocator.free(current);
+
+    while (true) {
+        const manifest_path = try std.fs.path.join(allocator, &.{ current, "runa.toml" });
+        defer allocator.free(manifest_path);
+        if (std.Io.Dir.cwd().access(io, manifest_path, .{})) |_| {
+            var manifest = try package.Manifest.loadAtPath(allocator, io, manifest_path);
+            defer manifest.deinit();
+            if (manifest.has_workspace and try workspaceClaimsMember(allocator, current, &manifest, package_dir)) {
+                return .{
+                    .root_dir = try allocator.dupe(u8, current),
+                    .has_package = manifest.has_package,
+                };
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
+}
+
+fn workspaceClaimsMember(
+    allocator: Allocator,
+    workspace_dir: []const u8,
+    manifest: *const package.Manifest,
+    package_dir: []const u8,
+) !bool {
+    const package_resolved = try std.fs.path.resolve(allocator, &.{package_dir});
+    defer allocator.free(package_resolved);
+    for (manifest.workspace_members.items) |member| {
+        const member_resolved = try std.fs.path.resolve(allocator, &.{ workspace_dir, member });
+        defer allocator.free(member_resolved);
+        if (std.mem.eql(u8, member_resolved, package_resolved)) return true;
+    }
+    return false;
+}
+
+fn discoveredTargetPackage(
+    allocator: Allocator,
+    manifest: *const package.Manifest,
+    root_dir: []const u8,
+    manifest_path: []const u8,
+) !DiscoveredTargetPackage {
+    return .{
+        .name = try allocator.dupe(u8, manifest.name.?),
+        .root_dir = try allocator.dupe(u8, root_dir),
+        .manifest_path = try allocator.dupe(u8, manifest_path),
+    };
+}
+
+fn relativePathText(root: []const u8, path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, root, path)) return ".";
+    if (!std.mem.startsWith(u8, path, root)) return null;
+    var relative = path[root.len..];
+    if (relative.len != 0 and relative[0] != '/' and relative[0] != '\\') return null;
+    while (relative.len != 0 and (relative[0] == '/' or relative[0] == '\\')) relative = relative[1..];
+    return relative;
+}
+
+fn isValidPackageName(name: []const u8) bool {
+    return package.isValidPackageName(name);
 }

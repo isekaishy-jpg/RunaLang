@@ -3,15 +3,15 @@ pub fn Result(comptime T: type, comptime E: type) type {
         ok: T,
         err: E,
 
-        pub fn isOk(self: @This()) bool {
+        pub fn is_ok(self: @This()) bool {
             return switch (self) {
                 .ok => true,
                 .err => false,
             };
         }
 
-        pub fn isErr(self: @This()) bool {
-            return !self.isOk();
+        pub fn is_err(self: @This()) bool {
+            return !self.is_ok();
         }
     };
 }

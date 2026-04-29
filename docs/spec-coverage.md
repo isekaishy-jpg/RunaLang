@@ -18,7 +18,8 @@ Stage0 Zig implementation ownership is split by subsystem.
 - `toolchain/package`: `runa.toml` parsing
 - `toolchain/workspace`: workspace and product root resolution
 - `toolchain/build`: stage0 Windows artifact orchestration
-- `cmd/runa`, `cmd/runac`, `cmd/runafmt`, `cmd/runadoc`, `cmd/runals`: public workflow entrypoints over the shared pipeline
+- `toolchain/cli` and `cmd/runa`: canonical public workflow shell
+- `cmd/runals`: hosted language-server helper over the shared pipeline
 
 ## Specs To Stage0 Owners
 

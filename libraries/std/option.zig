@@ -5,18 +5,18 @@ pub fn Option(comptime T: type) type {
         none,
         some: T,
 
-        pub fn isSome(self: @This()) bool {
+        pub fn is_some(self: @This()) bool {
             return switch (self) {
                 .some => true,
                 .none => false,
             };
         }
 
-        pub fn isNone(self: @This()) bool {
-            return !self.isSome();
+        pub fn is_none(self: @This()) bool {
+            return !self.is_some();
         }
 
-        pub fn unwrapOr(self: @This(), fallback: T) T {
+        pub fn unwrap_or(self: @This(), fallback: T) T {
             return switch (self) {
                 .some => |value| value,
                 .none => fallback,

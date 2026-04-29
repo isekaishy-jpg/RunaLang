@@ -173,6 +173,29 @@ pub const ExpressionResult = struct {
     }
 };
 
+pub const TestDescriptor = struct {
+    item_id: session_ids.ItemId,
+    package_index: usize,
+    package_name: []const u8,
+    root_module_relative_path: []const u8,
+    module_path: []const u8,
+    function_name: []const u8,
+    call_path: []const u8,
+};
+
+pub const PackageTestResult = struct {
+    package_index: usize,
+    package_name: []const u8,
+    tests: []const TestDescriptor,
+
+    pub fn deinit(self: PackageTestResult, allocator: @import("std").mem.Allocator) void {
+        for (self.tests) |test_descriptor| {
+            allocator.free(test_descriptor.call_path);
+        }
+        if (self.tests.len != 0) allocator.free(self.tests);
+    }
+};
+
 pub const ConversionMode = enum {
     implicit,
     explicit_infallible,

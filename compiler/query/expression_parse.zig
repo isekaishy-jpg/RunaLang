@@ -1312,12 +1312,14 @@ fn ExprParser(
                 } });
             };
             const expected = standard_families.typeRefFromName(payload_type_name);
-            if (args.len != 1) {
+            const unit_payload = expected.eql(types.TypeRef.fromBuiltin(.unit));
+            const arity_ok = if (unit_payload) args.len == 0 or args.len == 1 else args.len == 1;
+            if (!arity_ok) {
                 try self.diagnostics.add(.@"error", "type.enum.ctor.arity", self.span, "constructor call to '{s}.{s}' has wrong arity", .{
                     variant.family_name,
                     variant.variant_name,
                 });
-            } else if (!args[0].ty.isUnsupported() and !expected.isUnsupported() and
+            } else if (args.len == 1 and !args[0].ty.isUnsupported() and !expected.isUnsupported() and
                 !callArgumentTypeCompatible(args[0].ty, expected, payload_type_name, &.{}, false))
             {
                 try self.diagnostics.add(.@"error", "type.enum.ctor.arg", self.span, "constructor call to '{s}.{s}' argument 1 has wrong type", .{

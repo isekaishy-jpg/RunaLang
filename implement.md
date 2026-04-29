@@ -17,7 +17,7 @@
 - Implement source loading, spans, file tables, diagnostics, lexer, parser, and AST for the full surface already specified.
 - Lower AST to HIR with names preserved exactly as specified: attrs, visibility, generics/lifetimes, ownership qualifiers, patterns, ranges, async forms, boundary attrs, ABI attrs.
 - Define `types/`, `hir/`, `typed/`, and `mir/` data models so ownership, retained borrows, lifetimes, attrs, reflection metadata, and boundary classification survive every lowering step.
-- Make `runa check` and `runac` use the same driver/session/query pipeline from day one.
+- Make `runa check` use the same driver/session/query pipeline from day one.
 
 3. **Static semantics**
 - Implement module/workspace loading, `runa.toml` parsing, item visibility, imports, name resolution, and package identity first.
@@ -39,7 +39,7 @@
 - Support `bin` and `cdylib` products in stage0. Keep Linux codegen/link roots explicit but unsupported until real test coverage exists.
 
 6. **Toolchain and managed packages**
-- Make `runa check` the first fully functional public command, then `runa build`, then `runa test`, `runa fmt`, `runa doc`, and `runals`.
+- Make `runa check` the first functional public command, then build/test/fmt.
 - Implement `runa.toml`, `runa.lock`, workspace/package/build/product parsing, global managed package store, registry identity, source/artifact provenance, and publication metadata in `toolchain/`.
 - Build formatter, doc, and LSP on top of the same parser/HIR/typed data; no separate grammar or semantic model.
 - Make package/build behavior deterministic and lockfile-driven from the start. No registry fallback, no artifact/source fallback.
@@ -54,7 +54,7 @@
 - `runa build`: Windows `bin` and `cdylib` artifact generation through the C backend path.
 - `runa.toml` and `runa.lock`: real manifest and lockfile inputs for workspace/package/build resolution.
 - `libraries/std`: first-wave public Zig implementation of the spec’d standard surfaces, especially collections, text/bytes, reflect, async runtime, and boundary runtime.
-- `runafmt`, `runadoc`, and `runals`: parser/HIR-backed tools sharing the same front-end.
+- `runa fmt`, later `runa doc`, and `runals`: shared front-end tools.
 
 ## Test Plan
 - Keep `zig build test` passing at every phase; expand it from scaffold checks into real compiler/toolchain tests.

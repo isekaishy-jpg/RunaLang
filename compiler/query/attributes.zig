@@ -98,6 +98,14 @@ pub fn validateDeclarationAttributes(
         if (std.mem.eql(u8, attribute.name, "unsafe") and !target.functionLike()) {
             try diagnostics.add(.@"error", "type.attr.unsafe.target", span, "#unsafe declaration attributes are valid only on functions", .{});
         }
+        if (std.mem.eql(u8, attribute.name, "test")) {
+            if (!std.mem.eql(u8, std.mem.trim(u8, attribute.raw, " \t\r\n"), "#test")) {
+                try diagnostics.add(.@"error", "type.test.args", attribute.span, "#test is a bare attribute and does not take arguments", .{});
+            }
+            if (target != .function or !has_body) {
+                try diagnostics.add(.@"error", "type.test.target", span, "#test is valid only on module-level ordinary function declarations with bodies", .{});
+            }
+        }
     }
 
     if (hasAttribute(attributes, "link") and hasAttribute(attributes, "export")) {
@@ -164,6 +172,7 @@ pub fn isAllowedAttribute(name: []const u8) bool {
         std.mem.eql(u8, name, "domain_context") or
         std.mem.eql(u8, name, "boundary") or
         std.mem.eql(u8, name, "repr") or
+        std.mem.eql(u8, name, "test") or
         std.mem.eql(u8, name, "link") or
         std.mem.eql(u8, name, "export");
 }

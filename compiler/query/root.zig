@@ -44,9 +44,10 @@ const session = @import("../session/root.zig");
 const signature_syntax_checks = @import("signature_syntax_checks.zig");
 const source = @import("../source/root.zig");
 const send_checks = @import("send_checks.zig");
-const standard_families = @import("standard_families.zig");
+pub const standard_families = @import("standard_families.zig");
 const statement_checks = @import("statement_checks.zig");
 const target = @import("../target/root.zig");
+const test_discovery = @import("test_discovery.zig");
 const trait_solver = @import("trait_solver.zig");
 const typed = @import("../typed/root.zig");
 const typed_attributes = @import("attributes.zig");
@@ -98,6 +99,8 @@ pub const CheckedConversionFact = query_types.CheckedConversionFact;
 pub const ConversionMode = query_types.ConversionMode;
 pub const ConversionStatus = query_types.ConversionStatus;
 pub const ModuleSignatureResult = query_types.ModuleSignatureResult;
+pub const TestDescriptor = query_types.TestDescriptor;
+pub const PackageTestResult = query_types.PackageTestResult;
 pub const DomainStateItemResult = query_types.DomainStateItemResult;
 pub const DomainStateBodyResult = query_types.DomainStateBodyResult;
 pub const ConstResult = query_types.ConstResult;
@@ -989,7 +992,7 @@ fn validateSignatureSemantics(active: *session.Session, checked: CheckedSignatur
     try validateItemShape(checked.item, diagnostics);
 
     switch (checked.facts) {
-        .function => |function| try validateFunctionSignatureSemantics(checked.item, function, diagnostics),
+        .function => |function| try validateFunctionSignatureSemantics(active.allocator, checked.item, function, diagnostics),
         .const_item => |const_item| try validateConstInitializerType(checked.item.span, checked.item.name, const_item, diagnostics),
         .trait_type => |trait_type| try validateTraitMethodSyntax(checked.item.span, trait_type.methods, diagnostics),
         .impl_block => |impl_block| {
@@ -1012,13 +1015,38 @@ fn validateItemShape(item: *const typed.Item, diagnostics: *diag.Bag) !void {
 }
 
 fn validateFunctionSignatureSemantics(
+    allocator: Allocator,
     item: *const typed.Item,
     function: query_types.FunctionSignature,
     diagnostics: *diag.Bag,
 ) !void {
-    _ = item;
-    _ = function;
-    _ = diagnostics;
+    if (!typed_attributes.hasAttribute(item.attributes, "test")) return;
+
+    if (function.foreign) {
+        try diagnostics.add(.@"error", "type.test.foreign", item.span, "#test is not valid on foreign functions", .{});
+    }
+    if (function.is_suspend) {
+        try diagnostics.add(.@"error", "type.test.suspend", item.span, "#test functions must not be suspend functions", .{});
+    }
+    if (function.parameters.len != 0) {
+        try diagnostics.add(.@"error", "type.test.params", item.span, "#test functions must not declare parameters", .{});
+    }
+    if (function.generic_params.len != 0) {
+        try diagnostics.add(.@"error", "type.test.generic", item.span, "#test functions must not declare generic or lifetime parameters", .{});
+    }
+    if (!(try testReturnTypeAllowed(allocator, function.return_type))) {
+        try diagnostics.add(.@"error", "type.test.return", item.span, "#test functions must return Unit or Result[Unit, Str]", .{});
+    }
+}
+
+fn testReturnTypeAllowed(allocator: Allocator, return_type: types.TypeRef) !bool {
+    if (return_type.eql(types.TypeRef.fromBuiltin(.unit))) return true;
+    return standard_families.resultTypeArgsMatch(
+        allocator,
+        return_type,
+        types.TypeRef.fromBuiltin(.unit),
+        types.TypeRef.fromBuiltin(.str),
+    );
 }
 
 fn rawPointerPointee(raw_type_name: []const u8) ?[]const u8 {
@@ -2123,6 +2151,18 @@ pub fn finalizeSemanticChecks(active: *session.Session) !void {
     }
 }
 
+pub fn discoverPackageTests(
+    allocator: Allocator,
+    active: *session.Session,
+    package_index: usize,
+) !PackageTestResult {
+    return test_discovery.discoverPackageTests(allocator, active, package_index, checkedSignature);
+}
+
+pub fn discoverAllPackageTests(allocator: Allocator, active: *session.Session) ![]PackageTestResult {
+    return test_discovery.discoverAllPackageTests(allocator, active, checkedSignature);
+}
+
 fn backendProgramDescriptorsForLoweredBackend(active: *session.Session, module_id: session.ModuleId) !backend_contract.program.Module {
     var checked_signatures = std.array_list.Managed(CheckedSignature).init(active.allocator);
     defer checked_signatures.deinit();
@@ -3166,10 +3206,10 @@ fn backendValueTypeFromCanonicalType(
         .c_va_list => ownedBackendValueType(active, type_id, "va_list", .c_va_list, null, null),
         .handle => |handle| backendValueTypeFromHandle(active, type_id, handle),
         .tuple => ownedBackendValueType(active, type_id, "", .tuple, null, null),
+        .option => |option| backendValueTypeFromOption(active, type_id, option),
+        .result => |result| backendValueTypeFromResult(active, type_id, result),
         .generic_param,
         .fixed_array,
-        .option,
-        .result,
         .unsupported,
         => ownedBackendValueType(active, type_id, "void*", .unsupported, null, null),
     };
@@ -3283,6 +3323,56 @@ fn backendValueTypeFromCallable(
         .return_type = return_type,
         .variadic = callable.variadic_tail != null,
     });
+}
+
+fn backendValueTypeFromOption(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    option: types.OptionType,
+) anyerror!backend_contract.program.ValueType {
+    const payload = try active.allocator.create(backend_contract.program.ValueType);
+    errdefer active.allocator.destroy(payload);
+    payload.* = try backendValueTypeFromCanonicalType(active, option.payload);
+    errdefer payload.deinit(active.allocator);
+
+    const c_name = try std.fmt.allocPrint(active.allocator, "runa_type_std_option_{d}", .{type_id.index});
+    errdefer active.allocator.free(c_name);
+    return .{
+        .type_id = type_id,
+        .c_name = c_name,
+        .owned_c_name = c_name,
+        .kind = .option,
+        .option = .{ .payload = payload },
+    };
+}
+
+fn backendValueTypeFromResult(
+    active: *session.Session,
+    type_id: types.CanonicalTypeId,
+    result: types.ResultType,
+) anyerror!backend_contract.program.ValueType {
+    const ok = try active.allocator.create(backend_contract.program.ValueType);
+    errdefer active.allocator.destroy(ok);
+    ok.* = try backendValueTypeFromCanonicalType(active, result.ok);
+    errdefer ok.deinit(active.allocator);
+
+    const err = try active.allocator.create(backend_contract.program.ValueType);
+    errdefer active.allocator.destroy(err);
+    err.* = try backendValueTypeFromCanonicalType(active, result.err);
+    errdefer err.deinit(active.allocator);
+
+    const c_name = try std.fmt.allocPrint(active.allocator, "runa_type_std_result_{d}", .{type_id.index});
+    errdefer active.allocator.free(c_name);
+    return .{
+        .type_id = type_id,
+        .c_name = c_name,
+        .owned_c_name = c_name,
+        .kind = .result,
+        .result = .{
+            .ok = ok,
+            .err = err,
+        },
+    };
 }
 
 fn hasTopLevelComma(raw: []const u8) bool {

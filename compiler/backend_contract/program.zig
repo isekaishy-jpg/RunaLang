@@ -65,6 +65,8 @@ pub const TypeKind = enum {
     dynamic_library,
     c_va_list,
     tuple,
+    option,
+    result,
     unsupported,
 };
 
@@ -82,6 +84,29 @@ pub const CallableType = struct {
     }
 };
 
+pub const OptionValueType = struct {
+    payload: *ValueType,
+
+    fn deinit(self: *OptionValueType, allocator: Allocator) void {
+        self.payload.deinit(allocator);
+        allocator.destroy(self.payload);
+        self.* = undefined;
+    }
+};
+
+pub const ResultValueType = struct {
+    ok: *ValueType,
+    err: *ValueType,
+
+    fn deinit(self: *ResultValueType, allocator: Allocator) void {
+        self.ok.deinit(allocator);
+        allocator.destroy(self.ok);
+        self.err.deinit(allocator);
+        allocator.destroy(self.err);
+        self.* = undefined;
+    }
+};
+
 pub const ValueType = struct {
     type_id: types.CanonicalTypeId,
     c_name: []const u8,
@@ -89,9 +114,13 @@ pub const ValueType = struct {
     kind: TypeKind = .unsupported,
     builtin: ?types.Builtin = null,
     callable: ?CallableType = null,
+    option: ?OptionValueType = null,
+    result: ?ResultValueType = null,
 
     pub fn deinit(self: *ValueType, allocator: Allocator) void {
         if (self.callable) |*callable| callable.deinit(allocator);
+        if (self.option) |*option| option.deinit(allocator);
+        if (self.result) |*result| result.deinit(allocator);
         if (self.owned_c_name) |owned| allocator.free(owned);
         self.* = .{
             .type_id = .{ .index = 0 },
@@ -666,6 +695,12 @@ pub fn cloneValueType(allocator: Allocator, value: ValueType) Allocator.Error!Va
     if (value.callable) |callable| {
         cloned.callable = try cloneCallableType(allocator, callable);
     }
+    if (value.option) |option| {
+        cloned.option = try cloneOptionValueType(allocator, option);
+    }
+    if (value.result) |result| {
+        cloned.result = try cloneResultValueType(allocator, result);
+    }
     return cloned;
 }
 
@@ -685,6 +720,29 @@ fn cloneCallableType(allocator: Allocator, callable: CallableType) Allocator.Err
         .parameters = parameters,
         .return_type = return_type,
         .variadic = callable.variadic,
+    };
+}
+
+fn cloneOptionValueType(allocator: Allocator, option: OptionValueType) Allocator.Error!OptionValueType {
+    const payload = try allocator.create(ValueType);
+    errdefer allocator.destroy(payload);
+    payload.* = try cloneValueType(allocator, option.payload.*);
+    return .{ .payload = payload };
+}
+
+fn cloneResultValueType(allocator: Allocator, result: ResultValueType) Allocator.Error!ResultValueType {
+    const ok = try allocator.create(ValueType);
+    errdefer allocator.destroy(ok);
+    ok.* = try cloneValueType(allocator, result.ok.*);
+    errdefer ok.deinit(allocator);
+
+    const err = try allocator.create(ValueType);
+    errdefer allocator.destroy(err);
+    err.* = try cloneValueType(allocator, result.err.*);
+
+    return .{
+        .ok = ok,
+        .err = err,
     };
 }
 
@@ -862,8 +920,8 @@ fn cloneStatement(allocator: Allocator, statement: Statement) anyerror!Statement
             break :blk .{ .let_decl = .{
                 .name = cloned_name.name,
                 .owned_name = cloned_name.owned_name,
-            .ty = try cloneValueType(allocator, binding.ty),
-            .expr = try cloneExpr(allocator, binding.expr),
+                .ty = try cloneValueType(allocator, binding.ty),
+                .expr = try cloneExpr(allocator, binding.expr),
             } };
         },
         .const_decl => |binding| blk: {
@@ -871,8 +929,8 @@ fn cloneStatement(allocator: Allocator, statement: Statement) anyerror!Statement
             break :blk .{ .const_decl = .{
                 .name = cloned_name.name,
                 .owned_name = cloned_name.owned_name,
-            .ty = try cloneValueType(allocator, binding.ty),
-            .expr = try cloneExpr(allocator, binding.expr),
+                .ty = try cloneValueType(allocator, binding.ty),
+                .expr = try cloneExpr(allocator, binding.expr),
             } };
         },
         .assign_stmt => |assign| blk: {
@@ -880,9 +938,9 @@ fn cloneStatement(allocator: Allocator, statement: Statement) anyerror!Statement
             break :blk .{ .assign_stmt = .{
                 .name = cloned_name.name,
                 .owned_name = cloned_name.owned_name,
-            .ty = try cloneValueType(allocator, assign.ty),
-            .op = assign.op,
-            .expr = try cloneExpr(allocator, assign.expr),
+                .ty = try cloneValueType(allocator, assign.ty),
+                .op = assign.op,
+                .expr = try cloneExpr(allocator, assign.expr),
             } };
         },
         .select_stmt => |select_data| blk: {

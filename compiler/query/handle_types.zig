@@ -1,6 +1,7 @@
 const std = @import("std");
 const boundary_checks = @import("boundary_checks.zig");
 const session = @import("../session/root.zig");
+const standard_families = @import("standard_families.zig");
 const typed_text = @import("text.zig");
 const tuple_types = @import("tuple_types.zig");
 const type_support = @import("type_support.zig");
@@ -67,6 +68,22 @@ fn typeNameContainsHandleFamily(
     }
 
     if (std.mem.startsWith(u8, name, "*read ") or std.mem.startsWith(u8, name, "*edit ")) return false;
+
+    if (try standard_families.applicationArgs(active.allocator, name, .option)) |args| {
+        defer active.allocator.free(args);
+        for (args) |arg| {
+            if (try typeNameContainsHandleFamily(active, module_id, arg, signature_resolver, visited)) return true;
+        }
+        return false;
+    }
+
+    if (try standard_families.applicationArgs(active.allocator, name, .result)) |args| {
+        defer active.allocator.free(args);
+        for (args) |arg| {
+            if (try typeNameContainsHandleFamily(active, module_id, arg, signature_resolver, visited)) return true;
+        }
+        return false;
+    }
 
     const item_id = resolveTypeItemId(active, module_id, typed_text.baseTypeName(name)) orelse return false;
     if (itemIsHandleFamily(active, item_id)) return true;

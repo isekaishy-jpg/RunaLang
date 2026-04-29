@@ -24,6 +24,40 @@ pub const VariantInfo = struct {
     payload_field_name: ?[]const u8 = null,
 };
 
+pub const HelperSurface = struct {
+    family: Family,
+    method_name: []const u8,
+    true_variant_name: []const u8,
+    source_path: []const u8,
+};
+
+pub const helper_surfaces = [_]HelperSurface{
+    .{
+        .family = .option,
+        .method_name = "is_some",
+        .true_variant_name = "Some",
+        .source_path = "libraries/std/option/mod.rna",
+    },
+    .{
+        .family = .option,
+        .method_name = "is_none",
+        .true_variant_name = "None",
+        .source_path = "libraries/std/option/mod.rna",
+    },
+    .{
+        .family = .result,
+        .method_name = "is_ok",
+        .true_variant_name = "Ok",
+        .source_path = "libraries/std/result/mod.rna",
+    },
+    .{
+        .family = .result,
+        .method_name = "is_err",
+        .true_variant_name = "Err",
+        .source_path = "libraries/std/result/mod.rna",
+    },
+};
+
 pub fn familyFromName(name: []const u8) ?Family {
     if (std.mem.eql(u8, name, "Option")) return .option;
     if (std.mem.eql(u8, name, "Result")) return .result;
@@ -109,18 +143,12 @@ pub fn variantForConcrete(
 
 pub fn helperVariant(concrete_type_name: []const u8, method_name: []const u8) ?[]const u8 {
     const family = familyFromName(typed_text.baseTypeName(concrete_type_name)) orelse return null;
-    return switch (family) {
-        .option => {
-            if (std.mem.eql(u8, method_name, "is_some")) return "Some";
-            if (std.mem.eql(u8, method_name, "is_none")) return "None";
-            return null;
-        },
-        .result => {
-            if (std.mem.eql(u8, method_name, "is_ok")) return "Ok";
-            if (std.mem.eql(u8, method_name, "is_err")) return "Err";
-            return null;
-        },
-    };
+    for (helper_surfaces) |surface| {
+        if (surface.family == family and std.mem.eql(u8, surface.method_name, method_name)) {
+            return surface.true_variant_name;
+        }
+    }
+    return null;
 }
 
 pub fn typeRefFromName(raw: []const u8) types.TypeRef {
@@ -128,6 +156,39 @@ pub fn typeRefFromName(raw: []const u8) types.TypeRef {
     const builtin = types.Builtin.fromName(name);
     if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
     return .{ .named = name };
+}
+
+pub fn typeRefIsApplicationOf(
+    allocator: std.mem.Allocator,
+    ty: types.TypeRef,
+    family: Family,
+) !bool {
+    const concrete_type_name = switch (ty) {
+        .named => |name| name,
+        else => return false,
+    };
+    const args = (try applicationArgs(allocator, concrete_type_name, family)) orelse return false;
+    defer allocator.free(args);
+    return switch (family) {
+        .option => args.len == 1,
+        .result => args.len == 2,
+    };
+}
+
+pub fn resultTypeArgsMatch(
+    allocator: std.mem.Allocator,
+    ty: types.TypeRef,
+    ok: types.TypeRef,
+    err: types.TypeRef,
+) !bool {
+    const concrete_type_name = switch (ty) {
+        .named => |name| name,
+        else => return false,
+    };
+    const args = (try applicationArgs(allocator, concrete_type_name, .result)) orelse return false;
+    defer allocator.free(args);
+    if (args.len != 2) return false;
+    return typeRefFromName(args[0]).eql(ok) and typeRefFromName(args[1]).eql(err);
 }
 
 pub fn exhaustiveVariantNames(allocator: std.mem.Allocator, raw_type_name: []const u8) !?[]const []const u8 {

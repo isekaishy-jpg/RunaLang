@@ -46,6 +46,7 @@ pub const ImportBindingSite = struct {
 pub const ModulePipeline = struct {
     root_index: usize,
     package_index: usize,
+    package_name: []const u8,
     module_path: []const u8,
     parsed: parse.ParsedFile,
     hir: hir.Module,
@@ -66,6 +67,7 @@ pub const ModulePipeline = struct {
         self.resolved.deinit();
         self.hir.deinit(allocator);
         self.parsed.deinit(allocator);
+        allocator.free(self.package_name);
         allocator.free(self.module_path);
     }
 };
@@ -198,6 +200,7 @@ fn discoverSinglePackageModuleTree(
     try pipeline.modules.append(.{
         .root_index = root_index,
         .package_index = 0,
+        .package_name = try allocator.dupe(u8, "root"),
         .module_path = try allocator.dupe(u8, module_path),
         .parsed = parsed,
         .hir = lowered_hir,
@@ -592,6 +595,7 @@ fn discoverGraphModuleTree(
     try pipeline.modules.append(.{
         .root_index = root_index,
         .package_index = package_index,
+        .package_name = try allocator.dupe(u8, graph.packages[package_index].package_name),
         .module_path = try allocator.dupe(u8, module_path),
         .parsed = parsed,
         .hir = lowered_hir,
