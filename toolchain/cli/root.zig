@@ -1,4 +1,9 @@
 const std = @import("std");
+const build_command = @import("../build/root.zig");
+const check_command = @import("../check/root.zig");
+const fmt_command = @import("../fmt/root.zig");
+const pkgcmd = @import("../pkgcmd/root.zig");
+const test_command = @import("../test/root.zig");
 const context = @import("context.zig");
 const writer = @import("writer.zig");
 
@@ -45,14 +50,14 @@ pub const Command = enum {
 
     pub fn needsRegistryConfig(self: Command) bool {
         return switch (self) {
-            .add, .import, .vendor, .publish => true,
+            .import, .vendor, .publish => true,
             else => false,
         };
     }
 
     pub fn needsGlobalStore(self: Command) bool {
         return switch (self) {
-            .build, .check, .@"test", .fmt, .add, .import, .vendor, .publish => true,
+            .import => true,
             else => false,
         };
     }
@@ -205,11 +210,20 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !CliOutcome {
-    return runWithOutput(allocator, io, argv, .emit);
+    return runWithOutput(allocator, io, argv, .emit, null);
 }
 
 pub fn runQuietForTest(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !CliOutcome {
-    return runWithOutput(allocator, io, argv, .suppress);
+    return runWithOutput(allocator, io, argv, .suppress, null);
+}
+
+pub fn runQuietForTestWithEnvMap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    env_map: *const std.process.Environ.Map,
+) !CliOutcome {
+    return runWithOutput(allocator, io, argv, .suppress, env_map);
 }
 
 const OutputMode = enum {
@@ -217,7 +231,13 @@ const OutputMode = enum {
     suppress,
 };
 
-fn runWithOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, output: OutputMode) !CliOutcome {
+fn runWithOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    output: OutputMode,
+    env_map: ?*const std.process.Environ.Map,
+) !CliOutcome {
     const args = if (argv.len == 0) argv else argv[1..];
     const parsed = try parseArgs(allocator, args);
     switch (parsed) {
@@ -225,7 +245,7 @@ fn runWithOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const
             try writeLineIfEmitting(output, io, .stderr, failure.message);
             return .{ .usage_failure = failure.message };
         },
-        .ok => |invocation| return executeParsed(allocator, io, invocation, output),
+        .ok => |invocation| return executeParsed(allocator, io, invocation, output, env_map),
     }
 }
 
@@ -272,7 +292,13 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParseR
     return .{ .ok = .{ .command = parsed_command } };
 }
 
-fn executeParsed(allocator: std.mem.Allocator, io: std.Io, invocation: ParsedInvocation, output: OutputMode) !CliOutcome {
+fn executeParsed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    invocation: ParsedInvocation,
+    output: OutputMode,
+    env_map: ?*const std.process.Environ.Map,
+) !CliOutcome {
     switch (invocation) {
         .top_level_help => {
             try writeLinesIfEmitting(output, io, .stdout, &top_level_help_lines);
@@ -294,18 +320,362 @@ fn executeParsed(allocator: std.mem.Allocator, io: std.Io, invocation: ParsedInv
                 return .{ .reserved_unimplemented = tag };
             }
 
-            var command_context = context.build(allocator, io, tag) catch |err| {
+            var command_context = context.buildWithEnvMap(allocator, io, tag, env_map) catch |err| {
                 const line = try std.fmt.allocPrint(allocator, "runa {s}: {s}", .{ tag.name(), @errorName(err) });
                 try writeLineIfEmitting(output, io, .stderr, line);
                 return .{ .command_failure = line };
             };
             defer command_context.deinit();
 
+            switch (command) {
+                .new => |options| return executeNew(allocator, io, &command_context, options, output),
+                .build => |options| return executeBuild(allocator, io, &command_context, options, output),
+                .check => return executeCheck(allocator, io, &command_context, output),
+                .@"test" => |options| return executeTest(allocator, io, &command_context, options, output),
+                .fmt => |options| return executeFmt(allocator, io, &command_context, options, output),
+                .add => |options| return executeAdd(allocator, io, &command_context, options, output),
+                .remove => |options| return executeRemove(allocator, io, &command_context, options, output),
+                .import => |options| return executeImport(allocator, io, &command_context, options, output),
+                .vendor => |options| return executeVendor(allocator, io, &command_context, options, output),
+                .publish => |options| return executePublish(allocator, io, &command_context, options, output),
+                else => {},
+            }
+
             const line = try std.fmt.allocPrint(allocator, "runa {s}: unimplemented", .{tag.name()});
             try writeLineIfEmitting(output, io, .stderr, line);
             return .{ .unimplemented = tag };
         },
     }
+}
+
+fn executeNew(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: NewOptions,
+    output: OutputMode,
+) !CliOutcome {
+    const standalone = switch (command_context.*) {
+        .standalone => |*value| value,
+        .manifest_rooted => return .{ .command_failure = "runa new: invalid context" },
+    };
+    var result = pkgcmd.runNew(allocator, io, standalone, .{ .name = options.name, .lib = options.lib }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa new: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit(allocator);
+
+    const line = try std.fmt.allocPrint(allocator, "runa new: ok ({s}, {d} file(s))", .{ result.package_dir, result.files_written });
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeBuild(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: BuildOptions,
+    output: OutputMode,
+) !CliOutcome {
+    var result = build_command.buildCommandContext(allocator, io, command_context, .{
+        .release = options.release,
+        .package = options.package,
+        .product = options.product,
+        .bin = options.bin,
+        .cdylib = options.cdylib,
+    }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa build: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit();
+
+    if (output == .emit) {
+        try writer.renderDiagnostics(allocator, io, result.active.pipeline.diagnostics, &result.active.pipeline.sources);
+    }
+
+    if (result.hasErrors()) {
+        const line = try std.fmt.allocPrint(allocator, "runa build: {d} error(s)", .{result.errorCount()});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    }
+
+    const line = try std.fmt.allocPrint(allocator, "runa build: ok ({s}, {s}, {d} artifact(s))", .{
+        result.selected_target,
+        result.mode.name(),
+        result.artifacts.items.len,
+    });
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeAdd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: DependencyEditOptions,
+    output: OutputMode,
+) !CliOutcome {
+    const manifest_rooted = switch (command_context.*) {
+        .manifest_rooted => |*value| value,
+        .standalone => return .{ .command_failure = "runa add: invalid context" },
+    };
+    var result = pkgcmd.runAdd(allocator, io, manifest_rooted, .{
+        .name = options.name,
+        .version = options.version,
+        .path = options.path,
+        .registry = options.registry,
+        .edition = options.edition,
+        .lang_version = options.lang_version,
+    }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa add: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit(allocator);
+    const line = try std.fmt.allocPrint(allocator, "runa add: ok ({s})", .{result.manifest_path});
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeRemove(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: RemoveOptions,
+    output: OutputMode,
+) !CliOutcome {
+    const manifest_rooted = switch (command_context.*) {
+        .manifest_rooted => |*value| value,
+        .standalone => return .{ .command_failure = "runa remove: invalid context" },
+    };
+    var result = pkgcmd.runRemove(allocator, io, manifest_rooted, .{ .name = options.name }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa remove: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit(allocator);
+    const line = try std.fmt.allocPrint(allocator, "runa remove: ok ({s})", .{result.manifest_path});
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeImport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: ImportOptions,
+    output: OutputMode,
+) !CliOutcome {
+    const standalone = switch (command_context.*) {
+        .standalone => |*value| value,
+        .manifest_rooted => return .{ .command_failure = "runa import: invalid context" },
+    };
+    var result = pkgcmd.runImport(allocator, io, standalone, .{
+        .name = options.name,
+        .version = options.version,
+        .registry = options.registry,
+    }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa import: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit(allocator);
+    const line = try std.fmt.allocPrint(allocator, "runa import: ok ({s})", .{result.store_entry_root});
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeVendor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: VendorOptions,
+    output: OutputMode,
+) !CliOutcome {
+    const manifest_rooted = switch (command_context.*) {
+        .manifest_rooted => |*value| value,
+        .standalone => return .{ .command_failure = "runa vendor: invalid context" },
+    };
+    var result = pkgcmd.runVendor(allocator, io, manifest_rooted, .{
+        .name = options.name,
+        .version = options.version,
+        .registry = options.registry,
+        .edition = options.edition,
+        .lang_version = options.lang_version,
+    }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa vendor: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit(allocator);
+    const line = try std.fmt.allocPrint(allocator, "runa vendor: ok ({s})", .{result.vendor_root});
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executePublish(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: PublishOptions,
+    output: OutputMode,
+) !CliOutcome {
+    const manifest_rooted = switch (command_context.*) {
+        .manifest_rooted => |*value| value,
+        .standalone => return .{ .command_failure = "runa publish: invalid context" },
+    };
+    var result = pkgcmd.runPublish(allocator, io, manifest_rooted, .{
+        .registry = options.registry,
+        .artifacts = options.artifacts,
+    }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa publish: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit(allocator);
+    const line = try std.fmt.allocPrint(
+        allocator,
+        "runa publish: ok ({s}, {d} source file(s), {d} artifact(s))",
+        .{ result.source_root, result.copied_source_files, result.published_artifacts },
+    );
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: TestOptions,
+    output: OutputMode,
+) !CliOutcome {
+    var result = test_command.runCommandContext(allocator, io, command_context, .{
+        .parallel = options.parallel,
+        .no_capture = options.no_capture,
+    }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa test: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit();
+
+    if (output == .emit) {
+        try writer.renderDiagnostics(allocator, io, result.active.pipeline.diagnostics, &result.active.pipeline.sources);
+    }
+
+    for (result.progress.items) |progress| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "runa test: {s} {s}::{s}",
+            .{
+                if (progress.passed) "ok" else "failed",
+                progress.package_name,
+                progress.function_name,
+            },
+        );
+        try writeLineIfEmitting(output, io, .stderr, line);
+    }
+
+    for (result.package_summaries.items) |package_summary| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "runa test package {s}: discovered={d} executed={d} passed={d} failed={d} harness_failures={d}",
+            .{
+                package_summary.package_name,
+                package_summary.discovered,
+                package_summary.executed,
+                package_summary.passed,
+                package_summary.failed,
+                package_summary.harness_failures,
+            },
+        );
+        try writeLineIfEmitting(output, io, .stdout, line);
+    }
+
+    const summary_line = try std.fmt.allocPrint(
+        allocator,
+        "runa test: discovered={d} executed={d} passed={d} failed={d} harness_failures={d}",
+        .{
+            result.summary.discovered,
+            result.summary.executed,
+            result.summary.passed,
+            result.summary.failed,
+            result.summary.harness_failures,
+        },
+    );
+    try writeLineIfEmitting(output, io, .stdout, summary_line);
+
+    if (result.failed()) return .{ .command_failure = summary_line };
+    return .parsed_success;
+}
+
+fn executeFmt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    options: FmtOptions,
+    output: OutputMode,
+) !CliOutcome {
+    var result = fmt_command.formatCommandContext(allocator, io, command_context, .{ .check = options.check }) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa fmt: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit();
+
+    if (output == .emit) {
+        try writer.renderDiagnostics(allocator, io, result.active.pipeline.diagnostics, &result.active.pipeline.sources);
+    }
+
+    if (result.failed()) {
+        const line = if (result.check_mismatches != 0)
+            try std.fmt.allocPrint(allocator, "runa fmt: {d} file(s) need formatting", .{result.check_mismatches})
+        else
+            try std.fmt.allocPrint(allocator, "runa fmt: {d} blocking format error(s)", .{result.blocking_errors});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    }
+
+    const line = try std.fmt.allocPrint(allocator, "runa fmt: ok ({d} file(s), {d} changed)", .{
+        result.formatted_files,
+        result.changed_files,
+    });
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
+}
+
+fn executeCheck(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command_context: *const context.CommandContext,
+    output: OutputMode,
+) !CliOutcome {
+    var result = check_command.runContext(allocator, io, command_context) catch |err| {
+        const line = try std.fmt.allocPrint(allocator, "runa check: {s}", .{@errorName(err)});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    };
+    defer result.deinit();
+
+    if (output == .emit) {
+        try writer.renderDiagnostics(allocator, io, result.active.pipeline.diagnostics, &result.active.pipeline.sources);
+    }
+
+    if (result.hasErrors()) {
+        const line = try std.fmt.allocPrint(allocator, "runa check: {d} error(s)", .{result.errorCount()});
+        try writeLineIfEmitting(output, io, .stderr, line);
+        return .{ .command_failure = line };
+    }
+
+    const line = try std.fmt.allocPrint(allocator, "runa check: ok ({d} package(s), {d} product(s), {d} source file(s))", .{
+        result.checkedPackageCount(),
+        result.checkedProductCount(),
+        result.checkedSourceFileCount(),
+    });
+    try writeLineIfEmitting(output, io, .stdout, line);
+    return .parsed_success;
 }
 
 fn writeLineIfEmitting(output: OutputMode, io: std.Io, channel: writer.Channel, line: []const u8) !void {

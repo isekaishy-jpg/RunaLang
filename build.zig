@@ -72,9 +72,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_scaffold_tests = b.addRunArtifact(scaffold_tests);
+    const command_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/toolchain_commands_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &[_]std.Build.Module.Import{
+                .{ .name = "compiler", .module = compiler_mod },
+                .{ .name = "toolchain", .module = toolchain_mod },
+            },
+        }),
+    });
+    const run_command_tests = b.addRunArtifact(command_tests);
 
     const test_step = b.step("test", "Run scaffold smoke tests");
     test_step.dependOn(&run_scaffold_tests.step);
+    test_step.dependOn(&run_command_tests.step);
 
     const parser_bench = b.addExecutable(.{
         .name = "parser-frontend-bench",

@@ -422,7 +422,7 @@ test "standalone and reserved run paths bypass manifest discovery" {
 
     const new_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "new", "demo" });
     switch (new_outcome) {
-        .unimplemented => |command| try std.testing.expect(command == .new),
+        .parsed_success => {},
         else => return error.UnexpectedTestResult,
     }
 
@@ -469,7 +469,7 @@ test "standalone and reserved run paths ignore invalid nearest manifest" {
 
     const new_outcome = try toolchain.cli.runQuietForTest(allocator, std.testing.io, &.{ "runa", "new", "demo" });
     switch (new_outcome) {
-        .unimplemented => |command| try std.testing.expect(command == .new),
+        .parsed_success => {},
         else => return error.UnexpectedTestResult,
     }
 
@@ -704,7 +704,13 @@ test "workspace-only compiler prep loads explicit member packages" {
 
     var discovered = try toolchain.workspace.discoverCommandRoot(std.testing.allocator, std.testing.io, root);
     defer discovered.deinit();
-    try std.testing.expectError(error.MissingLocalAuthoringScope, toolchain.workspace.localAuthoringScope(std.testing.allocator, &discovered));
+    const root_local_scope = try toolchain.workspace.localAuthoringScope(std.testing.allocator, &discovered);
+    defer {
+        for (root_local_scope) |scope_root| std.testing.allocator.free(scope_root);
+        std.testing.allocator.free(root_local_scope);
+    }
+    try std.testing.expectEqual(@as(usize, 1), root_local_scope.len);
+    try std.testing.expectEqualStrings(root, root_local_scope[0]);
 
     const default_scope = try toolchain.workspace.selectedBuildPackageScope(std.testing.allocator, std.testing.io, &discovered, null);
     defer {
@@ -733,7 +739,7 @@ test "workspace-only compiler prep loads explicit member packages" {
         std.testing.allocator.free(local_scope);
     }
     try std.testing.expectEqual(@as(usize, 1), local_scope.len);
-    try std.testing.expectEqualStrings(app_dir, local_scope[0]);
+    try std.testing.expectEqualStrings(root, local_scope[0]);
 
     const selected_scope = try toolchain.workspace.selectedBuildPackageScope(std.testing.allocator, std.testing.io, &member_discovered, null);
     defer {
@@ -745,7 +751,7 @@ test "workspace-only compiler prep loads explicit member packages" {
 
     var local_prep = try toolchain.workspace.prepareCompilerInputs(std.testing.allocator, std.testing.io, &member_discovered, .local_authoring, .{});
     defer local_prep.deinit();
-    try std.testing.expectEqual(@as(usize, 1), local_prep.graph.root_products.items.len);
+    try std.testing.expectEqual(@as(usize, 2), local_prep.graph.root_products.items.len);
 
     var selected_tool_prep = try toolchain.workspace.prepareCompilerInputs(std.testing.allocator, std.testing.io, &member_discovered, .{ .selected_build_package = "tool" }, .{});
     defer selected_tool_prep.deinit();

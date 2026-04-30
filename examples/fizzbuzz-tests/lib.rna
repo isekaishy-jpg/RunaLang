@@ -1,0 +1,33 @@
+mod suite
+
+fn fizzbuzz_value(take value: I32) -> I32:
+    select:
+        when value % 15 == 0 => return 15
+        when value % 3 == 0 => return 3
+        when value % 5 == 0 => return 5
+        else => return value
+    return value
+
+#test
+fn fizz() -> Result[Unit, Str]:
+    let found: I32 = fizzbuzz_value :: 9 :: call
+    select:
+        when found == 3 => return Result.Ok :: :: call
+        else => return Result.Err :: "fizz" :: call
+    return Result.Err :: "fizz" :: call
+
+#test
+fn buzz() -> Result[Unit, Str]:
+    let found: I32 = fizzbuzz_value :: 10 :: call
+    select:
+        when found == 5 => return Result.Ok :: :: call
+        else => return Result.Err :: "buzz" :: call
+    return Result.Err :: "buzz" :: call
+
+#test
+fn fizzbuzz() -> Result[Unit, Str]:
+    let found: I32 = fizzbuzz_value :: 30 :: call
+    select:
+        when found == 15 => return Result.Ok :: :: call
+        else => return Result.Err :: "fizzbuzz" :: call
+    return Result.Err :: "fizzbuzz" :: call

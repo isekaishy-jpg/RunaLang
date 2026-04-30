@@ -32,7 +32,7 @@ pub const Dependency = struct {
     edition: ?[]const u8 = null,
     lang_version: ?[]const u8 = null,
 
-    fn deinit(self: Dependency, allocator: Allocator) void {
+    pub fn deinit(self: Dependency, allocator: Allocator) void {
         allocator.free(self.name);
         if (self.version) |value| allocator.free(value);
         if (self.path) |value| allocator.free(value);
@@ -495,6 +495,84 @@ pub fn renderRootLockfile(
     return out.toOwnedSlice();
 }
 
+pub fn renderManifest(
+    allocator: Allocator,
+    manifest: *const Manifest,
+) ![]u8 {
+    var out = array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    if (manifest.has_package) {
+        try out.appendSlice("[package]\n");
+        try appendTomlField(&out, "name", manifest.name.?);
+        try appendTomlField(&out, "version", manifest.version.?);
+        try appendTomlField(&out, "edition", manifest.edition.?);
+        try appendTomlField(&out, "lang_version", manifest.lang_version.?);
+        try out.appendSlice("\n");
+    }
+
+    if (manifest.has_workspace) {
+        try out.appendSlice("[workspace]\n");
+        try out.appendSlice("members = [");
+        for (manifest.workspace_members.items, 0..) |member, index| {
+            if (index != 0) try out.appendSlice(", ");
+            try out.appendSlice("\"");
+            try out.appendSlice(member);
+            try out.appendSlice("\"");
+        }
+        try out.appendSlice("]\n\n");
+    }
+
+    if (manifest.dependencies.items.len != 0) {
+        try out.appendSlice("[dependencies]\n");
+        for (manifest.dependencies.items) |dependency| {
+            try out.appendSlice(dependency.name);
+            try out.appendSlice(" = ");
+            if (dependency.path == null and dependency.registry == null and dependency.edition == null and dependency.lang_version == null) {
+                try out.appendSlice("\"");
+                try out.appendSlice(dependency.version.?);
+                try out.appendSlice("\"\n");
+            } else {
+                try out.appendSlice("{ ");
+                var wrote = false;
+                if (dependency.version) |value| {
+                    try appendInlineTomlField(&out, &wrote, "version", value);
+                }
+                if (dependency.path) |value| {
+                    try appendInlineTomlField(&out, &wrote, "path", value);
+                }
+                if (dependency.registry) |value| {
+                    try appendInlineTomlField(&out, &wrote, "registry", value);
+                }
+                if (dependency.edition) |value| {
+                    try appendInlineTomlField(&out, &wrote, "edition", value);
+                }
+                if (dependency.lang_version) |value| {
+                    try appendInlineTomlField(&out, &wrote, "lang_version", value);
+                }
+                try out.appendSlice(" }\n");
+            }
+        }
+        try out.appendSlice("\n");
+    }
+
+    for (manifest.products.items) |product| {
+        try out.appendSlice("[[products]]\n");
+        try appendTomlField(&out, "kind", @tagName(product.kind));
+        if (product.name) |value| try appendTomlField(&out, "name", value);
+        if (product.root) |value| try appendTomlField(&out, "root", value);
+        try out.appendSlice("\n");
+    }
+
+    if (manifest.build_target) |target| {
+        try out.appendSlice("[build]\n");
+        try appendTomlField(&out, "target", target);
+        try out.appendSlice("\n");
+    }
+
+    return out.toOwnedSlice();
+}
+
 fn validateManifest(manifest: *Manifest) !void {
     if (!manifest.has_package and !manifest.has_workspace) return error.InvalidManifest;
 
@@ -676,6 +754,15 @@ fn appendTomlField(out: *array_list.Managed(u8), key: []const u8, value: []const
     try out.appendSlice("\"\n");
 }
 
+fn appendInlineTomlField(out: *array_list.Managed(u8), wrote: *bool, key: []const u8, value: []const u8) !void {
+    if (wrote.*) try out.appendSlice(", ");
+    wrote.* = true;
+    try out.appendSlice(key);
+    try out.appendSlice(" = \"");
+    try out.appendSlice(value);
+    try out.appendSlice("\"");
+}
+
 fn copyFile(io: std.Io, allocator: Allocator, source_path: []const u8, dest_path: []const u8) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(bytes);
@@ -711,7 +798,7 @@ fn validateStoreRoot(io: std.Io, root: []const u8) !void {
     };
 }
 
-fn isValidEdition(raw: []const u8) bool {
+pub fn isValidEdition(raw: []const u8) bool {
     if (raw.len != 4) return false;
     for (raw) |byte| {
         if (byte < '0' or byte > '9') return false;
@@ -719,12 +806,26 @@ fn isValidEdition(raw: []const u8) bool {
     return true;
 }
 
-fn isValidLangVersion(raw: []const u8) bool {
+pub fn isValidLangVersion(raw: []const u8) bool {
     if (raw.len != 4) return false;
     return raw[0] >= '0' and raw[0] <= '9' and
         raw[1] == '.' and
         raw[2] >= '0' and raw[2] <= '9' and
         raw[3] >= '0' and raw[3] <= '9';
+}
+
+pub fn isValidPackageVersion(raw: []const u8) bool {
+    if (raw.len < "YYYY.0.NN".len) return false;
+    if (raw[0] < '0' or raw[0] > '9') return false;
+    if (raw[1] < '0' or raw[1] > '9') return false;
+    if (raw[2] < '0' or raw[2] > '9') return false;
+    if (raw[3] < '0' or raw[3] > '9') return false;
+    if (raw[4] != '.' or raw[5] != '0' or raw[6] != '.') return false;
+    if (raw.len - 7 < 2) return false;
+    for (raw[7..]) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
 }
 
 pub fn isValidPackageName(raw: []const u8) bool {

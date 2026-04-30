@@ -106,6 +106,10 @@ pub const LoadOptions = struct {
     include_workspace_members: bool = true,
 };
 
+pub const CreatePackageOptions = struct {
+    lib: bool = false,
+};
+
 pub const CompilerPrepScope = union(enum) {
     workspace,
     local_authoring,
@@ -302,13 +306,7 @@ pub fn packageOriginWithStore(command_root: []const u8, store_root: ?[]const u8,
 }
 
 pub fn localAuthoringScope(allocator: Allocator, discovery: *const CommandRootDiscovery) ![][]const u8 {
-    const root = if (discovery.target_package) |target|
-        target.root_dir
-    else switch (discovery.kind) {
-        .standalone_package, .workspace_root => discovery.root_dir,
-        .workspace_only_root => return error.MissingLocalAuthoringScope,
-    };
-    return singleScopeRoot(allocator, root);
+    return singleScopeRoot(allocator, discovery.root_dir);
 }
 
 pub fn selectedBuildPackageScope(
@@ -331,6 +329,77 @@ pub fn packageCommandTargetPackage(discovery: *const CommandRootDiscovery) ?Disc
     return discovery.target_package;
 }
 
+pub fn collectLocalAuthoringSourceFiles(
+    allocator: Allocator,
+    io: std.Io,
+    command_root: []const u8,
+    out: *array_list.Managed([]const u8),
+) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ command_root, "runa.toml" });
+    defer allocator.free(manifest_path);
+    var manifest = try package.Manifest.loadAtPath(allocator, io, manifest_path);
+    defer manifest.deinit();
+
+    if (manifest.has_package) {
+        try collectRnaFilesUnderRoot(allocator, io, command_root, &seen, out, .{});
+    }
+    try collectDeclaredVendoredDependencies(allocator, io, command_root, command_root, &manifest, &seen, out);
+
+    if (manifest.has_workspace) {
+        for (manifest.workspace_members.items) |member| {
+            if (std.mem.eql(u8, member, ".")) continue;
+            const member_root = try std.fs.path.join(allocator, &.{ command_root, member });
+            defer allocator.free(member_root);
+            if (std.mem.eql(u8, member_root, command_root)) continue;
+            try collectRnaFilesUnderRoot(allocator, io, member_root, &seen, out, .{});
+
+            const member_manifest_path = try std.fs.path.join(allocator, &.{ member_root, "runa.toml" });
+            defer allocator.free(member_manifest_path);
+            var member_manifest = try package.Manifest.loadAtPath(allocator, io, member_manifest_path);
+            defer member_manifest.deinit();
+            try collectDeclaredVendoredDependencies(allocator, io, command_root, member_root, &member_manifest, &seen, out);
+        }
+    }
+
+    std.mem.sort([]const u8, out.items, {}, lessThanNormalizedPath);
+}
+
+fn collectDeclaredVendoredDependencies(
+    allocator: Allocator,
+    io: std.Io,
+    command_root: []const u8,
+    package_root: []const u8,
+    manifest: *const package.Manifest,
+    seen: *std.StringHashMap(void),
+    out: *array_list.Managed([]const u8),
+) !void {
+    if (!manifest.has_package) return;
+
+    const resolved_command_root = try std.fs.path.resolve(allocator, &.{command_root});
+    defer allocator.free(resolved_command_root);
+
+    for (manifest.dependencies.items) |dependency| {
+        const dependency_path = dependency.path orelse continue;
+        const dependency_root = try std.fs.path.resolve(allocator, &.{ package_root, dependency_path });
+        defer allocator.free(dependency_root);
+
+        const relative = relativePathText(resolved_command_root, dependency_root) orelse continue;
+        if (!isVendoredRelativePath(relative)) continue;
+        if (!(try pathExists(io, dependency_root))) continue;
+
+        try collectRnaFilesUnderRoot(allocator, io, dependency_root, seen, out, .{});
+    }
+}
+
+fn isVendoredRelativePath(relative: []const u8) bool {
+    return std.mem.eql(u8, relative, "vendor") or
+        std.mem.startsWith(u8, relative, "vendor/") or
+        std.mem.startsWith(u8, relative, "vendor\\");
+}
+
 fn compilerPrepRoot(
     allocator: Allocator,
     io: std.Io,
@@ -344,12 +413,11 @@ fn compilerPrepRoot(
             break :blk allocator.dupe(u8, command_root.root_dir);
         },
         .local_authoring => blk: {
-            options.include_workspace_members = false;
-            if (command_root.target_package_root) |root| break :blk allocator.dupe(u8, root);
             switch (command_root.kind) {
-                .standalone_package, .workspace_root => break :blk allocator.dupe(u8, command_root.root_dir),
-                .workspace_only_root => return error.MissingLocalAuthoringScope,
+                .standalone_package => options.include_workspace_members = false,
+                .workspace_root, .workspace_only_root => options.include_workspace_members = true,
             }
+            break :blk allocator.dupe(u8, command_root.root_dir);
         },
         .selected_build_package => |package_name| blk: {
             if (package_name) |name| {
@@ -405,27 +473,106 @@ fn findWorkspacePackageRootByName(
     return error.UnknownWorkspacePackage;
 }
 
-pub fn atomicRewriteFile(allocator: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+pub const AtomicRewrite = struct {
+    path: []const u8,
+    contents: []const u8,
+};
 
-    if (std.Io.Dir.cwd().access(io, tmp_path, .{})) |_| {
-        return error.AtomicRewriteTempExists;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
+pub fn atomicRewriteFile(allocator: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    try atomicRewriteFiles(allocator, io, &.{.{ .path = path, .contents = contents }});
+}
+
+pub fn atomicRewriteFiles(allocator: Allocator, io: std.Io, rewrites: []const AtomicRewrite) !void {
+    if (rewrites.len == 0) return;
+
+    var states = try allocator.alloc(AtomicRewriteState, rewrites.len);
+    defer {
+        for (states) |*state| state.deinit(allocator);
+        allocator.free(states);
+    }
+    for (rewrites, 0..) |rewrite, index| {
+        states[index] = .{
+            .path = rewrite.path,
+            .contents = rewrite.contents,
+            .tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{rewrite.path}),
+            .backup_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{rewrite.path}),
+        };
+        if (try pathExists(io, states[index].tmp_path)) return error.AtomicRewriteTempExists;
+        if (try pathExists(io, states[index].backup_path)) return error.AtomicRewriteBackupExists;
     }
 
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = tmp_path,
-        .data = contents,
-    });
-    const verify = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, allocator, .limited(contents.len + 1));
-    defer allocator.free(verify);
-    if (!std.mem.eql(u8, verify, contents)) return error.AtomicRewriteVerifyFailed;
+    var tmp_written: usize = 0;
+    var originals_backed_up: usize = 0;
+    var originals_replaced: usize = 0;
+    var committed = false;
+    errdefer rollbackAtomicRewrites(io, states, tmp_written, originals_backed_up, originals_replaced, committed);
 
-    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
+    for (states) |state| {
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = state.tmp_path,
+            .data = state.contents,
+        });
+        tmp_written += 1;
+        const verify = try std.Io.Dir.cwd().readFileAlloc(io, state.tmp_path, allocator, .limited(state.contents.len + 1));
+        defer allocator.free(verify);
+        if (!std.mem.eql(u8, verify, state.contents)) return error.AtomicRewriteVerifyFailed;
+    }
+
+    for (states) |state| {
+        try std.Io.Dir.rename(.cwd(), state.path, .cwd(), state.backup_path, io);
+        originals_backed_up += 1;
+    }
+
+    for (states) |state| {
+        try std.Io.Dir.rename(.cwd(), state.tmp_path, .cwd(), state.path, io);
+        originals_replaced += 1;
+    }
+
+    committed = true;
+    for (states) |state| {
+        try std.Io.Dir.cwd().deleteFile(io, state.backup_path);
+    }
+}
+
+const AtomicRewriteState = struct {
+    path: []const u8,
+    contents: []const u8,
+    tmp_path: []const u8,
+    backup_path: []const u8,
+
+    fn deinit(self: *AtomicRewriteState, allocator: Allocator) void {
+        allocator.free(self.tmp_path);
+        allocator.free(self.backup_path);
+    }
+};
+
+fn rollbackAtomicRewrites(
+    io: std.Io,
+    rewrites: []const AtomicRewriteState,
+    tmp_written: usize,
+    originals_backed_up: usize,
+    originals_replaced: usize,
+    committed: bool,
+) void {
+    if (committed) return;
+
+    var replaced = originals_replaced;
+    while (replaced > 0) {
+        replaced -= 1;
+        std.Io.Dir.cwd().deleteFile(io, rewrites[replaced].path) catch {};
+    }
+
+    var backed_up = originals_backed_up;
+    while (backed_up > 0) {
+        backed_up -= 1;
+        std.Io.Dir.rename(.cwd(), rewrites[backed_up].backup_path, .cwd(), rewrites[backed_up].path, io) catch {};
+    }
+
+    var tmp_index = tmp_written;
+    while (tmp_index > 0) {
+        tmp_index -= 1;
+        std.Io.Dir.cwd().deleteFile(io, rewrites[tmp_index].tmp_path) catch {};
+    }
 }
 
 pub fn loadGraphAtPath(allocator: Allocator, io: std.Io, root_dir: []const u8) !Graph {
@@ -462,7 +609,12 @@ pub fn loadGraphAtPathWithOptions(
     }
 
     if (root_manifest.has_workspace and options.include_workspace_members) {
-        for (root_manifest.workspace_members.items) |member| {
+        const sorted_members = try allocator.dupe([]const u8, root_manifest.workspace_members.items);
+        defer allocator.free(sorted_members);
+        std.mem.sort([]const u8, sorted_members, {}, lessThanNormalizedPath);
+
+        for (sorted_members) |member| {
+            if (std.mem.eql(u8, member, ".")) continue;
             const member_root = try std.fs.path.join(allocator, &.{ root_dir, member });
             defer allocator.free(member_root);
             if (std.mem.eql(u8, member_root, root_dir)) continue;
@@ -478,6 +630,21 @@ pub fn loadGraphAtPathWithOptions(
     if (!loaded_any) return error.EmptyWorkspace;
 
     return graph;
+}
+
+fn lessThanNormalizedPath(_: void, lhs: []const u8, rhs: []const u8) bool {
+    var index: usize = 0;
+    while (index < lhs.len and index < rhs.len) : (index += 1) {
+        const lhs_byte = normalizedPathByte(lhs[index]);
+        const rhs_byte = normalizedPathByte(rhs[index]);
+        if (lhs_byte == rhs_byte) continue;
+        return lhs_byte < rhs_byte;
+    }
+    return lhs.len < rhs.len;
+}
+
+fn normalizedPathByte(byte: u8) u8 {
+    return if (byte == '\\') '/' else byte;
 }
 
 fn appendRootProductsFromPath(
@@ -544,6 +711,16 @@ pub fn toCompilerGraph(allocator: Allocator, graph: *const Graph) !CompilerGraph
 }
 
 pub fn createPackageAtPath(allocator: Allocator, io: std.Io, parent_dir: []const u8, package_name: []const u8) ![]const u8 {
+    return createPackageAtPathWithOptions(allocator, io, parent_dir, package_name, .{});
+}
+
+pub fn createPackageAtPathWithOptions(
+    allocator: Allocator,
+    io: std.Io,
+    parent_dir: []const u8,
+    package_name: []const u8,
+    options: CreatePackageOptions,
+) ![]const u8 {
     if (!isValidPackageName(package_name)) return error.InvalidPackageName;
 
     const package_dir = try std.fs.path.join(allocator, &.{ parent_dir, package_name });
@@ -556,8 +733,9 @@ pub fn createPackageAtPath(allocator: Allocator, io: std.Io, parent_dir: []const
 
     const manifest_path = try std.fs.path.join(allocator, &.{ package_dir, "runa.toml" });
     defer allocator.free(manifest_path);
-    const main_path = try std.fs.path.join(allocator, &.{ package_dir, "main.rna" });
-    defer allocator.free(main_path);
+    const root_source_name = if (options.lib) "lib.rna" else "main.rna";
+    const root_source_path = try std.fs.path.join(allocator, &.{ package_dir, root_source_name });
+    defer allocator.free(root_source_path);
 
     const manifest = try std.fmt.allocPrint(allocator,
         \\[package]
@@ -567,24 +745,58 @@ pub fn createPackageAtPath(allocator: Allocator, io: std.Io, parent_dir: []const
         \\lang_version = "{s}"
         \\
         \\[[products]]
-        \\kind = "bin"
-        \\root = "main.rna"
+        \\kind = "{s}"
+        \\root = "{s}"
         \\
-    , .{ package_name, default_edition, default_lang_version });
+    , .{
+        package_name,
+        default_edition,
+        default_lang_version,
+        if (options.lib) "lib" else "bin",
+        root_source_name,
+    });
     defer allocator.free(manifest);
 
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = manifest_path,
         .data = manifest,
     });
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = main_path,
-        .data =
-        \\fn main() -> I32:
-        \\    return 0
-        \\
-        ,
-    });
+    if (options.lib) {
+        const core_dir = try std.fs.path.join(allocator, &.{ package_dir, "core" });
+        defer allocator.free(core_dir);
+        std.Io.Dir.cwd().createDir(io, core_dir, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.PathAlreadyExists,
+            else => return err,
+        };
+
+        const core_mod_path = try std.fs.path.join(allocator, &.{ core_dir, "mod.rna" });
+        defer allocator.free(core_mod_path);
+
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = root_source_path,
+            .data =
+            \\mod core
+            \\pub use core.VALUE
+            \\
+            ,
+        });
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = core_mod_path,
+            .data =
+            \\pub const VALUE: I32 = 0
+            \\
+            ,
+        });
+    } else {
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = root_source_path,
+            .data =
+            \\fn main() -> I32:
+            \\    return 0
+            \\
+            ,
+        });
+    }
 
     return package_dir;
 }
@@ -1017,6 +1229,65 @@ fn relativePathText(root: []const u8, path: []const u8) ?[]const u8 {
     if (relative.len != 0 and relative[0] != '/' and relative[0] != '\\') return null;
     while (relative.len != 0 and (relative[0] == '/' or relative[0] == '\\')) relative = relative[1..];
     return relative;
+}
+
+const AuthoringCollectionOptions = struct {
+    include_vendor_dirs: bool = false,
+};
+
+fn collectRnaFilesUnderRoot(
+    allocator: Allocator,
+    io: std.Io,
+    root: []const u8,
+    seen: *std.StringHashMap(void),
+    out: *array_list.Managed([]const u8),
+    options: AuthoringCollectionOptions,
+) !void {
+    var dir = try openIterableDir(io, root);
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            if (isExcludedAuthoringDir(entry.path, options)) walker.leave(io);
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".rna")) continue;
+
+        const full_path = try std.fs.path.join(allocator, &.{ root, entry.path });
+        errdefer allocator.free(full_path);
+        const entry_result = try seen.getOrPut(full_path);
+        if (entry_result.found_existing) {
+            allocator.free(full_path);
+            continue;
+        }
+        entry_result.value_ptr.* = {};
+        try out.append(full_path);
+    }
+}
+
+fn isExcludedAuthoringDir(raw: []const u8, options: AuthoringCollectionOptions) bool {
+    const name = std.fs.path.basename(raw);
+    return std.mem.eql(u8, name, "target") or
+        std.mem.eql(u8, name, "dist") or
+        std.mem.eql(u8, name, ".zig-cache") or
+        std.mem.eql(u8, name, ".git") or
+        (!options.include_vendor_dirs and std.mem.eql(u8, name, "vendor"));
+}
+
+fn pathExists(io: std.Io, path: []const u8) !bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn openIterableDir(io: std.Io, path: []const u8) !std.Io.Dir {
+    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    return std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 }
 
 fn isValidPackageName(name: []const u8) bool {

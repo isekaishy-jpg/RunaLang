@@ -1,0 +1,5 @@
+#unsafe
+extern["c"] fn missing_stage0_symbol() -> I32
+
+fn main() -> I32:
+    return #unsafe missing_stage0_symbol :: :: call

@@ -1,0 +1,8 @@
+mod suite
+
+fn main() -> I32:
+    return 0
+
+#test
+fn root_ok() -> Unit:
+    return

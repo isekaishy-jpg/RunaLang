@@ -1,0 +1,2 @@
+[workspace]
+members = ["packages/b_good", "packages/a_bad"]

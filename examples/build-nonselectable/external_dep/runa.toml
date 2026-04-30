@@ -1,0 +1,9 @@
+[package]
+name = "external_dep"
+version = "2026.0.01"
+edition = "2026"
+lang_version = "0.00"
+
+[[products]]
+kind = "lib"
+root = "lib.rna"

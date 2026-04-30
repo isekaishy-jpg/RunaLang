@@ -1,0 +1,15 @@
+mod suite
+
+#link[name = "msvcrt"]
+#unsafe
+extern["c"] fn putchar(value: CInt) -> CInt
+
+#test
+fn ok_first() -> Result[Unit, Str]:
+    return Result.Ok :: :: call
+
+#test
+fn writes_and_fails() -> Result[Unit, Str]:
+    let marker: CInt = 88
+    let ignored: CInt = #unsafe putchar :: marker :: call
+    return Result.Err :: "routing" :: call

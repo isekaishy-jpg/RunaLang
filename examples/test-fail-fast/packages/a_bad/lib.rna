@@ -1,0 +1,5 @@
+mod core
+
+#test
+fn fails_first() -> Result[Unit, Str]:
+    return Result.Err :: "first package failed" :: call

@@ -1,0 +1,1 @@
+pub const VALUE: I32 = 0

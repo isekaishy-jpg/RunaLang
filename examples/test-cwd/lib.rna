@@ -1,0 +1,5 @@
+mod suite
+
+#test
+fn ok() -> Result[Unit, Str]:
+    return Result.Ok :: :: call

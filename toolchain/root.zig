@@ -1,7 +1,9 @@
 pub const cli = @import("cli/root.zig");
 pub const workspace = @import("workspace/root.zig");
+pub const check = @import("check/root.zig");
 pub const build = @import("build/root.zig");
 pub const package = @import("package/root.zig");
+pub const pkgcmd = @import("pkgcmd/root.zig");
 pub const publish = @import("publish/root.zig");
 pub const fmt = @import("fmt/root.zig");
 pub const doc = @import("doc/root.zig");

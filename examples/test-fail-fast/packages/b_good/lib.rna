@@ -1,0 +1,5 @@
+mod core
+
+#test
+fn must_not_run_after_first_package_fails() -> Result[Unit, Str]:
+    return Result.Ok :: :: call

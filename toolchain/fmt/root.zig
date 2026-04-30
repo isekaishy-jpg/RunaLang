@@ -1,6 +1,8 @@
 const std = @import("std");
 const array_list = std.array_list;
 const compiler = @import("compiler");
+const cli_context = @import("../cli/context.zig");
+const workspace = @import("../workspace/root.zig");
 const Allocator = std.mem.Allocator;
 
 pub const summary = "Formatting pipeline over the shared CST parse front-end.";
@@ -9,6 +11,137 @@ pub const Result = struct {
     formatted_files: usize,
     changed_files: usize,
 };
+
+pub const Options = struct {
+    check: bool = false,
+};
+
+pub const CommandResult = struct {
+    active: compiler.session.Session,
+    formatted_files: usize,
+    changed_files: usize,
+    blocking_errors: usize,
+    check_mismatches: usize,
+
+    pub fn deinit(self: *CommandResult) void {
+        self.active.deinit();
+    }
+
+    pub fn failed(self: *const CommandResult) bool {
+        return self.blocking_errors != 0 or self.check_mismatches != 0;
+    }
+};
+
+pub fn formatCommandContext(
+    allocator: Allocator,
+    io: std.Io,
+    command_context: *const cli_context.CommandContext,
+    options: Options,
+) !CommandResult {
+    return switch (command_context.*) {
+        .manifest_rooted => |*manifest_rooted| formatManifestRooted(allocator, io, manifest_rooted, options),
+        .standalone => error.MissingManifest,
+    };
+}
+
+pub fn formatManifestRooted(
+    allocator: Allocator,
+    io: std.Io,
+    manifest_rooted: *const cli_context.ManifestRootedContext,
+    options: Options,
+) !CommandResult {
+    var source_paths = array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (source_paths.items) |path| allocator.free(path);
+        source_paths.deinit();
+    }
+    try workspace.collectLocalAuthoringSourceFiles(allocator, io, manifest_rooted.command_root, &source_paths);
+
+    var active = try compiler.session.prepareFiles(allocator, io, source_paths.items);
+    var active_owned = true;
+    errdefer if (active_owned) active.deinit();
+
+    var result = CommandResult{
+        .active = active,
+        .formatted_files = 0,
+        .changed_files = 0,
+        .blocking_errors = blockingFormatErrorCount(&active.pipeline.diagnostics),
+        .check_mismatches = 0,
+    };
+    active_owned = false;
+    errdefer result.deinit();
+
+    if (result.blocking_errors != 0) return result;
+
+    var seen_files = std.StringHashMap(void).init(allocator);
+    defer seen_files.deinit();
+    var rewrites = array_list.Managed(PendingRewrite).init(allocator);
+    defer {
+        for (rewrites.items) |*rewrite| rewrite.deinit(allocator);
+        rewrites.deinit();
+    }
+
+    for (result.active.pipeline.modules.items) |module| {
+        const file = result.active.pipeline.sources.get(module.parsed.module.file_id);
+
+        const seen = try seen_files.getOrPut(file.path);
+        if (seen.found_existing) continue;
+        seen.value_ptr.* = {};
+
+        const rendered = try renderParsedFile(allocator, &module.parsed);
+        defer allocator.free(rendered);
+
+        result.formatted_files += 1;
+        if (std.mem.eql(u8, file.contents, rendered)) continue;
+
+        result.changed_files += 1;
+        if (options.check) {
+            result.check_mismatches += 1;
+            try result.active.pipeline.diagnostics.add(
+                .@"error",
+                "fmt.check.changed",
+                .{ .file_id = file.id, .start = 0, .end = 0 },
+                "file is not formatted",
+                .{},
+            );
+            continue;
+        }
+
+        try rewrites.append(.{
+            .path = file.path,
+            .contents = try allocator.dupe(u8, rendered),
+        });
+    }
+
+    if (!options.check) try applyPendingRewrites(allocator, io, rewrites.items);
+    return result;
+}
+
+const PendingRewrite = struct {
+    path: []const u8,
+    contents: []u8,
+
+    fn deinit(self: *PendingRewrite, allocator: Allocator) void {
+        allocator.free(self.contents);
+    }
+};
+
+fn applyPendingRewrites(
+    allocator: Allocator,
+    io: std.Io,
+    rewrites: []const PendingRewrite,
+) !void {
+    if (rewrites.len == 0) return;
+    var atomic = try allocator.alloc(workspace.AtomicRewrite, rewrites.len);
+    defer allocator.free(atomic);
+    for (rewrites, 0..) |rewrite, index| {
+        atomic[index] = .{
+            .path = rewrite.path,
+            .contents = rewrite.contents,
+        };
+    }
+    try workspace.atomicRewriteFiles(allocator, io, atomic);
+}
 
 pub fn formatPipeline(allocator: Allocator, io: std.Io, pipeline: *const compiler.driver.Pipeline, write_changes: bool) !Result {
     var result = Result{
@@ -26,14 +159,25 @@ pub fn formatPipeline(allocator: Allocator, io: std.Io, pipeline: *const compile
         result.changed_files += 1;
 
         if (write_changes) {
-            try std.Io.Dir.cwd().writeFile(io, .{
-                .sub_path = file.path,
-                .data = rendered,
-            });
+            try workspace.atomicRewriteFile(allocator, io, file.path, rendered);
         }
     }
 
     return result;
+}
+
+fn blockingFormatErrorCount(diagnostics: *const compiler.diag.Bag) usize {
+    var count: usize = 0;
+    for (diagnostics.items.items) |item| {
+        if (item.severity != .@"error") continue;
+        if (std.mem.startsWith(u8, item.code, "parse.") or
+            std.mem.startsWith(u8, item.code, "syntax.") or
+            std.mem.eql(u8, item.code, "workspace.root.missing"))
+        {
+            count += 1;
+        }
+    }
+    return count;
 }
 
 pub fn renderParsedFile(allocator: Allocator, parsed: *const compiler.parse.ParsedFile) ![]const u8 {
@@ -129,6 +273,7 @@ fn appendStructuredNode(
     defer raw.deinit();
 
     try appendInlineTokens(&raw, tree, tokens, trivia, node_id);
+    try appendTrailingLineComment(&raw, tree, tokens, node_id);
     try appendNormalizedLines(out, raw.items, indent);
 
     for (tree.childSlice(node_id)) |child| {
@@ -172,6 +317,30 @@ fn appendTriviaIterator(out: *array_list.Managed(u8), iterator: compiler.syntax.
     var items = iterator;
     while (items.next()) |item| {
         try out.appendSlice(item.lexeme);
+    }
+}
+
+fn appendTrailingLineComment(
+    out: *array_list.Managed(u8),
+    tree: *const compiler.cst.Tree,
+    tokens: compiler.syntax.TokenStore,
+    node_id: compiler.cst.NodeId,
+) anyerror!void {
+    const last_token = tree.lastTokenRef(node_id) orelse return;
+    const last_index = tokens.indexOfRef(last_token) orelse return;
+    if (last_index + 1 >= tokens.len()) return;
+
+    const next_token = tokens.refAt(last_index + 1);
+    if (tokens.getRef(next_token).kind != .newline) return;
+
+    var trivia = tokens.leadingTriviaIterator(next_token);
+    while (trivia.next()) |item| {
+        if (item.kind != .comment) continue;
+        if (out.items.len != 0 and out.items[out.items.len - 1] != ' ' and out.items[out.items.len - 1] != '\t') {
+            try out.append(' ');
+        }
+        try out.appendSlice(item.lexeme);
+        return;
     }
 }
 

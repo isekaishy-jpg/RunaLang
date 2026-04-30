@@ -7,6 +7,7 @@ pub const StandaloneContext = struct {
     cwd: [:0]u8,
     global_store: ?package.GlobalStore = null,
     registry_config: ?package.RegistryConfig = null,
+    env_map: ?*const std.process.Environ.Map = null,
 
     pub fn deinit(self: *StandaloneContext) void {
         if (self.global_store) |*store| store.deinit(self.allocator);
@@ -60,6 +61,7 @@ pub const ManifestRootedContext = struct {
     lockfile_path: []const u8,
     global_store: ?package.GlobalStore = null,
     registry_config: ?package.RegistryConfig = null,
+    env_map: ?*const std.process.Environ.Map = null,
 
     pub fn deinit(self: *ManifestRootedContext) void {
         if (self.registry_config) |*config| config.deinit();
@@ -76,12 +78,17 @@ pub const ManifestRootedContext = struct {
         io: std.Io,
         scope: workspace.CompilerPrepScope,
     ) !workspace.CompilerPrep {
-        const store = self.global_store orelse return error.MissingGlobalStoreRoot;
         return workspace.prepareCompilerInputsForCommandRoot(self.allocator, io, .{
             .root_dir = self.command_root,
             .kind = self.command_root_kind,
             .target_package_root = if (self.target_package) |target| target.root_dir else null,
-        }, scope, .{ .store_root_override = store.root });
+        }, scope, .{ .store_root_override = self.storeRootOverride() });
+    }
+
+    pub fn storeRootOverride(self: *const ManifestRootedContext) ?[]const u8 {
+        if (self.global_store) |store| return store.root;
+        if (self.env_map) |map| return map.get("RUNA_STORE_ROOT");
+        return null;
     }
 };
 
@@ -90,9 +97,18 @@ pub fn build(
     io: std.Io,
     command: anytype,
 ) !CommandContext {
+    return buildWithEnvMap(allocator, io, command, null);
+}
+
+pub fn buildWithEnvMap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command: anytype,
+    env_map: ?*const std.process.Environ.Map,
+) !CommandContext {
     return switch (command.contextKind()) {
-        .standalone => .{ .standalone = try buildStandalone(allocator, io, command) },
-        .manifest_rooted => .{ .manifest_rooted = try buildManifestRooted(allocator, io, command) },
+        .standalone => .{ .standalone = try buildStandalone(allocator, io, command, env_map) },
+        .manifest_rooted => .{ .manifest_rooted = try buildManifestRooted(allocator, io, command, env_map) },
     };
 }
 
@@ -100,18 +116,26 @@ pub fn buildStandalone(
     allocator: std.mem.Allocator,
     io: std.Io,
     command: anytype,
+    env_map: ?*const std.process.Environ.Map,
 ) !StandaloneContext {
     var result = StandaloneContext{
         .allocator = allocator,
         .cwd = try std.process.currentPathAlloc(io, allocator),
+        .env_map = env_map,
     };
     errdefer result.deinit();
 
     if (command.needsGlobalStore()) {
-        result.global_store = try package.GlobalStore.init(allocator, io);
+        result.global_store = if (env_map) |map|
+            try package.GlobalStore.initWithEnvMap(allocator, io, map)
+        else
+            try package.GlobalStore.init(allocator, io);
     }
     if (command.needsRegistryConfig()) {
-        result.registry_config = try package.RegistryConfig.load(allocator, io);
+        result.registry_config = if (env_map) |map|
+            try package.RegistryConfig.loadWithEnvMap(allocator, io, map)
+        else
+            try package.RegistryConfig.load(allocator, io);
     }
     return result;
 }
@@ -120,6 +144,7 @@ pub fn buildManifestRooted(
     allocator: std.mem.Allocator,
     io: std.Io,
     command: anytype,
+    env_map: ?*const std.process.Environ.Map,
 ) !ManifestRootedContext {
     const cwd = try std.process.currentPathAlloc(io, allocator);
     errdefer allocator.free(cwd);
@@ -135,13 +160,19 @@ pub fn buildManifestRooted(
 
     var store: ?package.GlobalStore = null;
     if (command.needsGlobalStore()) {
-        store = try package.GlobalStore.init(allocator, io);
+        store = if (env_map) |map|
+            try package.GlobalStore.initWithEnvMap(allocator, io, map)
+        else
+            try package.GlobalStore.init(allocator, io);
     }
     errdefer if (store) |*global_store| global_store.deinit(allocator);
 
     var registry_config: ?package.RegistryConfig = null;
     if (command.needsRegistryConfig()) {
-        registry_config = try package.RegistryConfig.load(allocator, io);
+        registry_config = if (env_map) |map|
+            try package.RegistryConfig.loadWithEnvMap(allocator, io, map)
+        else
+            try package.RegistryConfig.load(allocator, io);
     }
     errdefer if (registry_config) |*config| config.deinit();
 
@@ -155,6 +186,7 @@ pub fn buildManifestRooted(
         .lockfile_path = try allocator.dupe(u8, discovered.lockfile_path),
         .global_store = store,
         .registry_config = registry_config,
+        .env_map = env_map,
     };
 }
 
