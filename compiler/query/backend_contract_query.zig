@@ -6,6 +6,7 @@ const layout = @import("../layout/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const target = @import("../target/root.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const types = @import("../types/root.zig");
 
 const array_list = std.array_list;
@@ -313,7 +314,7 @@ fn appendBoundarySurface(
     errdefer active.allocator.free(name);
     const input_type_name = try renderPackedInputType(active.allocator, function.parameters);
     errdefer active.allocator.free(input_type_name);
-    const output_type_name = try active.allocator.dupe(u8, function.return_type_name);
+    const output_type_name = try active.allocator.dupe(u8, function.return_type.displayName());
     errdefer active.allocator.free(output_type_name);
     const capability_families = try collectCapabilityFamilies(active, module_id, function, resolvers);
     errdefer freeStringSlice(active.allocator, capability_families);
@@ -343,7 +344,9 @@ fn appendConstDescriptor(
     resolvers: Resolvers,
 ) !void {
     const id = const_id orelse return;
-    const type_id = try resolvers.canonical_type_expression(active, module_id, const_item.type_name);
+    const type_name = try type_syntax_support.render(active.allocator, const_item.type_syntax);
+    defer active.allocator.free(type_name);
+    const type_id = try resolvers.canonical_type_expression(active, module_id, type_name);
     const type_layout = try resolvers.layout_for_key(active, .{
         .type_id = type_id,
         .target_name = key.target_name,
@@ -378,7 +381,7 @@ fn reprContextForType(
 
 fn renderPackedInputType(allocator: std.mem.Allocator, parameters: anytype) ![]const u8 {
     if (parameters.len == 0) return allocator.dupe(u8, "Unit");
-    if (parameters.len == 1) return allocator.dupe(u8, parameters[0].type_name);
+    if (parameters.len == 1) return allocator.dupe(u8, parameters[0].ty.displayName());
 
     var rendered = array_list.Managed(u8).init(allocator);
     errdefer rendered.deinit();
@@ -386,7 +389,7 @@ fn renderPackedInputType(allocator: std.mem.Allocator, parameters: anytype) ![]c
     try rendered.append('(');
     for (parameters, 0..) |parameter, index| {
         if (index != 0) try rendered.appendSlice(", ");
-        try rendered.appendSlice(parameter.type_name);
+        try rendered.appendSlice(parameter.ty.displayName());
     }
     try rendered.append(')');
     return rendered.toOwnedSlice();
@@ -405,9 +408,9 @@ fn collectCapabilityFamilies(
     }
 
     for (function.parameters) |parameter| {
-        try appendCapabilityFamily(active, &families, module_id, parameter.type_name, resolvers);
+        try appendCapabilityFamily(active, &families, module_id, parameter.ty.displayName(), resolvers);
     }
-    try appendCapabilityFamily(active, &families, module_id, function.return_type_name, resolvers);
+    try appendCapabilityFamily(active, &families, module_id, function.return_type.displayName(), resolvers);
     return families.toOwnedSlice();
 }
 

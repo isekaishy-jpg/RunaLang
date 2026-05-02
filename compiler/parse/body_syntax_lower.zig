@@ -386,10 +386,15 @@ fn lowerBindingStatement(
     const expr_trimmed = trimSpanText(makeSubspanText(base, equal_index + 1, raw.len)) orelse return .{ .placeholder = line_text };
 
     var name_text = left_trimmed;
-    var declared_type: ?ast.SpanText = null;
+    var declared_type: ?ast.TypeSyntax = null;
     if (findTopLevelColon(left_trimmed.text)) |colon_index| {
         name_text = trimSpanText(makeSubspanText(left_trimmed, 0, colon_index)) orelse left_trimmed;
-        declared_type = trimSpanText(makeSubspanText(left_trimmed, colon_index + 1, left_trimmed.text.len));
+        const raw_declared_type = makeSubspanText(left_trimmed, colon_index + 1, left_trimmed.text.len);
+        if (trimSpanText(raw_declared_type)) |type_text| {
+            declared_type = .{ .source = type_text };
+        } else {
+            declared_type = .{ .source = makeSubspanText(raw_declared_type, 0, 0) };
+        }
     }
 
     const binding: ast.BodyStatementSyntax.BindingDecl = .{

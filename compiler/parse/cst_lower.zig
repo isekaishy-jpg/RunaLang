@@ -1,6 +1,7 @@
 const std = @import("std");
 const array_list = std.array_list;
 const ast = @import("../ast/root.zig");
+const attribute_syntax_lower = @import("attribute_syntax_lower.zig");
 const block_syntax_lower = @import("block_syntax_lower.zig");
 const cst = @import("../cst/root.zig");
 const diag = @import("../diag/root.zig");
@@ -63,7 +64,7 @@ fn lowerTopLevelNodeItems(
     switch (tree.nodeKind(node_id)) {
         .blank_line => return allocator.alloc(ast.Item, 0),
         .item => return lowerItemItems(allocator, file, tokens, tree, node_id, diagnostics),
-        .@"error" => try diagnoseTopLevelError(file, tokens, tree, node_id, diagnostics),
+        .@"error" => try diagnoseTopLevelError(allocator, file, tokens, tree, node_id, diagnostics),
         else => try diagnoseGenericTopLevelError(file, tokens, tree, node_id, diagnostics),
     }
 
@@ -79,7 +80,10 @@ fn lowerItemItems(
     diagnostics: *diag.Bag,
 ) ![]ast.Item {
     var pending_attributes = array_list.Managed(ast.Attribute).init(allocator);
-    defer pending_attributes.deinit();
+    defer {
+        for (pending_attributes.items) |*attribute| attribute.deinit(allocator);
+        pending_attributes.deinit();
+    }
 
     const item_children = tree.childSlice(item_node);
     var declaration: ?cst.NodeId = null;
@@ -87,7 +91,7 @@ fn lowerItemItems(
     for (item_children) |child| {
         switch (child) {
             .node => |node_id| switch (tree.nodeKind(node_id)) {
-                .attribute_line => try pending_attributes.append(try lowerAttribute(file, tokens, tree, node_id)),
+                .attribute_line => try pending_attributes.append(try lowerAttribute(allocator, file, tokens, tree, node_id)),
                 else => {
                     if (declaration == null) declaration = node_id;
                 },
@@ -144,7 +148,7 @@ fn lowerItemItems(
                 .kind = .use_decl,
                 .name = try allocator.dupe(u8, local_name),
                 .visibility = visibility,
-                .attributes = try allocator.dupe(ast.Attribute, pending_attributes.items),
+                .attributes = try ast.cloneAttributes(allocator, pending_attributes.items),
                 .target_path = target_path,
                 .span = item_span,
                 .has_body = false,
@@ -165,7 +169,7 @@ fn lowerItemItems(
         .kind = astItemKind(declaration_kind),
         .name = try allocator.dupe(u8, itemNameFromSyntax(lowered_syntax)),
         .visibility = visibility,
-        .attributes = try allocator.dupe(ast.Attribute, pending_attributes.items),
+        .attributes = try ast.cloneAttributes(allocator, pending_attributes.items),
         .target_path = null,
         .span = item_span,
         .has_body = has_body,
@@ -178,18 +182,14 @@ fn lowerItemItems(
 }
 
 fn lowerAttribute(
+    allocator: Allocator,
     file: *const source.File,
     tokens: syntax.TokenStore,
     tree: *const cst.Tree,
     node_id: cst.NodeId,
 ) !ast.Attribute {
     const span = nodeSpan(tokens, tree, node_id) orelse return error.InvalidParse;
-    const raw = trimTrailingLineEnding(file.contents[span.start..span.end]);
-    return .{
-        .name = attributeName(raw),
-        .raw = raw,
-        .span = span,
-    };
+    return attribute_syntax_lower.lowerAttribute(allocator, file, span);
 }
 
 fn diagnoseStructuredDeclaration(
@@ -281,6 +281,7 @@ fn useBindingTargetPath(allocator: Allocator, binding: ast.UseBindingSyntax) !?[
 }
 
 fn diagnoseTopLevelError(
+    allocator: Allocator,
     file: *const source.File,
     tokens: syntax.TokenStore,
     tree: *const cst.Tree,
@@ -292,7 +293,8 @@ fn diagnoseTopLevelError(
         switch (children[0]) {
             .node => |child_node| {
                 if (tree.nodeKind(child_node) == .attribute_line) {
-                    const attribute = try lowerAttribute(file, tokens, tree, child_node);
+                    var attribute = try lowerAttribute(allocator, file, tokens, tree, child_node);
+                    defer attribute.deinit(allocator);
                     try diagnostics.add(.@"error", "parse.attr.orphan", attribute.span, "attribute lines must attach to a following declaration", .{});
                     return;
                 }
@@ -443,12 +445,6 @@ fn startsWithRelativeSuper(raw: []const u8) bool {
 
     const next = trimmed["super".len];
     return !std.ascii.isAlphanumeric(next) and next != '_';
-}
-
-fn attributeName(trimmed: []const u8) []const u8 {
-    const start = if (trimmed.len > 0 and trimmed[0] == '#') @as(usize, 1) else 0;
-    const end = std.mem.indexOfAnyPos(u8, trimmed, start, "[ \t") orelse trimmed.len;
-    return trimmed[start..end];
 }
 
 fn trimCarriageReturn(raw: []const u8) []const u8 {

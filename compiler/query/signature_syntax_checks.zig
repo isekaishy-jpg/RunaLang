@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("../ast/root.zig");
+const attribute_support = @import("../attribute_support.zig");
 const body_syntax_bridge = @import("body_syntax_bridge.zig");
 const diag = @import("../diag/root.zig");
 const hir = @import("../hir/root.zig");
@@ -69,7 +70,7 @@ fn validateTypeAliasSyntax(allocator: Allocator, item: hir.Item, diagnostics: *d
     if (!isPlainIdentifier(std.mem.trim(u8, name.text, " \t"))) {
         try diagnostics.add(.@"error", "type.alias.name", item.span, "malformed type alias name '{s}'", .{name.text});
     }
-    if (std.mem.trim(u8, target.text, " \t").len == 0) {
+    if (std.mem.trim(u8, target.text(), " \t").len == 0) {
         try diagnostics.add(.@"error", "type.alias.target", item.span, "type alias '{s}' requires a target type", .{name.text});
     }
 }
@@ -169,7 +170,10 @@ fn validateImplSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag.B
     switch (item.body_syntax) {
         .impl_body => |body| {
             const associated_types = try parseImplAssociatedTypes(allocator, body.associated_types, item.span, diagnostics);
-            defer allocator.free(associated_types);
+            defer {
+                for (associated_types) |*binding| binding.deinit(allocator);
+                allocator.free(associated_types);
+            }
 
             const associated_consts = try parseImplAssociatedConsts(allocator, body.associated_consts, item.span, diagnostics);
             defer {
@@ -186,7 +190,7 @@ fn validateImplSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag.B
             for (body.methods) |method| {
                 const parsed = try body_syntax_bridge.parseExecutableMethodFromSyntax(
                     allocator,
-                    header.target_type,
+                    header.target_type.displayName(),
                     header.generic_params,
                     method,
                     diagnostics,
@@ -222,7 +226,7 @@ fn parseImplAssociatedTypes(
         };
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const value_text = std.mem.trim(u8, value.text, " \t");
+        const value_text = std.mem.trim(u8, value.text(), " \t");
         if (!isPlainIdentifier(name_text) or value_text.len == 0) {
             try diagnostics.add(.@"error", "type.impl.associated_type", span, "malformed impl associated type binding '{s}'", .{name.text});
             continue;
@@ -242,7 +246,7 @@ fn parseImplAssociatedTypes(
 
         try lowered.append(.{
             .name = name_text,
-            .value_type_name = value_text,
+            .value_type_syntax = try value.clone(allocator),
             .value_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(value_text)),
         });
     }
@@ -277,7 +281,7 @@ fn parseImplAssociatedConsts(
         }
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        const type_name = std.mem.trim(u8, type_text.text(), " \t");
         if (!isPlainIdentifier(name_text) or type_name.len == 0) {
             try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding '{s}'", .{name.text});
             continue;
@@ -307,10 +311,5 @@ fn parseImplAssociatedConsts(
 }
 
 fn hasReprC(attributes: []const ast.Attribute) bool {
-    for (attributes) |attribute| {
-        if (!std.mem.eql(u8, attribute.name, "repr")) continue;
-        if (std.mem.indexOf(u8, attribute.raw, "[c]") != null) return true;
-        if (std.mem.indexOf(u8, attribute.raw, "[c,") != null) return true;
-    }
-    return false;
+    return attribute_support.reprInfoForTarget(attributes, .union_type).has_c;
 }

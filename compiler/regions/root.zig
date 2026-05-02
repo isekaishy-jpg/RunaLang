@@ -560,7 +560,7 @@ fn validateReturnExpr(
     expr: *const typed.Expr,
     diagnostics: *diag.Bag,
 ) !usize {
-    const expected = boundaryFromRawType(function.return_type_name);
+    const expected = boundaryFromRawType(function.return_type.displayName());
     if (expected.kind != .retained) return 0;
 
     var actual_set = try inferExprOrigins(diagnostics.allocator, state, expr);
@@ -715,23 +715,23 @@ fn projectBoundary(origin: BoundaryType, inner_type_name: []const u8) BoundaryTy
 }
 
 fn boundaryFromParameter(parameter: typed.Parameter) BoundaryType {
-    const retained = boundaryFromRawType(parameter.type_name);
+    const retained = boundaryFromRawType(parameter.ty.displayName());
     if (retained.kind == .retained) return retained;
 
     return switch (parameter.mode) {
         .read => .{
             .kind = .ephemeral,
             .access = .read,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
         .edit => .{
             .kind = .ephemeral,
             .access = .edit,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
         .owned, .take => .{
             .kind = .value,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
     };
 }

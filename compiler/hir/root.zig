@@ -10,6 +10,12 @@ pub const keeps_explicit_ownership = true;
 pub const Visibility = ast.Visibility;
 pub const Attribute = ast.Attribute;
 pub const SpanText = ast.SpanText;
+pub const TypeSyntax = ast.TypeSyntax;
+pub const ParameterModeSyntax = ast.ParameterModeSyntax;
+pub const GenericParamSyntax = ast.GenericParamSyntax;
+pub const GenericParamListSyntax = ast.GenericParamListSyntax;
+pub const WherePredicateSyntax = ast.WherePredicateSyntax;
+pub const WhereClauseSyntax = ast.WhereClauseSyntax;
 pub const BlockSyntax = ast.BlockSyntax;
 pub const LineSyntax = ast.LineSyntax;
 pub const BodyBlockSyntax = ast.BodyBlockSyntax;
@@ -55,7 +61,7 @@ pub const Item = struct {
             var owned_block = block;
             owned_block.deinit(allocator);
         }
-        allocator.free(self.attributes);
+        ast.deinitAttributes(allocator, self.attributes);
         allocator.free(self.name);
         if (self.target_path) |value| allocator.free(value);
     }
@@ -73,8 +79,8 @@ pub const Item = struct {
 
         const name = try allocator.dupe(u8, self.name);
         errdefer allocator.free(name);
-        const attributes = try allocator.dupe(Attribute, self.attributes);
-        errdefer allocator.free(attributes);
+        const attributes = try ast.cloneAttributes(allocator, self.attributes);
+        errdefer ast.deinitAttributes(allocator, attributes);
         const target_path = if (self.target_path) |value|
             try allocator.dupe(u8, value)
         else
@@ -139,8 +145,8 @@ fn lowerItem(allocator: Allocator, item: ast.Item) !Item {
 
     const name = try allocator.dupe(u8, item.name);
     errdefer allocator.free(name);
-    const attributes = try allocator.dupe(Attribute, item.attributes);
-    errdefer allocator.free(attributes);
+    const attributes = try ast.cloneAttributes(allocator, item.attributes);
+    errdefer ast.deinitAttributes(allocator, attributes);
     const target_path = if (item.target_path) |value|
         try allocator.dupe(u8, value)
     else

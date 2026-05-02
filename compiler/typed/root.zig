@@ -1,5 +1,6 @@
 const std = @import("std");
 const array_list = std.array_list;
+const attribute_support = @import("../attribute_support.zig");
 const ast = @import("../ast/root.zig");
 const typed_decls = @import("declarations.zig");
 const diag = @import("../diag/root.zig");
@@ -8,11 +9,10 @@ const hir = @import("../hir/root.zig");
 const signatures = @import("../signature_types.zig");
 const source = @import("../source/root.zig");
 const typed_statement = @import("statement.zig");
-const typed_attributes = @import("attributes.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
-const hasAttribute = typed_attributes.hasAttribute;
-const symbolNameFor = typed_attributes.symbolNameFor;
+const hasBareAttribute = attribute_support.hasBareAttribute;
+const symbolNameFor = attribute_support.symbolNameFor;
 
 pub const produced_by_type_checking = true;
 pub const ownership_validation_runs_after = true;
@@ -46,7 +46,7 @@ pub const ImportedBinding = struct {
 
     pub fn deinit(self: ImportedBinding, allocator: Allocator) void {
         if (self.function_generic_params.len != 0) allocator.free(self.function_generic_params);
-        if (self.function_where_predicates.len != 0) allocator.free(self.function_where_predicates);
+        deinitWherePredicates(allocator, self.function_where_predicates);
         if (self.function_parameter_types) |value| allocator.free(value);
         if (self.function_parameter_type_names) |value| allocator.free(value);
         if (self.function_parameter_modes) |value| allocator.free(value);
@@ -72,6 +72,8 @@ pub const ProjectionEqualityPredicate = signatures.ProjectionEqualityPredicate;
 pub const LifetimeOutlivesPredicate = signatures.LifetimeOutlivesPredicate;
 pub const TypeOutlivesPredicate = signatures.TypeOutlivesPredicate;
 pub const WherePredicate = signatures.WherePredicate;
+pub const cloneWherePredicates = signatures.cloneWherePredicates;
+pub const deinitWherePredicates = signatures.deinitWherePredicates;
 
 pub const MethodReceiverMode = enum {
     take,
@@ -150,7 +152,7 @@ pub const Item = struct {
 
     fn deinit(self: *Item, allocator: Allocator) void {
         if (self.owns_name) allocator.free(self.name);
-        allocator.free(self.attributes);
+        ast.deinitAttributes(allocator, self.attributes);
         allocator.free(self.symbol_name);
         self.payload.deinit(allocator);
     }
@@ -202,7 +204,7 @@ pub const FunctionPrototype = struct {
 
     pub fn deinit(self: FunctionPrototype, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
-        if (self.where_predicates.len != 0) allocator.free(self.where_predicates);
+        deinitWherePredicates(allocator, self.where_predicates);
         allocator.free(self.parameter_types);
         allocator.free(self.parameter_type_names);
         allocator.free(self.parameter_modes);
@@ -225,7 +227,7 @@ pub const MethodPrototype = struct {
 
     pub fn deinit(self: MethodPrototype, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
-        if (self.where_predicates.len != 0) allocator.free(self.where_predicates);
+        deinitWherePredicates(allocator, self.where_predicates);
         allocator.free(self.parameter_types);
         allocator.free(self.parameter_type_names);
         allocator.free(self.parameter_modes);
@@ -297,10 +299,10 @@ fn createTypedItem(
     module_path: []const u8,
     symbol_prefix: []const u8,
 ) !Item {
-    const item_is_domain_root = hasAttribute(item.attributes, "domain_root");
-    const item_is_domain_context = hasAttribute(item.attributes, "domain_context");
+    const item_is_domain_root = hasBareAttribute(item.attributes, "domain_root");
+    const item_is_domain_context = hasBareAttribute(item.attributes, "domain_context");
 
-    const item_is_reflectable = hasAttribute(item.attributes, "reflect");
+    const item_is_reflectable = hasBareAttribute(item.attributes, "reflect");
 
     const category: ItemCategory = switch (item.kind) {
         .function, .suspend_function, .const_item => .value,
@@ -318,13 +320,13 @@ fn createTypedItem(
         .category = category,
         .kind = item.kind,
         .visibility = item.visibility,
-        .attributes = try allocator.dupe(ast.Attribute, item.attributes),
+        .attributes = try ast.cloneAttributes(allocator, item.attributes),
         .span = item.span,
         .has_body = item.has_body,
         .is_synthetic = false,
         .is_reflectable = item_is_reflectable,
-        .is_boundary_api = hasAttribute(item.attributes, "boundary"),
-        .is_unsafe = hasAttribute(item.attributes, "unsafe"),
+        .is_boundary_api = attribute_support.boundaryKind(item.attributes) != null,
+        .is_unsafe = hasBareAttribute(item.attributes, "unsafe"),
         .is_domain_root = item_is_domain_root,
         .is_domain_context = item_is_domain_context,
         .payload = .none,

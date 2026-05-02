@@ -3,6 +3,7 @@ const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const trait_solver = @import("trait_solver.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const typed = @import("../typed/root.zig");
 const typed_text = @import("text.zig");
 
@@ -18,12 +19,12 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
             else => continue,
         };
 
-        const trait_name = impl_signature.trait_name orelse continue;
-        const trait_head = try trait_solver.canonicalTraitHead(active, checked.module_id, trait_name);
+        const trait_name = impl_signature.trait_type orelse continue;
+        const trait_head = try trait_solver.canonicalTraitHead(active, checked.module_id, trait_name.displayName());
         const type_head = try canonicalImplTypeHead(
             active,
             checked.module_id,
-            impl_signature.target_type,
+            impl_signature.target_type.displayName(),
             impl_signature.generic_params,
             impl_signature.where_predicates,
         );
@@ -49,8 +50,8 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
                 checked.item.span,
                 "impl '{s} for {s}' violates the orphan-style coherence rule",
                 .{
-                    baseTypeName(trait_name),
-                    baseTypeName(impl_signature.target_type),
+                    baseTypeName(trait_name.displayName()),
+                    baseTypeName(impl_signature.target_type.displayName()),
                 },
             );
         }
@@ -63,8 +64,8 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
                 .impl_block => |other_signature| other_signature,
                 else => continue,
             };
-            const other_trait_name = other_signature.trait_name orelse continue;
-            const other_trait_head = try trait_solver.canonicalTraitHead(active, other_checked.module_id, other_trait_name);
+            const other_trait_name = other_signature.trait_type orelse continue;
+            const other_trait_head = try trait_solver.canonicalTraitHead(active, other_checked.module_id, other_trait_name.displayName());
 
             if (!trait_solver.traitHeadsEqual(trait_head, other_trait_head)) continue;
             if (!try implTargetsOverlap(active, checked.module_id, impl_signature, other_checked.module_id, other_signature)) continue;
@@ -75,8 +76,8 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
                 other_checked.item.span,
                 "overlapping impls are not allowed for trait '{s}' and type '{s}'",
                 .{
-                    baseTypeName(trait_name),
-                    baseTypeName(impl_signature.target_type),
+                    baseTypeName(trait_name.displayName()),
+                    baseTypeName(impl_signature.target_type.displayName()),
                 },
             );
         }
@@ -90,17 +91,28 @@ fn implTargetsOverlap(
     rhs_module_id: session.ModuleId,
     rhs: query_types.ImplSignature,
 ) !bool {
+    const lhs_type_name = try ownedImplTargetTypeName(active.allocator, lhs);
+    defer active.allocator.free(lhs_type_name);
+    const rhs_type_name = try ownedImplTargetTypeName(active.allocator, rhs);
+    defer active.allocator.free(rhs_type_name);
     return typePatternsOverlap(
         active,
         lhs_module_id,
-        lhs.target_type,
+        lhs_type_name,
         lhs.generic_params,
         lhs.where_predicates,
         rhs_module_id,
-        rhs.target_type,
+        rhs_type_name,
         rhs.generic_params,
         rhs.where_predicates,
     );
+}
+
+fn ownedImplTargetTypeName(allocator: std.mem.Allocator, impl_signature: query_types.ImplSignature) ![]const u8 {
+    if (!type_syntax_support.containsInvalid(impl_signature.target_type_syntax)) {
+        return type_syntax_support.render(allocator, impl_signature.target_type_syntax);
+    }
+    return allocator.dupe(u8, impl_signature.target_type.displayName());
 }
 
 fn typePatternsOverlap(

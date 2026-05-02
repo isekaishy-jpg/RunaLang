@@ -10,7 +10,9 @@ const query_body_syntax_bridge = @import("../query/body_syntax_bridge.zig");
 const query_item_syntax_bridge = @import("../query/item_syntax_bridge.zig");
 const resolve = @import("../resolve/root.zig");
 const source = @import("../source/root.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const typed = @import("../typed/root.zig");
+const intern = @import("../intern/root.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 
@@ -74,6 +76,7 @@ pub const ModulePipeline = struct {
 
 pub const Pipeline = struct {
     allocator: Allocator,
+    interner: ?intern.Interner = null,
     sources: source.Table,
     diagnostics: diag.Bag,
     modules: array_list.Managed(ModulePipeline),
@@ -83,6 +86,7 @@ pub const Pipeline = struct {
         self.modules.deinit();
         self.diagnostics.deinit();
         self.sources.deinit();
+        if (self.interner) |*owned_interner| owned_interner.deinit();
     }
 
     pub fn itemCount(self: *const Pipeline) usize {
@@ -290,7 +294,7 @@ fn appendPreparedFunctionPrototypes(
             .target_symbol = typed_item.symbol_name,
             .return_type = function.return_type,
             .generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{},
-            .where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{},
+            .where_predicates = if (function.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, function.where_predicates) else &.{},
             .is_suspend = function.is_suspend,
             .parameter_types = parameter_types,
             .parameter_type_names = parameter_type_names,
@@ -303,7 +307,7 @@ fn appendPreparedFunctionPrototypes(
 fn duplicateParameterTypeNames(allocator: Allocator, parameters: []const typed.Parameter) ![]const []const u8 {
     const names = try allocator.alloc([]const u8, parameters.len);
     for (parameters, 0..) |parameter, index| {
-        names[index] = parameter.type_name;
+        names[index] = parameter.ty.displayName();
     }
     return names;
 }
@@ -338,9 +342,9 @@ fn collectGlobalItemMetadata(
                 else => return metadata,
             };
             try query_item_syntax_bridge.fillFunctionDataFromSyntax(allocator, &function, signature, source_item.span, &diagnostics);
-            metadata.function_return_type = resolveModuleValueType(&module_pipeline.typed, function.return_type, function.return_type_name);
+            metadata.function_return_type = resolveModuleValueType(&module_pipeline.typed, function.return_type, function.return_type.displayName());
             metadata.function_generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{};
-            metadata.function_where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{};
+            metadata.function_where_predicates = if (function.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, function.where_predicates) else &.{};
             metadata.function_is_suspend = function.is_suspend;
             metadata.function_parameter_types = try allocator.alloc(types.TypeRef, function.parameters.items.len);
             metadata.function_parameter_type_names = try duplicateParameterTypeNames(allocator, function.parameters.items);
@@ -349,7 +353,7 @@ fn collectGlobalItemMetadata(
                 metadata.function_parameter_types.?[parameter_index] = resolveModuleValueType(
                     &module_pipeline.typed,
                     parameter.ty,
-                    parameter.type_name,
+                    parameter.ty.displayName(),
                 );
                 metadata.function_parameter_modes.?[parameter_index] = parameter.mode;
             }
@@ -361,7 +365,9 @@ fn collectGlobalItemMetadata(
                 else => return metadata,
             };
             defer const_item.deinit(allocator);
-            metadata.const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, const_item.type_name);
+            const type_name = try type_syntax_support.render(allocator, const_item.type_syntax);
+            defer allocator.free(type_name);
+            metadata.const_type = resolveModuleValueType(&module_pipeline.typed, const_item.type_ref, type_name);
         },
         .struct_type => switch (source_item.body_syntax) {
             .struct_fields => |fields| {
@@ -406,7 +412,7 @@ fn collectGlobalItemMetadata(
 
 fn deinitGlobalItemMetadata(allocator: Allocator, item: *GlobalItem) void {
     if (item.function_generic_params.len != 0) allocator.free(item.function_generic_params);
-    if (item.function_where_predicates.len != 0) allocator.free(item.function_where_predicates);
+    typed.deinitWherePredicates(allocator, item.function_where_predicates);
     if (item.function_parameter_types) |value| allocator.free(value);
     if (item.function_parameter_type_names) |value| allocator.free(value);
     if (item.function_parameter_modes) |value| allocator.free(value);
@@ -442,7 +448,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
         while (iter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             if (entry.value_ptr.function_generic_params.len != 0) allocator.free(entry.value_ptr.function_generic_params);
-            if (entry.value_ptr.function_where_predicates.len != 0) allocator.free(entry.value_ptr.function_where_predicates);
+            typed.deinitWherePredicates(allocator, entry.value_ptr.function_where_predicates);
             if (entry.value_ptr.function_parameter_types) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_type_names) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_modes) |value| allocator.free(value);
@@ -499,7 +505,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
                     .const_type = target.const_type,
                     .function_return_type = target.function_return_type,
                     .function_generic_params = if (target.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, target.function_generic_params) else &.{},
-                    .function_where_predicates = if (target.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, target.function_where_predicates) else &.{},
+                    .function_where_predicates = if (target.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, target.function_where_predicates) else &.{},
                     .function_is_suspend = target.function_is_suspend,
                     .function_parameter_types = if (target.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
                     .function_parameter_type_names = if (target.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
@@ -521,7 +527,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
                         .target_symbol = imported.target_symbol,
                         .return_type = imported.function_return_type.?,
                         .generic_params = if (imported.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, imported.function_generic_params) else &.{},
-                        .where_predicates = if (imported.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, imported.function_where_predicates) else &.{},
+                        .where_predicates = if (imported.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, imported.function_where_predicates) else &.{},
                         .is_suspend = imported.function_is_suspend,
                         .parameter_types = try allocator.dupe(types.TypeRef, values),
                         .parameter_type_names = if (imported.function_parameter_type_names) |type_names| try allocator.dupe([]const u8, type_names) else try allocator.alloc([]const u8, 0),
@@ -645,7 +651,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
         while (iter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             if (entry.value_ptr.function_generic_params.len != 0) allocator.free(entry.value_ptr.function_generic_params);
-            if (entry.value_ptr.function_where_predicates.len != 0) allocator.free(entry.value_ptr.function_where_predicates);
+            typed.deinitWherePredicates(allocator, entry.value_ptr.function_where_predicates);
             if (entry.value_ptr.function_parameter_types) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_type_names) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_modes) |value| allocator.free(value);
@@ -716,7 +722,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         .const_type = target.const_type,
                         .function_return_type = target.function_return_type,
                         .function_generic_params = if (target.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, target.function_generic_params) else &.{},
-                        .function_where_predicates = if (target.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, target.function_where_predicates) else &.{},
+                        .function_where_predicates = if (target.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, target.function_where_predicates) else &.{},
                         .function_is_suspend = target.function_is_suspend,
                         .function_parameter_types = if (target.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
                         .function_parameter_type_names = if (target.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
@@ -737,7 +743,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                             .target_symbol = imported.target_symbol,
                             .return_type = imported.function_return_type.?,
                             .generic_params = if (imported.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, imported.function_generic_params) else &.{},
-                            .where_predicates = if (imported.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, imported.function_where_predicates) else &.{},
+                            .where_predicates = if (imported.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, imported.function_where_predicates) else &.{},
                             .is_suspend = imported.function_is_suspend,
                             .parameter_types = try allocator.dupe(types.TypeRef, values),
                             .parameter_type_names = if (imported.function_parameter_type_names) |type_names| try allocator.dupe([]const u8, type_names) else try allocator.alloc([]const u8, 0),
@@ -761,7 +767,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                         .const_type = resolved_target.const_type,
                         .function_return_type = resolved_target.function_return_type,
                         .function_generic_params = if (resolved_target.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, resolved_target.function_generic_params) else &.{},
-                        .function_where_predicates = if (resolved_target.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, resolved_target.function_where_predicates) else &.{},
+                        .function_where_predicates = if (resolved_target.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, resolved_target.function_where_predicates) else &.{},
                         .function_is_suspend = resolved_target.function_is_suspend,
                         .function_parameter_types = if (resolved_target.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
                         .function_parameter_type_names = if (resolved_target.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
@@ -782,7 +788,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
                             .target_symbol = imported.target_symbol,
                             .return_type = imported.function_return_type.?,
                             .generic_params = if (imported.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, imported.function_generic_params) else &.{},
-                            .where_predicates = if (imported.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, imported.function_where_predicates) else &.{},
+                            .where_predicates = if (imported.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, imported.function_where_predicates) else &.{},
                             .is_suspend = imported.function_is_suspend,
                             .parameter_types = try allocator.dupe(types.TypeRef, values),
                             .parameter_type_names = if (imported.function_parameter_type_names) |type_names| try allocator.dupe([]const u8, type_names) else try allocator.alloc([]const u8, 0),
@@ -916,7 +922,7 @@ fn duplicateTraitMethods(allocator: Allocator, methods: []const typed.TraitMetho
             .is_suspend = method.is_suspend,
             .has_default_body = method.has_default_body,
             .generic_params = if (method.generic_params.len != 0) try allocator.dupe(typed.GenericParam, method.generic_params) else &.{},
-            .where_predicates = if (method.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, method.where_predicates) else &.{},
+            .where_predicates = if (method.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, method.where_predicates) else &.{},
             .syntax = if (method.syntax) |syntax| try syntax.clone(allocator) else null,
         };
         initialized = method_index + 1;

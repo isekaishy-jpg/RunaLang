@@ -202,7 +202,7 @@ fn buildItemCallable(
     }
     if (variadic_tail_index) |tail_index| {
         const tail = function.parameters[tail_index];
-        if (!std.mem.eql(u8, tail.name, "...args") or !std.mem.eql(u8, std.mem.trim(u8, tail.type_name, " \t\r\n"), "CVaList")) {
+        if (!std.mem.eql(u8, tail.name, "...args") or !std.mem.eql(u8, std.mem.trim(u8, tail.ty.displayName(), " \t\r\n"), "CVaList")) {
             callable_safe = false;
             try appendDiagnostic(active.allocator, &diagnostics, "abi.c.variadic.tail", "variadic foreign declarations must end with '...args: CVaList'");
         }
@@ -226,7 +226,7 @@ fn buildItemCallable(
 
     for (function.parameters, 0..) |parameter, index| {
         if (variadic_tail_index != null and index == variadic_tail_index.?) continue;
-        const parameter_type = try resolvers.canonical_type_expression(active, checked.module_id, parameter.type_name);
+        const parameter_type = try resolvers.canonical_type_expression(active, checked.module_id, parameter.ty.displayName());
         const parameter_abi = try resolvers.abi_type_for_key(active, .{
             .type_id = parameter_type,
             .target_name = key.target_name,
@@ -248,13 +248,13 @@ fn buildItemCallable(
         try appendValueResult(active.allocator, &params, parameter_type, parameter_abi.safe, passable, parameter_abi.returnable, parameter_abi.pass_mode, parameter_abi.reason);
     }
 
-    const return_type = try resolvers.canonical_type_expression(active, checked.module_id, function.return_type_name);
+    const return_type = try resolvers.canonical_type_expression(active, checked.module_id, function.return_type.displayName());
     const return_abi = try resolvers.abi_type_for_key(active, .{
         .type_id = return_type,
         .target_name = key.target_name,
         .family = key.family,
     });
-    if (key.role == .foreign_export and isResultTypeName(function.return_type_name)) {
+    if (key.role == .foreign_export and isResultTypeName(function.return_type.displayName())) {
         callable_safe = false;
         try appendDiagnostic(active.allocator, &diagnostics, "abi.c.export.failure", "exported foreign functions cannot expose Result failure across the C ABI; translate explicitly or abort loudly");
     }
@@ -401,6 +401,6 @@ fn variadicTailIndex(function: query_types.FunctionSignature) ?usize {
     if (function.parameters.len == 0) return null;
     const last_index = function.parameters.len - 1;
     const last = function.parameters[last_index];
-    if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last.type_name, "...")) return last_index;
+    if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last.ty.displayName(), "...")) return last_index;
     return null;
 }

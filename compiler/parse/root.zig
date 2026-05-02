@@ -120,13 +120,23 @@ test "parse file lowers shallow AST items from CST grouping" {
     switch (function_item.syntax) {
         .function => |signature| {
             try std.testing.expectEqualStrings("main", signature.name.?.text);
-            try std.testing.expectEqualStrings("[T]", signature.generic_params.?.text);
+            try std.testing.expectEqual(@as(usize, 1), signature.generic_params.?.params.len);
+            try std.testing.expectEqual(ast.GenericParamKindSyntax.type_param, signature.generic_params.?.params[0].kind);
+            try std.testing.expectEqualStrings("T", signature.generic_params.?.params[0].name);
             try std.testing.expectEqual(@as(usize, 1), signature.parameters.len);
             try std.testing.expectEqualStrings("value", signature.parameters[0].name.?.text);
-            try std.testing.expectEqualStrings("T", signature.parameters[0].ty.?.text);
-            try std.testing.expectEqualStrings("Unit", signature.return_type.?.text);
+            try std.testing.expectEqualStrings("T", signature.parameters[0].ty.?.text());
+            try std.testing.expectEqual(ast.ParameterModeSyntax.owned, signature.parameters[0].mode);
+            try std.testing.expectEqualStrings("Unit", signature.return_type.?.text());
             try std.testing.expectEqual(@as(usize, 1), signature.where_clauses.len);
-            try std.testing.expectEqualStrings("where T: Send:", signature.where_clauses[0].text);
+            try std.testing.expectEqual(@as(usize, 1), signature.where_clauses[0].predicates.len);
+            switch (signature.where_clauses[0].predicates[0]) {
+                .bound => |predicate| {
+                    try std.testing.expectEqualStrings("T", predicate.subject_name);
+                    try std.testing.expectEqualStrings("Send", predicate.contract_name);
+                },
+                else => return error.UnexpectedStructure,
+            }
         },
         else => return error.UnexpectedStructure,
     }
@@ -220,7 +230,7 @@ test "parse file lowers structured declaration body syntax" {
             try std.testing.expectEqual(@as(usize, 1), fields.len);
             try std.testing.expectEqual(ast.Visibility.pub_item, fields[0].visibility);
             try std.testing.expectEqualStrings("value", fields[0].name.?.text);
-            try std.testing.expectEqualStrings("T", fields[0].ty.?.text);
+            try std.testing.expectEqualStrings("T", fields[0].ty.?.text());
         },
         else => return error.UnexpectedStructure,
     }
@@ -229,7 +239,8 @@ test "parse file lowers structured declaration body syntax" {
         .enum_variants => |variants| {
             try std.testing.expectEqual(@as(usize, 2), variants.len);
             try std.testing.expectEqualStrings("Some", variants[0].name.?.text);
-            try std.testing.expectEqualStrings("(T)", variants[0].tuple_payload.?.text);
+            try std.testing.expectEqual(@as(usize, 1), variants[0].tuple_payload.?.types.len);
+            try std.testing.expectEqualStrings("T", variants[0].tuple_payload.?.types[0].text());
             try std.testing.expectEqualStrings("None", variants[1].name.?.text);
             try std.testing.expectEqual(@as(usize, 1), variants[1].named_fields.len);
             try std.testing.expectEqualStrings("code", variants[1].named_fields[0].name.?.text);
@@ -244,7 +255,7 @@ test "parse file lowers structured declaration body syntax" {
             try std.testing.expectEqual(@as(usize, 1), body.methods.len);
             try std.testing.expectEqualStrings("Item", body.associated_types[0].name.?.text);
             try std.testing.expectEqualStrings("LIMIT", body.associated_consts[0].name.?.text);
-            try std.testing.expectEqualStrings("Index", body.associated_consts[0].ty.?.text);
+            try std.testing.expectEqualStrings("Index", body.associated_consts[0].ty.?.text());
             try std.testing.expectEqualStrings("read", body.methods[0].signature.name.?.text);
         },
         else => return error.UnexpectedStructure,
@@ -295,6 +306,50 @@ test "parse file lowers structured nested function block syntax" {
     try std.testing.expectEqualStrings("repeat:", block.lines[1].text.text);
     try std.testing.expect(block.lines[1].block != null);
     try std.testing.expectEqualStrings("return 3", block.lines[1].block.?.lines[0].text.text);
+}
+
+test "parse file keeps declaration and local declared types as TypeSyntax carriers" {
+    var table = source.Table.init(std.testing.allocator);
+    defer table.deinit();
+
+    const file_id = try table.addVirtualFile(
+        "parse-type-carriers.rna",
+        "type Output = Option[Str]\nimpl Reader for Buffer:\n    type Item = Str\nfn main(input: Str) -> Str:\n    let copy: Str = input\n    const count: Index = 4\n    return copy\n",
+    );
+    const file = table.get(file_id);
+
+    var diagnostics = diag.Bag.init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    var parsed = try parseFile(std.testing.allocator, file, &diagnostics);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.module.itemCount());
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.errorCount());
+
+    switch (parsed.module.itemAt(0).syntax) {
+        .type_alias => |alias| try std.testing.expectEqualStrings("Option[Str]", alias.target.?.text()),
+        else => return error.UnexpectedStructure,
+    }
+
+    switch (parsed.module.itemAt(1).body_syntax) {
+        .impl_body => |body| {
+            try std.testing.expectEqual(@as(usize, 1), body.associated_types.len);
+            try std.testing.expectEqualStrings("Str", body.associated_types[0].value.?.text());
+        },
+        else => return error.UnexpectedStructure,
+    }
+
+    const structured = parsed.module.itemAt(2).block_syntax.?.structured;
+    try std.testing.expectEqual(@as(usize, 3), structured.statements.len);
+    switch (structured.statements[0]) {
+        .let_decl => |binding| try std.testing.expectEqualStrings("Str", binding.declared_type.?.text()),
+        else => return error.UnexpectedStructure,
+    }
+    switch (structured.statements[1]) {
+        .const_decl => |binding| try std.testing.expectEqualStrings("Index", binding.declared_type.?.text()),
+        else => return error.UnexpectedStructure,
+    }
 }
 
 test "incremental reparse reuses unchanged top-level CST nodes" {

@@ -2,6 +2,7 @@ const std = @import("std");
 const abi = @import("../abi/root.zig");
 const c_va_list = @import("../abi/c/va_list.zig");
 const abi_query = @import("abi_query.zig");
+const attribute_support = @import("../attribute_support.zig");
 const ast = @import("../ast/root.zig");
 const backend_contract = @import("../backend_contract/root.zig");
 const backend_contract_query = @import("backend_contract_query.zig");
@@ -35,6 +36,7 @@ const method_mir_lower = @import("method_mir_lower.zig");
 const mir = @import("../mir/root.zig");
 const ownership = @import("../ownership/root.zig");
 const pattern_checks = @import("pattern_checks.zig");
+const typed_signatures = @import("signatures.zig");
 const raw_pointer = @import("../raw_pointer/root.zig");
 const reflect = @import("../reflect/root.zig");
 const resolve = @import("../resolve/root.zig");
@@ -50,7 +52,8 @@ const target = @import("../target/root.zig");
 const test_discovery = @import("test_discovery.zig");
 const trait_solver = @import("trait_solver.zig");
 const typed = @import("../typed/root.zig");
-const typed_attributes = @import("attributes.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
+const attribute_checks = @import("attributes.zig");
 const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
 const tuple_types = @import("tuple_types.zig");
@@ -62,9 +65,9 @@ const findMatchingDelimiter = typed_text.findMatchingDelimiter;
 const findMethodPrototype = type_support.findMethodPrototype;
 const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const isPlainIdentifier = typed_text.isPlainIdentifier;
-const parseExportName = typed_attributes.parseExportName;
-const parseLinkName = typed_attributes.parseLinkName;
-const symbolNameForSyntheticName = typed_attributes.symbolNameForSyntheticName;
+const parseExportName = attribute_support.parseExportName;
+const parseLinkName = attribute_support.parseLinkName;
+const symbolNameForSyntheticName = attribute_support.symbolNameForSyntheticName;
 const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 
 pub const summary = "Demand-driven compiler queries with session-owned ids and caches.";
@@ -725,7 +728,7 @@ fn canonicalTypeForAliasName(
         else => return null,
     };
     const alias_target = signature.target orelse return try canonicalType(active, .unsupported);
-    const target_name = std.mem.trim(u8, alias_target.text, " \t\r\n");
+    const target_name = std.mem.trim(u8, alias_target.text(), " \t\r\n");
     if (target_name.len == 0) return try canonicalType(active, .unsupported);
     const target_builtin = types.Builtin.fromName(target_name);
     if (types.BuiltinScalar.fromBuiltin(target_builtin)) |scalar| {
@@ -867,35 +870,20 @@ fn isNominalTypeItemKind(kind: ast.ItemKind) bool {
 }
 
 fn declaredReprForItem(active: *session.Session, module_id: session.ModuleId, item: *const typed.Item) !types.DeclaredRepr {
-    for (item.attributes) |attribute| {
-        if (!std.mem.eql(u8, attribute.name, "repr")) continue;
-        const open_index = std.mem.indexOfScalar(u8, attribute.raw, '[') orelse return .default;
-        const close_index = std.mem.lastIndexOfScalar(u8, attribute.raw, ']') orelse return .default;
-        if (close_index <= open_index) return .default;
-
-        var saw_c = false;
-        var enum_repr_type: ?types.CanonicalTypeId = null;
-        var parts = std.mem.splitScalar(u8, attribute.raw[open_index + 1 .. close_index], ',');
-        while (parts.next()) |part| {
-            const trimmed = std.mem.trim(u8, part, " \t\r\n");
-            if (trimmed.len == 0) continue;
-            if (std.mem.eql(u8, trimmed, "c")) {
-                saw_c = true;
-                continue;
-            }
-            if (item.kind == .enum_type) {
-                enum_repr_type = try canonicalTypeForNameInModule(active, module_id, trimmed);
-            }
+    const repr_target = switch (item.kind) {
+        .struct_type => attribute_support.ReprTarget.struct_type,
+        .union_type => attribute_support.ReprTarget.union_type,
+        .enum_type => attribute_support.ReprTarget.enum_type,
+        else => return .default,
+    };
+    const repr = attribute_support.reprInfoForTarget(item.attributes, repr_target);
+    if (!repr.has_c) return .default;
+    if (item.kind == .enum_type) {
+        if (repr.integer_type_name) |name| {
+            return .{ .c_enum = try canonicalTypeForNameInModule(active, module_id, name) };
         }
-
-        if (!saw_c) return .default;
-        if (item.kind == .enum_type) {
-            if (enum_repr_type) |repr_type| return .{ .c_enum = repr_type };
-        }
-        return .c;
     }
-
-    return .default;
+    return .c;
 }
 
 fn functionSignatureHasVariadicTail(function: query_types.FunctionSignature) bool {
@@ -906,12 +894,13 @@ fn variadicTailIndex(function: query_types.FunctionSignature) ?usize {
     if (function.parameters.len == 0) return null;
     const last_index = function.parameters.len - 1;
     const last = function.parameters[last_index];
-    if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last.type_name, "...")) return last_index;
+    const last_type_name = last.ty.displayName();
+    if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last_type_name, "...")) return last_index;
     return null;
 }
 
 fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !void {
-    try typed_attributes.validateDeclarationAttributes(item.attributes, declarationTargetForItem(item), item.has_body, item.span, diagnostics);
+    try attribute_checks.validateDeclarationAttributes(item.attributes, declarationTargetForItem(item), item.has_body, item.span, diagnostics);
 
     if (item.is_domain_root and item.kind != .struct_type) {
         try diagnostics.add(.@"error", "type.domain_root.target", item.span, "#domain_root is valid only on struct declarations", .{});
@@ -923,14 +912,7 @@ fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !
         try diagnostics.add(.@"error", "type.domain_attr.conflict", item.span, "a declaration may not be both #domain_root and #domain_context", .{});
     }
 
-    if (!item.is_reflectable) return;
-    for (item.attributes) |attribute| {
-        if (!std.mem.eql(u8, attribute.name, "reflect")) continue;
-        const after_name_start = if (attribute.raw.len > 0 and attribute.raw[0] == '#') "reflect".len + 1 else "reflect".len;
-        if (attribute.raw.len > after_name_start and std.mem.trim(u8, attribute.raw[after_name_start..], " \t\r\n").len != 0) {
-            try diagnostics.add(.@"error", "type.reflect.args", attribute.span, "#reflect is a bare attribute and does not take arguments", .{});
-        }
-    }
+    if (!attribute_support.hasAttribute(item.attributes, "reflect")) return;
 
     if (item.visibility != .pub_item) {
         try diagnostics.add(.@"error", "type.reflect.exported", item.span, "#reflect runtime metadata requires an exported declaration", .{});
@@ -949,7 +931,7 @@ fn validateSemanticAttributes(item: *const typed.Item, diagnostics: *diag.Bag) !
     }
 }
 
-fn declarationTargetForItem(item: *const typed.Item) typed_attributes.DeclarationTarget {
+fn declarationTargetForItem(item: *const typed.Item) attribute_checks.DeclarationTarget {
     return switch (item.kind) {
         .function => .function,
         .suspend_function => .suspend_function,
@@ -1020,7 +1002,7 @@ fn validateFunctionSignatureSemantics(
     function: query_types.FunctionSignature,
     diagnostics: *diag.Bag,
 ) !void {
-    if (!typed_attributes.hasAttribute(item.attributes, "test")) return;
+    if (!attribute_support.hasBareAttribute(item.attributes, "test")) return;
 
     if (function.foreign) {
         try diagnostics.add(.@"error", "type.test.foreign", item.span, "#test is not valid on foreign functions", .{});
@@ -1122,8 +1104,8 @@ fn validateImplTraitRequirements(
     impl_block: query_types.ImplSignature,
     diagnostics: *diag.Bag,
 ) anyerror!void {
-    const trait_name = impl_block.trait_name orelse return;
-    const resolved = try resolveTraitMethods(active, module_id, trait_name) orelse return;
+    const trait_name = impl_block.trait_type orelse return;
+    const resolved = try resolveTraitMethods(active, module_id, trait_name.displayName()) orelse return;
     for (resolved.methods) |trait_method| {
         if (implContainsTraitMethod(impl_block.methods, trait_method.name)) continue;
         if (trait_method.has_default_body) {
@@ -1139,7 +1121,7 @@ fn validateImplTraitRequirements(
             continue;
         }
         try diagnostics.add(.@"error", "type.impl.method_missing", span, "trait impl for '{s}' is missing required method '{s}'", .{
-            impl_block.target_type,
+            impl_block.target_type.displayName(),
             trait_method.name,
         });
     }
@@ -1384,14 +1366,14 @@ fn validateExecutableMethodPhase(
 
         if (phase == .local) {
             for (impl_block.methods) |method| {
-                if (try validateExecutableMethodSite(seen_methods, impl_block.target_type, method.name, checked.item.span, diagnostics)) {
+                if (try validateExecutableMethodSite(seen_methods, impl_block.target_type.displayName(), method.name, checked.item.span, diagnostics)) {
                     issue_count.* += 1;
                 }
             }
         }
 
-        const trait_name = impl_block.trait_name orelse continue;
-        const resolved = try resolveTraitMethods(active, checked.module_id, trait_name) orelse continue;
+        const trait_name = impl_block.trait_type orelse continue;
+        const resolved = try resolveTraitMethods(active, checked.module_id, trait_name.displayName()) orelse continue;
         const expected_source: TraitMethodSource = switch (phase) {
             .local => .local,
             .imported => .imported,
@@ -1401,7 +1383,7 @@ fn validateExecutableMethodPhase(
         for (resolved.methods) |trait_method| {
             if (implContainsTraitMethod(impl_block.methods, trait_method.name)) continue;
             if (!trait_method.has_default_body or trait_method.syntax == null) continue;
-            if (try validateExecutableMethodSite(seen_methods, impl_block.target_type, trait_method.name, checked.item.span, diagnostics)) {
+            if (try validateExecutableMethodSite(seen_methods, impl_block.target_type.displayName(), trait_method.name, checked.item.span, diagnostics)) {
                 issue_count.* += 1;
             }
         }
@@ -1966,9 +1948,13 @@ fn collectBoundaryApiCapabilityFamilies(active: *session.Session, module_id: ses
     }
 
     for (function.parameters) |parameter| {
-        try appendBoundaryCapabilityFamily(active, module_id, parameter.type_name, &families);
+        const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(active.allocator, parameter.type_syntax, parameter.ty);
+        defer active.allocator.free(parameter_type_name);
+        try appendBoundaryCapabilityFamily(active, module_id, parameter_type_name, &families);
     }
-    try appendBoundaryCapabilityFamily(active, module_id, function.return_type_name, &families);
+    const return_type_name = try ownedTypeNameFromSyntaxOrRef(active.allocator, function.return_type_syntax, function.return_type);
+    defer active.allocator.free(return_type_name);
+    try appendBoundaryCapabilityFamily(active, module_id, return_type_name, &families);
     return families.toOwnedSlice();
 }
 
@@ -3584,7 +3570,7 @@ fn duplicateMirImportInput(allocator: Allocator, binding: typed.ImportedBinding)
     else
         &.{};
     cloned.function_where_predicates = if (binding.function_where_predicates.len != 0)
-        try allocator.dupe(typed.WherePredicate, binding.function_where_predicates)
+        try typed.cloneWherePredicates(allocator, binding.function_where_predicates)
     else
         &.{};
     cloned.function_parameter_types = if (binding.function_parameter_types) |values|
@@ -3680,7 +3666,7 @@ fn duplicateMirTraitMethod(allocator: Allocator, method: typed.TraitMethod) !typ
     else
         &.{};
     cloned.where_predicates = if (method.where_predicates.len != 0)
-        try allocator.dupe(typed.WherePredicate, method.where_predicates)
+        try typed.cloneWherePredicates(allocator, method.where_predicates)
     else
         &.{};
     cloned.syntax = if (method.syntax) |syntax| try syntax.clone(allocator) else null;
@@ -4042,7 +4028,7 @@ const CheckedCallableResolver = struct {
         const item_id = resolveCallableItemId(self.active, self.module_id, callee_name) orelse return null;
         const signature = checkedSignature(self.active, item_id) catch return null;
         return switch (signature.facts) {
-            .function => |function| function.return_type_name,
+            .function => |function| function.return_type.displayName(),
             else => null,
         };
     }
@@ -4325,7 +4311,7 @@ fn findAssociatedConstIdInModule(
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
-        if (!std.mem.eql(u8, baseTypeName(impl_block.target_type), owner_base)) continue;
+        if (!std.mem.eql(u8, baseTypeName(impl_block.target_type.displayName()), owner_base)) continue;
         if (associated_entry.associated_index >= impl_block.associated_consts.len) continue;
         const binding = impl_block.associated_consts[associated_entry.associated_index];
         if (!std.mem.eql(u8, binding.name, const_name)) continue;
@@ -4345,7 +4331,7 @@ fn findAssociatedConstIdInModule(
                 .impl_block => |impl_block| impl_block,
                 else => continue,
             };
-            if (!std.mem.eql(u8, baseTypeName(impl_block.target_type), owner_base)) continue;
+            if (!std.mem.eql(u8, baseTypeName(impl_block.target_type.displayName()), owner_base)) continue;
             if (associated_entry.associated_index >= impl_block.associated_consts.len) continue;
             const binding = impl_block.associated_consts[associated_entry.associated_index];
             if (!std.mem.eql(u8, binding.name, const_name)) continue;
@@ -4573,10 +4559,10 @@ fn metadataForCheckedSignature(active: *session.Session, signature: CheckedSigna
             metadata.read_parameter_count = parameterModeCount(function.parameters, .read);
             metadata.edit_parameter_count = parameterModeCount(function.parameters, .edit);
             metadata.generic_param_count = function.generic_params.len;
-            metadata.return_type_name = function.return_type_name;
+            metadata.return_type_name = function.return_type.displayName();
         },
         .const_item => |const_item| {
-            metadata.const_type_name = const_item.type_name;
+            metadata.const_type_name = const_item.type_ref.displayName();
             if (const_item.expr != null) {
                 const const_id = active.semantic_index.itemEntry(signature.item_id).const_id orelse return error.NotAConst;
                 const value = try constById(active, const_id);
@@ -4704,11 +4690,16 @@ fn buildFunctionForCheckedBody(
     else
         &.{};
     cloned.where_predicates = if (signature.where_predicates.len != 0)
-        try allocator.dupe(typed.WherePredicate, signature.where_predicates)
+        try typed.cloneWherePredicates(allocator, signature.where_predicates)
     else
         &.{};
-    for (signature.parameters) |parameter| try cloned.parameters.append(parameter);
-    cloned.return_type_name = signature.return_type_name;
+    for (signature.parameters) |parameter| try cloned.parameters.append(.{
+        .name = parameter.name,
+        .mode = parameter.mode,
+        .type_syntax = if (parameter.type_syntax) |syntax_value| try syntax_value.clone(allocator) else null,
+        .ty = parameter.ty,
+    });
+    cloned.return_type_syntax = if (signature.return_type_syntax) |syntax_value| try syntax_value.clone(allocator) else null;
     cloned.return_type = signature.return_type;
     if (source_item.block_syntax) |block_syntax| cloned.block_syntax = try block_syntax.clone(allocator);
     cloned.export_name = signature.export_name;
@@ -4724,7 +4715,7 @@ fn duplicateFunctionPrototype(allocator: Allocator, prototype: typed.FunctionPro
         .target_symbol = prototype.target_symbol,
         .return_type = prototype.return_type,
         .generic_params = if (prototype.generic_params.len != 0) try allocator.dupe(typed.GenericParam, prototype.generic_params) else &.{},
-        .where_predicates = if (prototype.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, prototype.where_predicates) else &.{},
+        .where_predicates = if (prototype.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, prototype.where_predicates) else &.{},
         .is_suspend = prototype.is_suspend,
         .parameter_types = try allocator.dupe(types.TypeRef, prototype.parameter_types),
         .parameter_type_names = try allocator.dupe([]const u8, prototype.parameter_type_names),
@@ -4742,7 +4733,7 @@ fn duplicateMethodPrototype(allocator: Allocator, prototype: typed.MethodPrototy
         .receiver_mode = prototype.receiver_mode,
         .return_type = prototype.return_type,
         .generic_params = if (prototype.generic_params.len != 0) try allocator.dupe(typed.GenericParam, prototype.generic_params) else &.{},
-        .where_predicates = if (prototype.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, prototype.where_predicates) else &.{},
+        .where_predicates = if (prototype.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, prototype.where_predicates) else &.{},
         .is_suspend = prototype.is_suspend,
         .parameter_types = try allocator.dupe(types.TypeRef, prototype.parameter_types),
         .parameter_type_names = try allocator.dupe([]const u8, prototype.parameter_type_names),
@@ -4763,7 +4754,7 @@ fn cloneFunctionPrototypeFromSignature(
     errdefer allocator.free(parameter_modes);
     for (signature.parameters, 0..) |parameter, index| {
         parameter_types[index] = parameter.ty;
-        parameter_type_names[index] = parameter.type_name;
+        parameter_type_names[index] = parameter.ty.displayName();
         parameter_modes[index] = parameter.mode;
     }
 
@@ -4773,7 +4764,7 @@ fn cloneFunctionPrototypeFromSignature(
         .target_symbol = base.target_symbol,
         .return_type = signature.return_type,
         .generic_params = if (signature.generic_params.len != 0) try allocator.dupe(typed.GenericParam, signature.generic_params) else &.{},
-        .where_predicates = if (signature.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, signature.where_predicates) else &.{},
+        .where_predicates = if (signature.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, signature.where_predicates) else &.{},
         .is_suspend = signature.is_suspend,
         .parameter_types = parameter_types,
         .parameter_type_names = parameter_type_names,
@@ -4807,7 +4798,7 @@ fn cloneMethodPrototypeFromSignature(
         .receiver_mode = base.receiver_mode,
         .return_type = signature.return_type,
         .generic_params = if (signature.generic_params.len != 0) try allocator.dupe(typed.GenericParam, signature.generic_params) else &.{},
-        .where_predicates = if (signature.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, signature.where_predicates) else &.{},
+        .where_predicates = if (signature.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, signature.where_predicates) else &.{},
         .is_suspend = signature.is_suspend,
         .parameter_types = parameter_types,
         .parameter_type_names = parameter_type_names,
@@ -4875,7 +4866,7 @@ fn appendImportedMethodPrototypesForBinding(
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
-        if (!std.mem.eql(u8, impl_block.target_type, source_type_name)) continue;
+        if (!std.mem.eql(u8, impl_block.target_type.displayName(), source_type_name)) continue;
 
         for (impl_block.methods) |method| {
             if (dedupe and findMethodPrototype(prototypes.items, local_type_name, method.name) != null) continue;
@@ -4894,8 +4885,8 @@ fn appendImportedMethodPrototypesForBinding(
             try prototypes.append(imported);
         }
 
-        const trait_name = impl_block.trait_name orelse continue;
-        const resolved = try resolveTraitMethods(active, source_module_id, trait_name) orelse continue;
+        const trait_name = impl_block.trait_type orelse continue;
+        const resolved = try resolveTraitMethods(active, source_module_id, trait_name.displayName()) orelse continue;
         for (resolved.methods) |trait_method| {
             if (!trait_method.has_default_body) continue;
             if (implContainsMethod(impl_block.methods, trait_method.name)) continue;
@@ -4976,7 +4967,7 @@ fn buildImportedMethodPrototype(
     errdefer allocator.free(parameter_modes);
     for (function.parameters.items, 0..) |parameter, index| {
         parameter_types[index] = remapImportedMethodType(parameter.ty, source_type_name, local_type_name);
-        parameter_type_names[index] = remapImportedMethodTypeName(parameter.type_name, source_type_name, local_type_name);
+        parameter_type_names[index] = remapImportedMethodTypeName(parameter.ty.displayName(), source_type_name, local_type_name);
         parameter_modes[index] = parameter.mode;
     }
 
@@ -4993,7 +4984,7 @@ fn buildImportedMethodPrototype(
         },
         .return_type = remapImportedMethodType(function.return_type, source_type_name, local_type_name),
         .generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{},
-        .where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{},
+        .where_predicates = if (function.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, function.where_predicates) else &.{},
         .is_suspend = function.is_suspend,
         .parameter_types = parameter_types,
         .parameter_type_names = parameter_type_names,
@@ -5033,13 +5024,17 @@ fn buildDeclaredExecutableMethods(
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
+        const rendered_target_type_name = try ownedTypeNameFromSyntax(allocator, impl_block.target_type_syntax);
+        defer allocator.free(rendered_target_type_name);
+        const target_type_name_id = try active.internName(rendered_target_type_name);
+        const target_type_name = active.internedName(target_type_name_id) orelse return error.InvalidInternedName;
 
         for (impl_block.methods) |method| {
-            if (findOwnedExecutableMethod(declared.items, impl_block.target_type, method.name) != null) continue;
+            if (findOwnedExecutableMethod(declared.items, target_type_name, method.name) != null) continue;
 
             const parsed = (try body_syntax_bridge.parseExecutableMethodFromTraitMethod(
                 allocator,
-                impl_block.target_type,
+                target_type_name,
                 impl_block.generic_params,
                 method,
                 diagnostics,
@@ -5056,13 +5051,13 @@ fn buildDeclaredExecutableMethods(
                 module_id,
                 module,
                 item.span,
-                impl_block.target_type,
+                target_type_name,
                 function,
                 diagnostics,
             );
 
             const rendered_function_name = try std.fmt.allocPrint(allocator, "{s}__{s}", .{
-                impl_block.target_type,
+                target_type_name,
                 parsed.method_name,
             });
             defer allocator.free(rendered_function_name);
@@ -5080,7 +5075,7 @@ fn buildDeclaredExecutableMethods(
             const symbol_name = active.internedName(symbol_name_id) orelse return error.InvalidInternedName;
 
             try declared.append(.{
-                .target_type = impl_block.target_type,
+                .target_type = target_type_name,
                 .method_name = parsed.method_name,
                 .function_name = function_name,
                 .symbol_name = symbol_name,
@@ -5121,17 +5116,18 @@ fn buildSynthesizedDefaultMethods(
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
-        const trait_name = impl_block.trait_name orelse continue;
-        const resolved = try resolveTraitMethods(active, module_id, trait_name) orelse continue;
+        const trait_name = impl_block.trait_type orelse continue;
+        const target_type_name = impl_block.target_type.displayName();
+        const resolved = try resolveTraitMethods(active, module_id, trait_name.displayName()) orelse continue;
         for (resolved.methods) |trait_method| {
             if (!trait_method.has_default_body) continue;
             if (implContainsMethod(impl_block.methods, trait_method.name)) continue;
-            if (findMethodPrototype(imported_method_prototypes, impl_block.target_type, trait_method.name) != null) continue;
-            if (findOwnedExecutableMethod(synthesized.items, impl_block.target_type, trait_method.name) != null) continue;
+            if (findMethodPrototype(imported_method_prototypes, target_type_name, trait_method.name) != null) continue;
+            if (findOwnedExecutableMethod(synthesized.items, target_type_name, trait_method.name) != null) continue;
 
             const parsed = (try body_syntax_bridge.parseExecutableMethodFromTraitMethod(
                 allocator,
-                impl_block.target_type,
+                target_type_name,
                 impl_block.generic_params,
                 trait_method,
                 diagnostics,
@@ -5148,13 +5144,13 @@ fn buildSynthesizedDefaultMethods(
                 module_id,
                 module,
                 item.span,
-                impl_block.target_type,
+                target_type_name,
                 function,
                 diagnostics,
             );
 
             const rendered_function_name = try std.fmt.allocPrint(allocator, "{s}__{s}", .{
-                impl_block.target_type,
+                target_type_name,
                 parsed.method_name,
             });
             defer allocator.free(rendered_function_name);
@@ -5172,7 +5168,7 @@ fn buildSynthesizedDefaultMethods(
             const symbol_name = active.internedName(symbol_name_id) orelse return error.InvalidInternedName;
 
             try synthesized.append(.{
-                .target_type = impl_block.target_type,
+                .target_type = target_type_name,
                 .method_name = parsed.method_name,
                 .function_name = function_name,
                 .symbol_name = symbol_name,
@@ -5247,9 +5243,13 @@ fn resolveExecutableMethodFunction(
     };
 
     for (function.parameters.items) |*parameter| {
-        parameter.ty = try resolveValueTypeWithContext(parameter.type_name, context, span, diagnostics);
+        const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
+        defer allocator.free(parameter_type_name);
+        parameter.ty = try resolveValueTypeWithContext(parameter_type_name, context, span, diagnostics);
     }
-    function.return_type = try resolveValueTypeWithContext(function.return_type_name, context, span, diagnostics);
+    const return_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, function.return_type_syntax, function.return_type);
+    defer allocator.free(return_type_name);
+    function.return_type = try resolveValueTypeWithContext(return_type_name, context, span, diagnostics);
     try validateWherePredicates(active, module_id, module, function.where_predicates, context, span, diagnostics);
 }
 
@@ -5266,7 +5266,7 @@ fn methodPrototypeFromOwnedExecutableMethod(
     errdefer allocator.free(parameter_modes);
     for (function.parameters.items, 0..) |parameter, index| {
         parameter_types[index] = parameter.ty;
-        parameter_type_names[index] = parameter.type_name;
+        parameter_type_names[index] = parameter.ty.displayName();
         parameter_modes[index] = parameter.mode;
     }
 
@@ -5278,7 +5278,7 @@ fn methodPrototypeFromOwnedExecutableMethod(
         .receiver_mode = method.receiver_mode,
         .return_type = function.return_type,
         .generic_params = if (function.generic_params.len != 0) try allocator.dupe(typed.GenericParam, function.generic_params) else &.{},
-        .where_predicates = if (function.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, function.where_predicates) else &.{},
+        .where_predicates = if (function.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, function.where_predicates) else &.{},
         .is_suspend = function.is_suspend,
         .parameter_types = parameter_types,
         .parameter_type_names = parameter_type_names,
@@ -5973,7 +5973,7 @@ fn buildConstRequiredExprSites(
                 try collectTypeConstRequiredExprSites(
                     active.allocator,
                     &sites,
-                    parameter.type_name,
+                    parameter.ty.displayName(),
                     &scope,
                     module_pipeline.prototypes.items,
                     imported_method_prototypes,
@@ -5986,7 +5986,7 @@ fn buildConstRequiredExprSites(
             try collectTypeConstRequiredExprSites(
                 active.allocator,
                 &sites,
-                function.return_type_name,
+                function.return_type.displayName(),
                 &scope,
                 module_pipeline.prototypes.items,
                 imported_method_prototypes,
@@ -5996,30 +5996,38 @@ fn buildConstRequiredExprSites(
                 diagnostics,
             );
         },
-        .const_item => |const_item| try collectTypeConstRequiredExprSites(
-            active.allocator,
-            &sites,
-            const_item.type_name,
-            &scope,
-            module_pipeline.prototypes.items,
-            imported_method_prototypes,
-            struct_prototypes,
-            enum_prototypes,
-            item.span,
-            diagnostics,
-        ),
-        .type_alias => |type_alias| try collectTypeConstRequiredExprSites(
-            active.allocator,
-            &sites,
-            type_alias.target_type_name,
-            &scope,
-            module_pipeline.prototypes.items,
-            imported_method_prototypes,
-            struct_prototypes,
-            enum_prototypes,
-            item.span,
-            diagnostics,
-        ),
+        .const_item => |const_item| {
+            const const_type_name = try type_syntax_support.render(active.allocator, const_item.type_syntax);
+            defer active.allocator.free(const_type_name);
+            try collectTypeConstRequiredExprSites(
+                active.allocator,
+                &sites,
+                const_type_name,
+                &scope,
+                module_pipeline.prototypes.items,
+                imported_method_prototypes,
+                struct_prototypes,
+                enum_prototypes,
+                item.span,
+                diagnostics,
+            );
+        },
+        .type_alias => |type_alias| {
+            const target_type_name = try type_syntax_support.render(active.allocator, type_alias.target_type_syntax);
+            defer active.allocator.free(target_type_name);
+            try collectTypeConstRequiredExprSites(
+                active.allocator,
+                &sites,
+                target_type_name,
+                &scope,
+                module_pipeline.prototypes.items,
+                imported_method_prototypes,
+                struct_prototypes,
+                enum_prototypes,
+                item.span,
+                diagnostics,
+            );
+        },
         .struct_type => |struct_type| for (struct_type.fields) |field| {
             try collectTypeConstRequiredExprSites(
                 active.allocator,
@@ -6105,10 +6113,12 @@ fn buildConstRequiredExprSites(
             }
         },
         .impl_block => |impl_block| {
+            const target_type_name = try type_syntax_support.render(active.allocator, impl_block.target_type_syntax);
+            defer active.allocator.free(target_type_name);
             try collectTypeConstRequiredExprSites(
                 active.allocator,
                 &sites,
-                impl_block.target_type,
+                target_type_name,
                 &scope,
                 module_pipeline.prototypes.items,
                 imported_method_prototypes,
@@ -6118,10 +6128,12 @@ fn buildConstRequiredExprSites(
                 diagnostics,
             );
             for (impl_block.associated_types) |binding| {
+                const binding_type_name = try type_syntax_support.render(active.allocator, binding.value_type_syntax);
+                defer active.allocator.free(binding_type_name);
                 try collectTypeConstRequiredExprSites(
                     active.allocator,
                     &sites,
-                    binding.value_type_name,
+                    binding_type_name,
                     &scope,
                     module_pipeline.prototypes.items,
                     imported_method_prototypes,
@@ -6132,10 +6144,12 @@ fn buildConstRequiredExprSites(
                 );
             }
             for (impl_block.associated_consts) |binding| {
+                const const_type_name = try type_syntax_support.render(active.allocator, binding.const_item.type_syntax);
+                defer active.allocator.free(const_type_name);
                 try collectTypeConstRequiredExprSites(
                     active.allocator,
                     &sites,
-                    binding.const_item.type_name,
+                    const_type_name,
                     &scope,
                     module_pipeline.prototypes.items,
                     imported_method_prototypes,
@@ -6148,10 +6162,12 @@ fn buildConstRequiredExprSites(
         },
         .trait_type => |trait_type| {
             for (trait_type.associated_consts) |associated_const| {
+                const associated_type_name = try type_syntax_support.render(active.allocator, associated_const.type_syntax);
+                defer active.allocator.free(associated_type_name);
                 try collectTypeConstRequiredExprSites(
                     active.allocator,
                     &sites,
-                    associated_const.type_name,
+                    associated_type_name,
                     &scope,
                     module_pipeline.prototypes.items,
                     imported_method_prototypes,
@@ -6165,10 +6181,12 @@ fn buildConstRequiredExprSites(
                 const syntax = method.syntax orelse continue;
                 for (syntax.signature.parameters) |parameter| {
                     if (parameter.ty) |ty| {
+                        const parameter_type_name = try type_syntax_support.render(active.allocator, ty);
+                        defer active.allocator.free(parameter_type_name);
                         try collectTypeConstRequiredExprSites(
                             active.allocator,
                             &sites,
-                            ty.text,
+                            parameter_type_name,
                             &scope,
                             module_pipeline.prototypes.items,
                             imported_method_prototypes,
@@ -6180,10 +6198,12 @@ fn buildConstRequiredExprSites(
                     }
                 }
                 if (syntax.signature.return_type) |return_type| {
+                    const return_type_name = try type_syntax_support.render(active.allocator, return_type);
+                    defer active.allocator.free(return_type_name);
                     try collectTypeConstRequiredExprSites(
                         active.allocator,
                         &sites,
-                        return_type.text,
+                        return_type_name,
                         &scope,
                         module_pipeline.prototypes.items,
                         imported_method_prototypes,
@@ -6202,6 +6222,15 @@ fn buildConstRequiredExprSites(
 }
 
 fn seedConstExprScope(active: *session.Session, module_id: session.ModuleId, scope: *ConstExprScope, module: *const typed.Module) !void {
+    var type_scope = NameSet.init(active.allocator);
+    defer type_scope.deinit();
+    try seedTypeScope(&type_scope, module);
+    const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
+        .type_scope = &type_scope,
+    };
+
     const module_entry = active.semantic_index.moduleEntry(module_id);
     const source_items = active.pipeline.modules.items[module_entry.pipeline_index].hir.items.items;
     for (module.items.items, 0..) |item, item_index| {
@@ -6209,12 +6238,14 @@ fn seedConstExprScope(active: *session.Session, module_id: session.ModuleId, sco
         const source_item = source_items[item_index];
         var diagnostics = diag.Bag.init(active.allocator);
         defer diagnostics.deinit();
-        var const_item = switch (source_item.syntax) {
-            .const_item => |signature| try item_syntax_bridge.parseConstDataFromSyntax(active.allocator, signature, source_item.span, &diagnostics),
+        const signature = switch (source_item.syntax) {
+            .const_item => |signature| signature,
             else => continue,
         };
-        defer const_item.deinit(active.allocator);
-        try scope.putConst(item.name, const_item.type_ref);
+        const type_syntax = signature.ty orelse continue;
+        const type_name = try type_syntax_support.render(active.allocator, type_syntax);
+        defer active.allocator.free(type_name);
+        try scope.putConst(item.name, try resolveValueTypeWithContext(type_name, context, source_item.span, &diagnostics));
     }
     for (module.imports.items) |binding| {
         if (binding.const_type) |ty| try scope.putConst(binding.local_name, ty);
@@ -6460,17 +6491,22 @@ fn appendConstRequiredExprSite(
 }
 
 fn enumDiscriminantExpectedType(attributes: []const ast.Attribute) types.TypeRef {
-    for (attributes) |attribute| {
-        if (!std.mem.eql(u8, attribute.name, "repr")) continue;
-        const open_index = std.mem.indexOfScalar(u8, attribute.raw, '[') orelse return types.TypeRef.fromBuiltin(.index);
-        const close_index = std.mem.lastIndexOfScalar(u8, attribute.raw, ']') orelse return types.TypeRef.fromBuiltin(.index);
-        if (close_index <= open_index) return types.TypeRef.fromBuiltin(.index);
-
-        var parts = std.mem.splitScalar(u8, attribute.raw[open_index + 1 .. close_index], ',');
-        while (parts.next()) |part| {
-            const trimmed = std.mem.trim(u8, part, " \t\r\n");
-            const builtin = types.Builtin.fromName(trimmed);
-            if (builtin.isInteger()) return types.TypeRef.fromBuiltin(builtin);
+    const repr = attribute_support.reprInfoForTarget(attributes, .enum_type);
+    if (repr.integer_type_name) |name| {
+        const builtin = types.Builtin.fromName(name);
+        if (builtin.isInteger()) return types.TypeRef.fromBuiltin(builtin);
+        if (types.CAbiAlias.fromName(name)) |alias| {
+            return switch (alias) {
+                .c_uint,
+                .c_ulong,
+                .c_ulong_long,
+                .c_ushort,
+                .c_unsigned_char,
+                => types.TypeRef.fromBuiltin(.u32),
+                .c_size => types.TypeRef.fromBuiltin(.index),
+                .c_void => types.TypeRef.fromBuiltin(.index),
+                else => types.TypeRef.fromBuiltin(.i32),
+            };
         }
     }
     return types.TypeRef.fromBuiltin(.index);
@@ -6806,6 +6842,8 @@ fn resolveValueTypeWithContext(
         if (try resolveTypeAliasTargetType(active, context.module_id, trimmed, context, span, diagnostics, &alias_stack)) |aliased| {
             return aliased;
         }
+        const name_id = try active.internName(trimmed);
+        return .{ .named = active.internedName(name_id) orelse return error.InvalidInternedName };
     }
     return .{ .named = trimmed };
 }
@@ -6834,7 +6872,7 @@ fn resolveTypeAliasTargetType(
         else => return null,
     };
     const alias_target = signature.target orelse return .unsupported;
-    const target_name = std.mem.trim(u8, alias_target.text, " \t");
+    const target_name = std.mem.trim(u8, alias_target.text(), " \t");
     if (target_name.len == 0) return .unsupported;
 
     const builtin = types.Builtin.fromName(target_name);
@@ -6890,6 +6928,19 @@ fn duplicateTypeRefIfOwned(allocator: Allocator, value: types.TypeRef) !types.Ty
     };
 }
 
+fn ownedTypeNameFromSyntaxOrRef(
+    allocator: Allocator,
+    maybe_syntax: ?ast.TypeSyntax,
+    fallback: types.TypeRef,
+) ![]const u8 {
+    if (maybe_syntax) |syntax_value| return type_syntax_support.render(allocator, syntax_value);
+    return allocator.dupe(u8, fallback.displayName());
+}
+
+fn ownedTypeNameFromSyntax(allocator: Allocator, syntax_value: ast.TypeSyntax) ![]const u8 {
+    return type_syntax_support.render(allocator, syntax_value);
+}
+
 fn validateWherePredicates(
     active: *session.Session,
     module_id: session.ModuleId,
@@ -6903,7 +6954,9 @@ fn validateWherePredicates(
         switch (predicate) {
             .bound => |bound| try validateTypeExpression(bound.contract_name, context, span, diagnostics),
             .projection_equality => |projection| {
-                try validateTypeExpression(projection.value_type_name, context, span, diagnostics);
+                const value_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, projection.value_type_syntax);
+                defer diagnostics.allocator.free(value_type_name);
+                try validateTypeExpression(value_type_name, context, span, diagnostics);
                 if (!projectionSubjectHasAssociatedType(active, module_id, module, predicates, projection.subject_name, projection.associated_name)) {
                     try diagnostics.add(.@"error", "type.where.associated", span, "invalid associated-output reference '{s}.{s}'", .{
                         projection.subject_name,
@@ -6974,87 +7027,23 @@ fn projectionSubjectHasAssociatedType(
     return false;
 }
 
-fn parseParameterMode(
-    mode: ?ast.SpanText,
-    span: source.Span,
-    diagnostics: *diag.Bag,
-) !typed.ParameterMode {
-    const raw = if (mode) |value| std.mem.trim(u8, value.text, " \t") else return .owned;
-    if (std.mem.eql(u8, raw, "take")) return .take;
-    if (std.mem.eql(u8, raw, "read")) return .read;
-    if (std.mem.eql(u8, raw, "edit")) return .edit;
-    try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter mode '{s}'", .{raw});
-    return .owned;
-}
-
 fn parseMethodReceiverFromSyntax(
+    allocator: Allocator,
     target_type: []const u8,
     parameter: ast.ParameterSyntax,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !?typed.Parameter {
-    const name = parameter.name orelse {
-        try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter in function signature", .{});
-        return null;
-    };
-    if (!std.mem.eql(u8, std.mem.trim(u8, name.text, " \t"), "self")) {
-        try diagnostics.add(.@"error", "type.method.receiver", span, "inherent methods require an explicit self receiver", .{});
-        return null;
-    }
-
-    const mode = try parseParameterMode(parameter.mode, span, diagnostics);
-    const type_name = if (parameter.ty) |ty| std.mem.trim(u8, ty.text, " \t") else "";
-    if (type_name.len == 0) {
-        return switch (mode) {
-            .take, .read, .edit => .{
-                .name = "self",
-                .mode = mode,
-                .type_name = target_type,
-                .ty = .{ .named = target_type },
-            },
-            .owned => {
-                try diagnostics.add(.@"error", "type.method.receiver", span, "unsupported method receiver form", .{});
-                return null;
-            },
-        };
-    }
-
-    if (mode == .take and std.mem.startsWith(u8, type_name, "hold[") and
-        (std.mem.indexOf(u8, type_name, " read Self") != null or std.mem.indexOf(u8, type_name, " edit Self") != null))
-    {
-        return .{
-            .name = "self",
-            .mode = .take,
-            .type_name = type_name,
-            .ty = types.TypeRef.fromBuiltin(types.Builtin.fromName(type_name)),
-        };
-    }
-
-    try diagnostics.add(.@"error", "type.method.receiver", span, "unsupported method receiver form", .{});
-    return null;
+    return body_syntax_bridge.parseMethodReceiverFromSyntax(allocator, target_type, parameter, span, diagnostics);
 }
 
 fn parseOrdinaryParameterFromSyntax(
+    allocator: Allocator,
     parameter: ast.ParameterSyntax,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !?typed.Parameter {
-    const name = parameter.name orelse {
-        try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter in function signature", .{});
-        return null;
-    };
-    const ty = parameter.ty orelse {
-        try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter '{s}'", .{name.text});
-        return null;
-    };
-
-    const type_name = std.mem.trim(u8, ty.text, " \t");
-    return .{
-        .name = std.mem.trim(u8, name.text, " \t"),
-        .mode = try parseParameterMode(parameter.mode, span, diagnostics),
-        .type_name = type_name,
-        .ty = types.TypeRef.fromBuiltin(types.Builtin.fromName(type_name)),
-    };
+    return body_syntax_bridge.parseOrdinaryParameterFromSyntax(allocator, parameter, span, diagnostics);
 }
 
 fn validateTraitMethodSignature(
@@ -7087,21 +7076,30 @@ fn validateTraitMethodSignature(
             const first_parameter = method_syntax.signature.parameters[0];
             if (first_parameter.name) |name| {
                 if (std.mem.eql(u8, std.mem.trim(u8, name.text, " \t"), "self")) {
-                    const receiver = try parseMethodReceiverFromSyntax("Self", first_parameter, span, diagnostics) orelse return;
-                    try validateTypeExpression(receiver.type_name, context, span, diagnostics);
+                    const receiver = try parseMethodReceiverFromSyntax(allocator, "Self", first_parameter, span, diagnostics) orelse return;
+                    var owned_receiver = receiver;
+                    defer owned_receiver.deinit(allocator);
+                    const receiver_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, receiver.type_syntax, receiver.ty);
+                    defer allocator.free(receiver_type_name);
+                    try validateTypeExpression(receiver_type_name, context, span, diagnostics);
                     param_index = 1;
                 }
             }
         }
 
         while (param_index < method_syntax.signature.parameters.len) : (param_index += 1) {
-            const parameter = try parseOrdinaryParameterFromSyntax(method_syntax.signature.parameters[param_index], span, diagnostics) orelse continue;
-            try validateTypeExpression(parameter.type_name, context, span, diagnostics);
+            const parameter = try parseOrdinaryParameterFromSyntax(allocator, method_syntax.signature.parameters[param_index], span, diagnostics) orelse continue;
+            var owned_parameter = parameter;
+            defer owned_parameter.deinit(allocator);
+            const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
+            defer allocator.free(parameter_type_name);
+            try validateTypeExpression(parameter_type_name, context, span, diagnostics);
         }
 
         if (method_syntax.signature.return_type) |return_type| {
-            const return_raw = std.mem.trim(u8, return_type.text, " \t");
-            if (return_raw.len != 0) try validateTypeExpression(return_raw, context, span, diagnostics);
+            const return_type_name = try ownedTypeNameFromSyntax(allocator, return_type);
+            defer allocator.free(return_type_name);
+            if (return_type_name.len != 0) try validateTypeExpression(return_type_name, context, span, diagnostics);
         }
         try validateWherePredicates(active, module_id, module, method.where_predicates, context, span, diagnostics);
     }
@@ -7130,7 +7128,9 @@ fn validateTraitSignature(
     };
     try validateWherePredicates(active, module_id, module, trait_type.where_predicates, context, span, diagnostics);
     for (trait_type.associated_consts) |associated_const| {
-        try validateTypeExpression(associated_const.type_name, context, span, diagnostics);
+        const associated_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, associated_const.type_syntax);
+        defer diagnostics.allocator.free(associated_type_name);
+        try validateTypeExpression(associated_type_name, context, span, diagnostics);
     }
     for (trait_type.methods) |*method| {
         try validateTraitMethodSignature(diagnostics.allocator, active, module_id, module, method, trait_type.generic_params, span, &type_scope, diagnostics);
@@ -7153,21 +7153,29 @@ fn validateImplBlock(
         .generic_params = impl_block.generic_params,
         .where_predicates = impl_block.where_predicates,
     };
-    try validateTypeExpression(impl_block.target_type, context, span, diagnostics);
-    const target_base = baseTypeName(impl_block.target_type);
+    const target_type_name = try ownedTypeNameFromSyntax( diagnostics.allocator, impl_block.target_type_syntax);
+    defer diagnostics.allocator.free(target_type_name);
+    try validateTypeExpression(target_type_name, context, span, diagnostics);
+    const target_base = baseTypeName(target_type_name);
     if (target_base.len != 0 and findTypeAliasSourceItem(active, module_id, target_base) != null) {
         try diagnostics.add(.@"error", "type.alias.impl", span, "type alias '{s}' cannot own impls in v1", .{target_base});
     }
-    if (impl_block.trait_name) |trait_name| {
+    if (impl_block.trait_syntax) |trait_syntax| {
+        const trait_name = try ownedTypeNameFromSyntax(diagnostics.allocator, trait_syntax);
+        defer diagnostics.allocator.free(trait_name);
         try validateTypeExpression(trait_name, context, span, diagnostics);
     } else if (impl_block.associated_types.len != 0) {
         try diagnostics.add(.@"error", "type.impl.associated_inherent", span, "inherent impls cannot bind associated types", .{});
     }
     for (impl_block.associated_types) |binding| {
-        try validateTypeExpression(binding.value_type_name, context, span, diagnostics);
+        const binding_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, binding.value_type_syntax);
+        defer diagnostics.allocator.free(binding_type_name);
+        try validateTypeExpression(binding_type_name, context, span, diagnostics);
     }
     for (impl_block.associated_consts) |binding| {
-        try validateTypeExpression(binding.const_data.type_name, context, span, diagnostics);
+        const const_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, binding.const_data.type_syntax);
+        defer diagnostics.allocator.free(const_type_name);
+        try validateTypeExpression(const_type_name, context, span, diagnostics);
     }
     try validateWherePredicates(active, module_id, module, impl_block.where_predicates, context, span, diagnostics);
 }
@@ -7205,10 +7213,24 @@ fn functionSignatureForItem(
     const parameters = try allocator.alloc(typed.Parameter, function.parameters.items.len);
     errdefer allocator.free(parameters);
     for (function.parameters.items, 0..) |parameter, index| {
-        parameters[index] = parameter;
-        parameters[index].ty = try resolveValueTypeWithContext(parameter.type_name, context, item.span, diagnostics);
+        const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
+        defer allocator.free(parameter_type_name);
+        parameters[index] = .{
+            .name = parameter.name,
+            .mode = parameter.mode,
+            .type_syntax = if (parameter.type_syntax) |syntax_value| try syntax_value.clone(allocator) else null,
+            .ty = try duplicateTypeRefIfOwned(
+                allocator,
+                try resolveValueTypeWithContext(parameter_type_name, context, item.span, diagnostics),
+            ),
+        };
     }
-    const return_type = try resolveValueTypeWithContext(function.return_type_name, context, item.span, diagnostics);
+    const return_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, function.return_type_syntax, function.return_type);
+    defer allocator.free(return_type_name);
+    const return_type = try duplicateTypeRefIfOwned(
+        allocator,
+        try resolveValueTypeWithContext(return_type_name, context, item.span, diagnostics),
+    );
     try validateWherePredicates(active, module_id, module, function.where_predicates, context, item.span, diagnostics);
 
     return .{
@@ -7217,7 +7239,7 @@ fn functionSignatureForItem(
         .generic_params = function.generic_params,
         .where_predicates = function.where_predicates,
         .parameters = parameters,
-        .return_type_name = function.return_type_name,
+        .return_type_syntax = if (function.return_type_syntax) |syntax_value| try syntax_value.clone(allocator) else null,
         .return_type = return_type,
         .export_name = function.export_name,
         .link_name = function.link_name,
@@ -7467,10 +7489,10 @@ fn typeAliasSignatureFromSyntax(
         .type_alias => |value| value,
         else => return error.InvalidParse,
     };
-    const generic_params = try item_syntax_bridge.parseGenericParamsFromSpan(allocator, signature.generic_params, span, diagnostics);
+    const generic_params = try typed_signatures.lowerGenericParams(allocator, signature.generic_params, diagnostics);
     errdefer if (generic_params.len != 0) allocator.free(generic_params);
-    const where_predicates = try item_syntax_bridge.parseWherePredicatesFromClauses(allocator, signature.where_clauses, generic_params, false, span, diagnostics);
-    errdefer if (where_predicates.len != 0) allocator.free(where_predicates);
+    const where_predicates = try typed_signatures.lowerWherePredicates(allocator, signature.where_clauses, generic_params, false, diagnostics);
+    errdefer typed.deinitWherePredicates(allocator, where_predicates);
 
     var type_scope = NameSet.init(allocator);
     defer type_scope.deinit();
@@ -7484,12 +7506,17 @@ fn typeAliasSignatureFromSyntax(
     };
     try validateWherePredicates(active, module_id, module, where_predicates, context, span, diagnostics);
 
-    const target_type_name = if (signature.target) |alias_target| std.mem.trim(u8, alias_target.text, " \t") else "";
-    const target_type = try resolveValueTypeWithContext(target_type_name, context, span, diagnostics);
+    const target_syntax = signature.target orelse return error.InvalidParse;
+    const target_type_name = try type_syntax_support.render(allocator, target_syntax);
+    defer allocator.free(target_type_name);
+    const target_type = try duplicateTypeRefIfOwned(
+        allocator,
+        try resolveValueTypeWithContext(target_type_name, context, span, diagnostics),
+    );
     return .{
         .generic_params = generic_params,
         .where_predicates = where_predicates,
-        .target_type_name = target_type_name,
+        .target_type_syntax = try target_syntax.clone(allocator),
         .target_type = target_type,
     };
 }
@@ -7703,18 +7730,36 @@ fn implSignatureFromSyntax(
     var impl_block = typed.ImplData{
         .generic_params = header.generic_params,
         .where_predicates = header.where_predicates,
+        .target_type_syntax = header.target_type_syntax,
         .target_type = header.target_type,
-        .trait_name = header.trait_name,
+        .trait_syntax = header.trait_syntax,
+        .trait_type = header.trait_type,
         .associated_types = associated_types,
         .associated_consts = associated_const_bindings,
         .methods = methods,
     };
-    const result = try implSignatureForItem(active, allocator, module_id, module, prototypes, span, &impl_block, diagnostics);
-
     header.generic_params = &.{};
     header.where_predicates = &.{};
+    header.target_type_syntax = .{
+        .source = .{
+            .text = "",
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        },
+    };
+    header.trait_syntax = null;
+    const result = try implSignatureForItem(active, allocator, module_id, module, prototypes, span, &impl_block, diagnostics);
+
+    impl_block.target_type_syntax.deinit(allocator);
+    if (impl_block.trait_syntax) |*trait_syntax| trait_syntax.deinit(allocator);
     impl_block.generic_params = &.{};
     impl_block.where_predicates = &.{};
+    impl_block.target_type_syntax = .{
+        .source = .{
+            .text = "",
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        },
+    };
+    impl_block.trait_syntax = null;
     impl_block.associated_types = &.{};
     impl_block.methods = &.{};
     for (impl_block.associated_consts) |*binding| binding.deinit(allocator);
@@ -7737,6 +7782,30 @@ fn implSignatureForItem(
     defer type_scope.deinit();
     try seedTypeScope(&type_scope, module);
     try validateImplBlock(active, module_id, module, impl_block, &type_scope, span, diagnostics);
+
+    const context = TypeResolutionContext{
+        .active = active,
+        .module_id = module_id,
+        .type_scope = &type_scope,
+        .generic_params = impl_block.generic_params,
+        .where_predicates = impl_block.where_predicates,
+    };
+
+    const target_type_name = try ownedTypeNameFromSyntax(allocator, impl_block.target_type_syntax);
+    defer allocator.free(target_type_name);
+    const target_type = try duplicateTypeRefIfOwned(
+        allocator,
+        try resolveValueTypeWithContext(target_type_name, context, span, diagnostics),
+    );
+
+    const trait_type = if (impl_block.trait_syntax) |trait_syntax| blk: {
+        const trait_name = try ownedTypeNameFromSyntax(allocator, trait_syntax);
+        defer allocator.free(trait_name);
+        break :blk try duplicateTypeRefIfOwned(
+            allocator,
+            try resolveValueTypeWithContext(trait_name, context, span, diagnostics),
+        );
+    } else null;
 
     const associated_consts = try allocator.alloc(query_types.AssociatedConstBindingSignature, impl_block.associated_consts.len);
     var initialized: usize = 0;
@@ -7767,8 +7836,10 @@ fn implSignatureForItem(
     return .{
         .generic_params = impl_block.generic_params,
         .where_predicates = impl_block.where_predicates,
-        .target_type = impl_block.target_type,
-        .trait_name = impl_block.trait_name,
+        .target_type_syntax = try impl_block.target_type_syntax.clone(allocator),
+        .target_type = target_type,
+        .trait_syntax = if (impl_block.trait_syntax) |syntax_value| try syntax_value.clone(allocator) else null,
+        .trait_type = trait_type,
         .associated_types = impl_block.associated_types,
         .associated_consts = associated_consts,
         .methods = impl_block.methods,
@@ -7801,7 +7872,9 @@ fn constSignatureForItem(
         .type_scope = &type_scope,
         .generic_params = generic_params,
     };
-    const resolved_type_ref = try resolveValueTypeWithContext(const_item.type_name, context, span, diagnostics);
+    const type_name = try type_syntax_support.render(allocator, const_item.type_syntax);
+    defer allocator.free(type_name);
+    const resolved_type_ref = try resolveValueTypeWithContext(type_name, context, span, diagnostics);
 
     var initializer_type_ref: types.TypeRef = .unsupported;
     if (const_item.initializer_syntax) |initializer_syntax| {
@@ -7835,14 +7908,13 @@ fn constSignatureForItem(
             else => {
                 lower_error = err;
                 return .{
-                    .type_name = const_item.type_name,
+                    .type_syntax = try const_item.type_syntax.clone(allocator),
                     .ty = switch (resolved_type_ref) {
                         .builtin => |builtin| builtin,
                         else => .unsupported,
                     },
-                    .type_ref = resolved_type_ref,
+                    .type_ref = try duplicateTypeRefIfOwned(allocator, resolved_type_ref),
                     .initializer_type_ref = .unsupported,
-                    .initializer_source = const_item.initializer_source,
                     .expr = null,
                     .lower_error = lower_error,
                 };
@@ -7865,14 +7937,13 @@ fn constSignatureForItem(
         };
     }
     return .{
-        .type_name = const_item.type_name,
+        .type_syntax = try const_item.type_syntax.clone(allocator),
         .ty = switch (resolved_type_ref) {
             .builtin => |builtin| builtin,
             else => .unsupported,
         },
-        .type_ref = resolved_type_ref,
+        .type_ref = try duplicateTypeRefIfOwned(allocator, resolved_type_ref),
         .initializer_type_ref = initializer_type_ref,
-        .initializer_source = const_item.initializer_source,
         .expr = lowered,
         .lower_error = lower_error,
     };

@@ -103,7 +103,7 @@ pub fn returnTypeStructurallyCompatible(actual: types.TypeRef, expected: types.T
 pub fn duplicateParameterTypeNames(allocator: Allocator, parameters: []const Parameter) ![]const []const u8 {
     const names = try allocator.alloc([]const u8, parameters.len);
     for (parameters, 0..) |parameter, index| {
-        names[index] = parameter.type_name;
+        names[index] = parameter.ty.displayName();
     }
     return names;
 }
@@ -288,17 +288,17 @@ pub fn cVariadicArgumentTypeNameSupported(raw_name: []const u8) bool {
 }
 
 pub fn boundaryFromParameter(parameter: Parameter) BoundaryType {
-    const retained = parseBoundaryType(parameter.type_name);
+    const retained = parseBoundaryType(parameter.ty.displayName());
     if (retained.kind == .retained_read or retained.kind == .retained_edit) return retained;
 
     return switch (parameter.mode) {
         .read => .{
             .kind = .ephemeral_read,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
         .edit => .{
             .kind = .ephemeral_edit,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
         .owned, .take => boundaryFromTypeRef(parameter.ty),
     };

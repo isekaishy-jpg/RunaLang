@@ -1,9 +1,12 @@
 const std = @import("std");
+const ast = @import("../ast/root.zig");
+const attribute_support = @import("../attribute_support.zig");
 const const_ir = @import("const_ir.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const typed = @import("../typed/root.zig");
 const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
@@ -34,12 +37,20 @@ pub fn validateSignature(
     switch (checked.facts) {
         .function => |function| {
             for (function.parameters) |parameter| {
-                try validateTypeName(active, checked.module_id, parameter.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                try validateTypeName(active, checked.module_id, parameter.ty.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
-            try validateTypeName(active, checked.module_id, function.return_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            try validateTypeName(active, checked.module_id, function.return_type.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
-        .const_item => |const_item| try validateTypeName(active, checked.module_id, const_item.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary),
-        .type_alias => |type_alias| try validateTypeName(active, checked.module_id, type_alias.target_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary),
+        .const_item => |const_item| {
+            const type_name = try type_syntax_support.render(diagnostics.allocator, const_item.type_syntax);
+            defer diagnostics.allocator.free(type_name);
+            try validateTypeName(active, checked.module_id, type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+        },
+        .type_alias => |type_alias| {
+            const target_type_name = try type_syntax_support.render(diagnostics.allocator, type_alias.target_type_syntax);
+            defer diagnostics.allocator.free(target_type_name);
+            try validateTypeName(active, checked.module_id, target_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+        },
         .struct_type => |struct_type| for (struct_type.fields) |field| {
             try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
@@ -61,16 +72,18 @@ pub fn validateSignature(
             try validateEnumDiscriminants(active, checked, enum_type.variants, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .impl_block => |impl_block| {
-            try validateTypeName(active, checked.module_id, impl_block.target_type, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            try validateTypeName(active, checked.module_id, impl_block.target_type.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             for (impl_block.associated_types) |binding| {
-                try validateTypeName(active, checked.module_id, binding.value_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                try validateTypeName(active, checked.module_id, binding.value_type.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
             for (impl_block.associated_consts) |binding| {
-                try validateTypeName(active, checked.module_id, binding.const_item.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                const const_type_name = try type_syntax_support.render(diagnostics.allocator, binding.const_item.type_syntax);
+                defer diagnostics.allocator.free(const_type_name);
+                try validateTypeName(active, checked.module_id, const_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
         },
         .trait_type => |trait_type| for (trait_type.associated_consts) |associated_const| {
-            try validateTypeName(active, checked.module_id, associated_const.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            try validateTypeName(active, checked.module_id, associated_const.type_ref.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .opaque_type, .none => {},
     }
@@ -80,9 +93,41 @@ pub fn validateSignature(
     return summary;
 }
 
+const ReprInteger = union(enum) {
+    builtin: types.Builtin,
+    c_alias: types.CAbiAlias,
+
+    fn isInteger(self: ReprInteger) bool {
+        return switch (self) {
+            .builtin => |builtin| builtin.isInteger(),
+            .c_alias => |alias| switch (alias) {
+                .c_void, .c_bool => false,
+                else => true,
+            },
+        };
+    }
+
+    fn stage0Builtin(self: ReprInteger) types.Builtin {
+        return switch (self) {
+            .builtin => |builtin| builtin,
+            .c_alias => |alias| switch (alias) {
+                .c_uint,
+                .c_ulong,
+                .c_ulong_long,
+                .c_ushort,
+                .c_unsigned_char,
+                => .u32,
+                .c_size => .index,
+                .c_void, .c_bool => .unsupported,
+                else => .i32,
+            },
+        };
+    }
+};
+
 const ReprEnum = struct {
     has_repr: bool = false,
-    int_type: types.Builtin = .unsupported,
+    int_type: ?ReprInteger = null,
 };
 
 fn validateEnumDiscriminants(
@@ -111,7 +156,18 @@ fn validateEnumDiscriminants(
         return;
     }
 
-    if (!repr.int_type.isInteger()) {
+    const repr_type = repr.int_type orelse {
+        summary.rejected_enum_discriminants += variants.len;
+        try diagnostics.add(
+            .@"error",
+            "type.enum.repr_int",
+            checked.item.span,
+            "C-layout enum '{s}' requires #repr[c, IntType] with an integer representation",
+            .{checked.item.name},
+        );
+        return;
+    };
+    if (!repr_type.isInteger()) {
         summary.rejected_enum_discriminants += variants.len;
         try diagnostics.add(
             .@"error",
@@ -156,7 +212,7 @@ fn validateEnumDiscriminants(
             try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, error.UnsupportedConstExpr);
             continue;
         };
-        const value = evalEnumDiscriminant(active, checked.module_id, site, repr.int_type, resolve_identifier, resolve_associated_const) catch |err| {
+        const value = evalEnumDiscriminant(active, checked.module_id, site, repr_type.stage0Builtin(), resolve_identifier, resolve_associated_const) catch |err| {
             summary.rejected_enum_discriminants += 1;
             try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, err);
             continue;
@@ -180,33 +236,24 @@ fn validateEnumDiscriminants(
     }
 }
 
-fn reprEnumInfo(active: *session.Session, attributes: []const @import("../ast/root.zig").Attribute) !ReprEnum {
-    for (attributes) |attribute| {
-        if (!std.mem.eql(u8, attribute.name, "repr")) continue;
-        var result = ReprEnum{ .has_repr = true };
-        const open_index = std.mem.indexOfScalar(u8, attribute.raw, '[') orelse return result;
-        const close_index = std.mem.lastIndexOfScalar(u8, attribute.raw, ']') orelse return result;
-        if (close_index <= open_index) return result;
+fn reprEnumInfo(active: *session.Session, attributes: []const ast.Attribute) !ReprEnum {
+    _ = active;
+    const repr = attribute_support.reprInfoForTarget(attributes, .enum_type);
+    if (!repr.has_c and repr.integer_type_name == null) return .{};
 
-        const parts = try splitTopLevelCommaParts(active.allocator, attribute.raw[open_index + 1 .. close_index]);
-        defer active.allocator.free(parts);
-        var saw_c = false;
-        for (parts) |part| {
-            const trimmed = std.mem.trim(u8, part, " \t\r\n");
-            if (std.mem.eql(u8, trimmed, "c")) {
-                saw_c = true;
-                continue;
-            }
-            const builtin = types.Builtin.fromName(trimmed);
-            if (builtin.isInteger()) {
-                result.int_type = builtin;
-                continue;
-            }
+    var result = ReprEnum{ .has_repr = true };
+    if (!repr.has_c) return result;
+    if (repr.integer_type_name) |name| {
+        const builtin = types.Builtin.fromName(name);
+        if (builtin.isInteger()) {
+            result.int_type = .{ .builtin = builtin };
+            return result;
         }
-        if (!saw_c) result.int_type = .unsupported;
-        return result;
+        if (types.CAbiAlias.fromName(name)) |alias| {
+            result.int_type = .{ .c_alias = alias };
+        }
     }
-    return .{};
+    return result;
 }
 
 fn evalEnumDiscriminant(

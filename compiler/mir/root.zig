@@ -34,7 +34,7 @@ pub const ImportedBinding = struct {
 
     pub fn deinit(self: ImportedBinding, allocator: Allocator) void {
         if (self.function_generic_params.len != 0) allocator.free(self.function_generic_params);
-        if (self.function_where_predicates.len != 0) allocator.free(self.function_where_predicates);
+        typed.deinitWherePredicates(allocator, self.function_where_predicates);
         if (self.function_parameter_types) |value| allocator.free(value);
         if (self.function_parameter_type_names) |value| allocator.free(value);
         if (self.function_parameter_modes) |value| allocator.free(value);
@@ -550,7 +550,7 @@ fn lowerModuleWithFacts(
             .const_type = binding.const_type,
             .function_return_type = binding.function_return_type,
             .function_generic_params = if (binding.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, binding.function_generic_params) else &.{},
-            .function_where_predicates = if (binding.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, binding.function_where_predicates) else &.{},
+            .function_where_predicates = if (binding.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, binding.function_where_predicates) else &.{},
             .function_is_suspend = binding.function_is_suspend,
             .function_parameter_types = if (binding.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
             .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
@@ -709,7 +709,7 @@ pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Modul
                 .const_type = binding.const_type,
                 .function_return_type = binding.function_return_type,
                 .function_generic_params = if (binding.function_generic_params.len != 0) try allocator.dupe(typed.GenericParam, binding.function_generic_params) else &.{},
-                .function_where_predicates = if (binding.function_where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, binding.function_where_predicates) else &.{},
+                .function_where_predicates = if (binding.function_where_predicates.len != 0) try typed.cloneWherePredicates(allocator, binding.function_where_predicates) else &.{},
                 .function_is_suspend = binding.function_is_suspend,
                 .function_parameter_types = if (binding.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
                 .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
@@ -1330,7 +1330,7 @@ fn duplicateImportedTraitMethods(allocator: Allocator, methods: []typed.TraitMet
             .is_suspend = method.is_suspend,
             .has_default_body = method.has_default_body,
             .generic_params = if (method.generic_params.len != 0) try allocator.dupe(typed.GenericParam, method.generic_params) else &.{},
-            .where_predicates = if (method.where_predicates.len != 0) try allocator.dupe(typed.WherePredicate, method.where_predicates) else &.{},
+            .where_predicates = if (method.where_predicates.len != 0) try typed.cloneWherePredicates(allocator, method.where_predicates) else &.{},
             .syntax = if (method.syntax) |syntax| try syntax.clone(allocator) else null,
         };
     }

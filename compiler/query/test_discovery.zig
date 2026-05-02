@@ -1,8 +1,8 @@
 const std = @import("std");
+const attribute_support = @import("../attribute_support.zig");
 const query_types = @import("types.zig");
 const standard_families = @import("standard_families.zig");
 const session = @import("../session/root.zig");
-const typed_attributes = @import("attributes.zig");
 const types = @import("../types/root.zig");
 
 const Allocator = std.mem.Allocator;
@@ -27,7 +27,7 @@ pub fn discoverPackageTests(
         if (package_name.len == 0) package_name = module_pipeline.package_name;
 
         const item = active.item(.{ .index = item_index });
-        if (!typed_attributes.hasAttribute(item.attributes, "test")) continue;
+        if (!attribute_support.hasBareAttribute(item.attributes, "test")) continue;
         const checked = try checked_signature(active, .{ .index = item_index });
         const function = switch (checked.facts) {
             .function => |function| function,

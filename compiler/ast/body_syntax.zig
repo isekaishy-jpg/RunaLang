@@ -4,6 +4,7 @@ const source = @import("../source/root.zig");
 const Allocator = std.mem.Allocator;
 
 pub const SpanText = item_syntax.SpanText;
+pub const TypeSyntax = item_syntax.TypeSyntax;
 
 pub const AssignOp = enum {
     add,
@@ -288,7 +289,7 @@ pub const Statement = union(enum) {
 
     pub const BindingDecl = struct {
         name: SpanText,
-        declared_type: ?SpanText = null,
+        declared_type: ?TypeSyntax = null,
         expr: *Expr,
     };
 
@@ -444,12 +445,12 @@ pub const Statement = union(enum) {
             .placeholder => |value| .{ .placeholder = value },
             .let_decl => |binding| .{ .let_decl = .{
                 .name = binding.name,
-                .declared_type = binding.declared_type,
+                .declared_type = if (binding.declared_type) |declared_type| try declared_type.clone(allocator) else null,
                 .expr = try binding.expr.clone(allocator),
             } },
             .const_decl => |binding| .{ .const_decl = .{
                 .name = binding.name,
-                .declared_type = binding.declared_type,
+                .declared_type = if (binding.declared_type) |declared_type| try declared_type.clone(allocator) else null,
                 .expr = try binding.expr.clone(allocator),
             } },
             .assign_stmt => |assign| .{ .assign_stmt = .{
@@ -485,8 +486,14 @@ pub const Statement = union(enum) {
 
     pub fn deinit(self: *Statement, allocator: Allocator) void {
         switch (self.*) {
-            .let_decl => |binding| destroyExpr(allocator, binding.expr),
-            .const_decl => |binding| destroyExpr(allocator, binding.expr),
+            .let_decl => |*binding| {
+                if (binding.declared_type) |*declared_type| declared_type.deinit(allocator);
+                destroyExpr(allocator, binding.expr);
+            },
+            .const_decl => |*binding| {
+                if (binding.declared_type) |*declared_type| declared_type.deinit(allocator);
+                destroyExpr(allocator, binding.expr);
+            },
             .assign_stmt => |assign| {
                 destroyExpr(allocator, assign.target);
                 destroyExpr(allocator, assign.expr);

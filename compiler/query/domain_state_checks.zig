@@ -79,7 +79,7 @@ pub fn validateSignature(
     };
 
     for (function.parameters) |parameter| {
-        if (classifyTypeName(active, checked.module_id, parameter.type_name)) |domain_ref| {
+        if (classifyTypeName(active, checked.module_id, parameter.ty.displayName())) |domain_ref| {
             try diagnostics.add(
                 .@"error",
                 "type.domain_state.boundary_param",
@@ -88,13 +88,13 @@ pub fn validateSignature(
                 .{
                     item.name,
                     kindLabel(domain_ref.kind),
-                    baseTypeName(parseBoundaryType(parameter.type_name).inner_type_name),
+                    baseTypeName(parseBoundaryType(parameter.ty.displayName()).inner_type_name),
                 },
             );
         }
     }
 
-    if (classifyTypeName(active, checked.module_id, function.return_type_name)) |domain_ref| {
+    if (classifyTypeName(active, checked.module_id, function.return_type.displayName())) |domain_ref| {
         try diagnostics.add(
             .@"error",
             "type.domain_state.boundary_return",
@@ -103,7 +103,7 @@ pub fn validateSignature(
             .{
                 item.name,
                 kindLabel(domain_ref.kind),
-                baseTypeName(parseBoundaryType(function.return_type_name).inner_type_name),
+                baseTypeName(parseBoundaryType(function.return_type.displayName()).inner_type_name),
             },
         );
     }

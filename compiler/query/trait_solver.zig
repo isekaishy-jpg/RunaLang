@@ -1,4 +1,5 @@
 const std = @import("std");
+const ast = @import("../ast/root.zig");
 const callable_types = @import("callable_types.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
@@ -6,6 +7,7 @@ const raw_pointer = @import("../raw_pointer/root.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
 const boundary_checks = @import("boundary_checks.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const type_support = @import("type_support.zig");
 const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
@@ -166,24 +168,26 @@ pub fn associatedTypeEqualsKeyWithResolver(
     where_predicates: []const typed.WherePredicate,
     signature_resolver: SignatureResolver,
 ) !bool {
+    var arena = std.heap.ArenaAllocator.init(active.allocator);
+    defer arena.deinit();
     const self_type_name = keySelfTypeName(active, key);
     const projection = typed.ProjectionEqualityPredicate{
         .subject_name = std.mem.trim(u8, self_type_name, " \t"),
         .associated_name = std.mem.trim(u8, associated_name, " \t"),
-        .value_type_name = std.mem.trim(u8, value_type_name, " \t"),
+        .value_type_syntax = syntheticTypeSyntax(std.mem.trim(u8, value_type_name, " \t")),
     };
-    if (whereEnvironmentHasProjection(where_predicates, projection)) return true;
+    if (try whereEnvironmentHasProjection(arena.allocator(), where_predicates, projection)) return true;
     _ = try findOrCreateGoal(active, key, where_predicates);
 
     const impl_signature = (try findSelectedImplSignature(active, key, signature_resolver)) orelse return false;
-    var arena = std.heap.ArenaAllocator.init(active.allocator);
-    defer arena.deinit();
     var substitutions = std.array_list.Managed(TypeSubstitution).init(arena.allocator());
     try collectTypeSubstitutions(arena.allocator(), impl_signature, self_type_name, &substitutions);
     for (impl_signature.associated_types) |binding| {
         if (!std.mem.eql(u8, binding.name, projection.associated_name)) continue;
-        const substituted = try substituteTypeName(arena.allocator(), binding.value_type_name, substitutions.items);
-        return typeNamesEqual(substituted, projection.value_type_name);
+        const binding_value_type_name = try type_syntax_support.render(arena.allocator(), binding.value_type_syntax);
+        const substituted = try substituteTypeName(arena.allocator(), binding_value_type_name, substitutions.items);
+        const projection_value_type_name = try projectionValueTypeName(arena.allocator(), projection);
+        return typeNamesEqual(substituted, projection_value_type_name);
     }
     return false;
 }
@@ -206,7 +210,7 @@ pub fn validateImplContractsWithResolver(
             .impl_block => |impl_signature| impl_signature,
             else => continue,
         };
-        const trait_name = impl_signature.trait_name orelse {
+        const trait_type = impl_signature.trait_type orelse {
             if (impl_signature.associated_types.len != 0) {
                 try diagnostics.add(
                     .@"error",
@@ -218,9 +222,9 @@ pub fn validateImplContractsWithResolver(
             }
             continue;
         };
-        if (std.mem.eql(u8, baseTypeName(trait_name), "Send")) continue;
+        if (std.mem.eql(u8, baseTypeName(trait_type.displayName()), "Send")) continue;
 
-        const trait_signature = (try traitSignatureByName(active, checked.module_id, trait_name, signature_resolver)) orelse continue;
+        const trait_signature = (try traitSignatureByName(active, checked.module_id, trait_type.displayName(), signature_resolver)) orelse continue;
         for (impl_signature.associated_types) |binding| {
             if (!traitHasAssociatedType(trait_signature, binding.name)) {
                 try diagnostics.add(
@@ -228,7 +232,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_unknown",
                     checked.item.span,
                     "trait '{s}' has no associated type '{s}'",
-                    .{ baseTypeName(trait_name), binding.name },
+                    .{ baseTypeName(trait_type.displayName()), binding.name },
                 );
             }
         }
@@ -239,7 +243,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_const_unknown",
                     checked.item.span,
                     "trait '{s}' has no associated const '{s}'",
-                    .{ baseTypeName(trait_name), binding.name },
+                    .{ baseTypeName(trait_type.displayName()), binding.name },
                 );
             }
         }
@@ -250,7 +254,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_missing",
                     checked.item.span,
                     "trait impl for '{s}' is missing associated type '{s}'",
-                    .{ impl_signature.target_type, required.name },
+                    .{ impl_signature.target_type.displayName(), required.name },
                 );
             }
         }
@@ -261,7 +265,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_const_missing",
                     checked.item.span,
                     "trait impl for '{s}' is missing associated const '{s}'",
-                    .{ impl_signature.target_type, required.name },
+                    .{ impl_signature.target_type.displayName(), required.name },
                 );
             }
         }
@@ -269,8 +273,8 @@ pub fn validateImplContractsWithResolver(
         _ = satisfiesTraitWithResolver(
             active,
             checked.module_id,
-            impl_signature.target_type,
-            trait_name,
+            impl_signature.target_type.displayName(),
+            trait_type.displayName(),
             impl_signature.where_predicates,
             signature_resolver,
         ) catch |err| switch (err) {
@@ -377,11 +381,11 @@ fn implIndex(
             .impl_block => |impl_signature| impl_signature,
             else => continue,
         };
-        const impl_trait_name = impl_signature.trait_name orelse continue;
+        const impl_trait = impl_signature.trait_type orelse continue;
         try entries.append(.{
             .module_id = checked.module_id,
-            .trait_head = try canonicalTraitHead(active, checked.module_id, impl_trait_name),
-            .self_head = try canonicalTypeHead(active, checked.module_id, impl_signature.target_type, impl_signature.where_predicates),
+            .trait_head = try canonicalTraitHead(active, checked.module_id, impl_trait.displayName()),
+            .self_head = try canonicalTypeHead(active, checked.module_id, impl_signature.target_type.displayName(), impl_signature.where_predicates),
             .impl_id = .{ .index = index },
         });
     }
@@ -470,8 +474,8 @@ fn findSelectedImplSignatureAt(
         .impl_block => |impl_signature| impl_signature,
         else => return null,
     };
-    const impl_trait_name = impl_signature.trait_name orelse return null;
-    if (!traitHeadsEqual(try canonicalTraitHead(active, checked.module_id, impl_trait_name), key.trait_head)) return null;
+    const impl_trait = impl_signature.trait_type orelse return null;
+    if (!traitHeadsEqual(try canonicalTraitHead(active, checked.module_id, impl_trait.displayName()), key.trait_head)) return null;
     if (!try implTargetMatchesGoal(active, checked.module_id, impl_signature, key)) return null;
     if (!implWherePredicatesSatisfied(active, checked.module_id, impl_signature, key, signature_resolver)) return null;
     return impl_signature;
@@ -497,7 +501,7 @@ fn implTargetMatchesGoal(
     impl_signature: query_types.ImplSignature,
     key: query_types.TraitGoalKey,
 ) !bool {
-    const impl_self_head = try canonicalTypeHead(active, module_id, impl_signature.target_type, impl_signature.where_predicates);
+    const impl_self_head = try canonicalTypeHead(active, module_id, impl_signature.target_type.displayName(), impl_signature.where_predicates);
     if (!typeHeadsEqual(impl_self_head, key.self_head) and implTargetGenericName(impl_signature) == null) return false;
 
     var arena = std.heap.ArenaAllocator.init(active.allocator);
@@ -505,7 +509,7 @@ fn implTargetMatchesGoal(
     var substitutions = std.array_list.Managed(TypeSubstitution).init(arena.allocator());
     return matchTypePattern(
         arena.allocator(),
-        impl_signature.target_type,
+        impl_signature.target_type.displayName(),
         keySelfTypeName(active, key),
         impl_signature.generic_params,
         &substitutions,
@@ -548,12 +552,13 @@ fn implWherePredicatesSatisfied(
                 if (!result.satisfied) return false;
             },
             .projection_equality => |projection| {
+                const projection_value_type_name = projectionValueTypeName(arena.allocator(), projection) catch return false;
                 const substituted = typed.ProjectionEqualityPredicate{
                     .subject_name = substituteTypeName(arena.allocator(), projection.subject_name, substitutions.items) catch return false,
                     .associated_name = projection.associated_name,
-                    .value_type_name = substituteTypeName(arena.allocator(), projection.value_type_name, substitutions.items) catch return false,
+                    .value_type_syntax = syntheticTypeSyntax(substituteTypeName(arena.allocator(), projection_value_type_name, substitutions.items) catch return false),
                 };
-                if (!whereEnvironmentHasProjection(caller_predicates, substituted)) return false;
+                if (!(whereEnvironmentHasProjection(arena.allocator(), caller_predicates, substituted) catch return false)) return false;
             },
             .lifetime_outlives, .type_outlives => {},
         }
@@ -562,7 +567,7 @@ fn implWherePredicatesSatisfied(
 }
 
 fn implTargetGenericName(impl_signature: query_types.ImplSignature) ?[]const u8 {
-    const target = baseTypeName(impl_signature.target_type);
+    const target = baseTypeName(impl_signature.target_type.displayName());
     if (target.len == 0) return null;
     for (impl_signature.generic_params) |param| {
         if (param.kind != .type_param) continue;
@@ -584,7 +589,7 @@ fn collectTypeSubstitutions(
 ) !void {
     _ = try matchTypePattern(
         allocator,
-        impl_signature.target_type,
+        impl_signature.target_type.displayName(),
         concrete_self,
         impl_signature.generic_params,
         substitutions,
@@ -803,7 +808,7 @@ fn solveBuiltinSendInner(
             }
             break :blk true;
         },
-        .type_alias => |alias| solveBuiltinSendInner(active, checked.module_id, alias.target_type_name, visiting, signature_resolver),
+        .type_alias => |alias| solveBuiltinSendInner(active, checked.module_id, alias.target_type.displayName(), visiting, signature_resolver),
         .opaque_type, .union_type, .function, .const_item, .trait_type, .impl_block, .none => false,
     };
 }
@@ -881,7 +886,7 @@ fn solveBuiltinEqHashInner(
     const item_id = resolveItemByName(active, module_id, base_name) orelse return false;
     const checked = signature_resolver(active, item_id) catch return false;
     return switch (checked.facts) {
-        .type_alias => |alias| solveBuiltinEqHashInner(active, checked.module_id, alias.target_type_name, contract, visiting, signature_resolver),
+        .type_alias => |alias| solveBuiltinEqHashInner(active, checked.module_id, alias.target_type.displayName(), contract, visiting, signature_resolver),
         else => false,
     };
 }
@@ -969,15 +974,19 @@ fn canonicalWhereEnvironment(active: *session.Session, predicates: []const typed
                 "B:{s}:{s}",
                 .{ std.mem.trim(u8, bound.subject_name, " \t"), baseTypeName(bound.contract_name) },
             ),
-            .projection_equality => |projection| try std.fmt.allocPrint(
-                active.allocator,
-                "P:{s}.{s}={s}",
-                .{
-                    std.mem.trim(u8, projection.subject_name, " \t"),
-                    std.mem.trim(u8, projection.associated_name, " \t"),
-                    std.mem.trim(u8, projection.value_type_name, " \t"),
-                },
-            ),
+            .projection_equality => |projection| blk: {
+                const projection_value_type_name = try projectionValueTypeName(active.allocator, projection);
+                defer active.allocator.free(projection_value_type_name);
+                break :blk try std.fmt.allocPrint(
+                    active.allocator,
+                    "P:{s}.{s}={s}",
+                    .{
+                        std.mem.trim(u8, projection.subject_name, " \t"),
+                        std.mem.trim(u8, projection.associated_name, " \t"),
+                        std.mem.trim(u8, projection_value_type_name, " \t"),
+                    },
+                );
+            },
             .lifetime_outlives => |outlives| try std.fmt.allocPrint(
                 active.allocator,
                 "L:{s}:{s}",
@@ -1229,18 +1238,39 @@ fn whereEnvironmentHasBound(predicates: []const typed.WherePredicate, subject_na
     return false;
 }
 
-fn whereEnvironmentHasProjection(predicates: []const typed.WherePredicate, projection: typed.ProjectionEqualityPredicate) bool {
+fn whereEnvironmentHasProjection(
+    allocator: std.mem.Allocator,
+    predicates: []const typed.WherePredicate,
+    projection: typed.ProjectionEqualityPredicate,
+) !bool {
+    const projection_value_type_name = try projectionValueTypeName(allocator, projection);
+    defer allocator.free(projection_value_type_name);
     for (predicates) |predicate| {
         switch (predicate) {
             .projection_equality => |existing| {
+                const existing_value_type_name = try projectionValueTypeName(allocator, existing);
+                defer allocator.free(existing_value_type_name);
                 if (std.mem.eql(u8, existing.subject_name, projection.subject_name) and
                     std.mem.eql(u8, existing.associated_name, projection.associated_name) and
-                    std.mem.eql(u8, existing.value_type_name, projection.value_type_name)) return true;
+                    typeNamesEqual(existing_value_type_name, projection_value_type_name)) return true;
             },
             else => {},
         }
     }
     return false;
+}
+
+fn projectionValueTypeName(allocator: std.mem.Allocator, projection: typed.ProjectionEqualityPredicate) ![]const u8 {
+    return type_syntax_support.render(allocator, projection.value_type_syntax);
+}
+
+fn syntheticTypeSyntax(raw: []const u8) ast.TypeSyntax {
+    return .{
+        .source = .{
+            .text = raw,
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+        },
+    };
 }
 
 fn goalKeysEqual(lhs: query_types.TraitGoalKey, rhs: query_types.TraitGoalKey) bool {

@@ -493,23 +493,23 @@ fn classifyLoopCondition(condition: ?*const typed.Expr) LoopCondition {
 }
 
 fn boundaryFromParameter(parameter: typed.Parameter) BoundaryType {
-    const retained = boundaryFromRawType(parameter.type_name);
+    const retained = boundaryFromRawType(parameter.ty.displayName());
     if (retained.kind == .retained) return retained;
 
     return switch (parameter.mode) {
         .read => .{
             .kind = .ephemeral,
             .access = .read,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
         .edit => .{
             .kind = .ephemeral,
             .access = .edit,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
         .owned, .take => .{
             .kind = .value,
-            .inner_type_name = parameter.type_name,
+            .inner_type_name = parameter.ty.displayName(),
         },
     };
 }

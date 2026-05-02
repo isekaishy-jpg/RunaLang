@@ -123,10 +123,15 @@ pub const Session = struct {
 };
 
 pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
+    var owned_pipeline = pipeline;
+    const had_interner = owned_pipeline.interner != null;
     var active = Session{
         .allocator = allocator,
-        .interner = intern.Interner.init(allocator),
-        .pipeline = pipeline,
+        .interner = if (owned_pipeline.interner) |existing| blk: {
+            owned_pipeline.interner = null;
+            break :blk existing;
+        } else intern.Interner.init(allocator),
+        .pipeline = owned_pipeline,
         .semantic_index = undefined,
         .caches = undefined,
         .active_queries = std.array_list.Managed(ActiveQuery).init(allocator),
@@ -135,10 +140,12 @@ pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
     errdefer active.pipeline.deinit();
     errdefer active.interner.deinit();
 
-    for (active.pipeline.modules.items) |module| {
-        for (module.resolved.symbols.items) |symbol| {
-            if (symbol.name.len == 0) continue;
-            _ = try active.interner.intern(symbol.name);
+    if (!had_interner) {
+        for (active.pipeline.modules.items) |module| {
+            for (module.resolved.symbols.items) |symbol| {
+                if (symbol.name.len == 0) continue;
+                _ = try active.interner.intern(symbol.name);
+            }
         }
     }
 
@@ -152,11 +159,11 @@ pub fn fromPipeline(allocator: Allocator, pipeline: driver.Pipeline) !Session {
 }
 
 pub fn intoPipeline(self: *Session) driver.Pipeline {
-    const pipeline = self.pipeline;
+    var pipeline = self.pipeline;
+    pipeline.interner = self.interner;
     self.active_queries.deinit();
     self.caches.deinit(self.allocator);
     self.semantic_index.deinit();
-    self.interner.deinit();
     self.* = undefined;
     return pipeline;
 }

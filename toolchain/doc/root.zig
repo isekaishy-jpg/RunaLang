@@ -120,7 +120,7 @@ fn appendParsedItems(
                     if (field.name == null or field.ty == null) continue;
                     const field_line = try std.fmt.allocPrint(allocator, "  - field `{s}`: `{s}`\n", .{
                         field.name.?.text,
-                        field.ty.?.text,
+                        field.ty.?.text(),
                     });
                     defer allocator.free(field_line);
                     try out.appendSlice(field_line);
@@ -131,7 +131,7 @@ fn appendParsedItems(
                     if (field.name == null or field.ty == null) continue;
                     const field_line = try std.fmt.allocPrint(allocator, "  - union field `{s}`: `{s}`\n", .{
                         field.name.?.text,
-                        field.ty.?.text,
+                        field.ty.?.text(),
                     });
                     defer allocator.free(field_line);
                     try out.appendSlice(field_line);
@@ -141,9 +141,11 @@ fn appendParsedItems(
                 for (variants) |variant| {
                     const name = if (variant.name) |value| value.text else continue;
                     if (variant.tuple_payload) |tuple_payload| {
+                        const payload_text = try renderTuplePayload(allocator, tuple_payload);
+                        defer allocator.free(payload_text);
                         const variant_line = try std.fmt.allocPrint(allocator, "  - variant `{s}{s}`\n", .{
                             name,
-                            tuple_payload.text,
+                            payload_text,
                         });
                         defer allocator.free(variant_line);
                         try out.appendSlice(variant_line);
@@ -156,7 +158,7 @@ fn appendParsedItems(
                         if (field.name == null or field.ty == null) continue;
                         const field_line = try std.fmt.allocPrint(allocator, "    - field `{s}`: `{s}`\n", .{
                             field.name.?.text,
-                            field.ty.?.text,
+                            field.ty.?.text(),
                         });
                         defer allocator.free(field_line);
                         try out.appendSlice(field_line);
@@ -186,12 +188,12 @@ fn appendParsedItems(
                     .impl_block => |signature| {
                         const header_line = if (signature.trait_name) |trait_name|
                             try std.fmt.allocPrint(allocator, "  - impl `{s}` for `{s}`\n", .{
-                                trait_name.text,
-                                if (signature.target_type) |target_type| target_type.text else "",
+                                trait_name.text(),
+                                if (signature.target_type) |target_type| target_type.text() else "",
                             })
                         else
                             try std.fmt.allocPrint(allocator, "  - inherent impl for `{s}`\n", .{
-                                if (signature.target_type) |target_type| target_type.text else "",
+                                if (signature.target_type) |target_type| target_type.text() else "",
                             });
                         defer allocator.free(header_line);
                         try out.appendSlice(header_line);
@@ -212,4 +214,17 @@ fn appendParsedItems(
             .none => {},
         }
     }
+}
+
+fn renderTuplePayload(allocator: Allocator, payload: compiler.ast.TuplePayloadSyntax) ![]const u8 {
+    var out = array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.append('(');
+    for (payload.types, 0..) |field_type, index| {
+        if (index != 0) try out.appendSlice(", ");
+        try out.appendSlice(field_type.text());
+    }
+    try out.append(')');
+    return out.toOwnedSlice();
 }

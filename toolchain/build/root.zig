@@ -180,163 +180,165 @@ pub fn buildAtPathWithOptions(
         metadata_docs.deinit();
     }
 
-    var pipeline = blk: {
-        var active = try compiler.semantic.openGraph(allocator, io, compiler_graph.graph);
-        errdefer active.deinit();
-        if (!active.pipeline.diagnostics.hasErrors()) {
-            for (loaded_workspace.products.items, 0..) |product, product_index| {
-                var packaged_metadata = try compiler.metadata.collectPackagedMetadataFromSession(
-                    allocator,
-                    &active,
-                    loaded_workspace.manifest.name.?,
-                    loaded_workspace.manifest.version.?,
-                    product.name,
-                    @tagName(product.kind),
-                    product_index,
-                );
-                defer packaged_metadata.deinit(allocator);
-                try metadata_docs.append(try compiler.metadata.renderDocument(allocator, &packaged_metadata));
-            }
+    var active = try compiler.semantic.openGraph(allocator, io, compiler_graph.graph);
+    errdefer active.deinit();
+
+    if (!active.pipeline.diagnostics.hasErrors()) {
+        for (loaded_workspace.products.items, 0..) |product, product_index| {
+            var packaged_metadata = try compiler.metadata.collectPackagedMetadataFromSession(
+                allocator,
+                &active,
+                loaded_workspace.manifest.name.?,
+                loaded_workspace.manifest.version.?,
+                product.name,
+                @tagName(product.kind),
+                product_index,
+            );
+            defer packaged_metadata.deinit(allocator);
+            try metadata_docs.append(try compiler.metadata.renderDocument(allocator, &packaged_metadata));
         }
-        break :blk compiler.session.intoPipeline(&active);
-    };
+    }
+
+    var artifacts = array_list.Managed(BuildArtifact).init(allocator);
+    errdefer {
+        for (artifacts.items) |artifact| artifact.deinit(allocator);
+        artifacts.deinit();
+    }
+
+    if (!compiler.target.hostStage0Supported()) {
+        try active.pipeline.diagnostics.add(.@"error", "build.target.unsupported", null, "stage0 build is only implemented for Windows hosts; current host is '{s}'", .{
+            compiler.target.hostName(),
+        });
+    }
+
+    if (!active.pipeline.diagnostics.hasErrors()) {
+        const package_name = loaded_workspace.manifest.name.?;
+
+        for (loaded_workspace.products.items, 0..) |product, index| {
+            if (product.kind == .lib) continue;
+
+            const product_dir = try std.fs.path.join(allocator, &.{
+                root_dir,
+                "target",
+                compiler.target.hostName(),
+                "debug",
+                package_name,
+                product.name,
+            });
+            defer allocator.free(product_dir);
+            try ensureDirPath(io, product_dir);
+
+            const c_name = try std.fmt.allocPrint(allocator, "{s}.c", .{product.name});
+            defer allocator.free(c_name);
+            const c_path = try std.fs.path.join(allocator, &.{ product_dir, c_name });
+
+            const out_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{
+                product.name,
+                switch (product.kind) {
+                    .bin => compiler.target.hostExecutableExtension(),
+                    .cdylib => compiler.target.hostDynamicLibraryExtension(),
+                    .lib => unreachable,
+                },
+            });
+            defer allocator.free(out_name);
+            const out_path = try std.fs.path.join(allocator, &.{ product_dir, out_name });
+
+            const metadata_name = try std.fmt.allocPrint(allocator, "{s}.runa.meta", .{product.name});
+            defer allocator.free(metadata_name);
+            const metadata_path = try std.fs.path.join(allocator, &.{ product_dir, metadata_name });
+            var keep_paths = false;
+            defer if (!keep_paths) {
+                allocator.free(c_path);
+                allocator.free(out_path);
+                allocator.free(metadata_path);
+            };
+
+            var root_modules = array_list.Managed(*const compiler.backend_contract.LoweredModule).init(allocator);
+            defer root_modules.deinit();
+            for (active.pipeline.modules.items) |*module_pipeline| {
+                if (module_pipeline.root_index != index) continue;
+                if (module_pipeline.backend_contract) |*lowered| try root_modules.append(lowered);
+            }
+            if (root_modules.items.len == 0) {
+                try active.pipeline.diagnostics.add(.@"error", "build.module.missing", null, "no lowered backend modules found for product '{s}'", .{product.name});
+                continue;
+            }
+
+            var lowered_module = try compiler.backend_contract.mergeLoweredModules(allocator, .{
+                .module_id = .{ .index = 0 },
+                .target_name = compiler.target.hostName(),
+                .output_kind = switch (product.kind) {
+                    .bin => .bin,
+                    .cdylib => .cdylib,
+                    .lib => unreachable,
+                },
+            }, root_modules.items);
+            defer compiler.backend_contract.deinitLoweredModule(allocator, &lowered_module);
+
+            const c_source = compiler.codegen.emitCModule(
+                allocator,
+                product.name,
+                &lowered_module,
+                switch (product.kind) {
+                    .bin => .bin,
+                    .cdylib => .cdylib,
+                    .lib => unreachable,
+                },
+                &active.pipeline.diagnostics,
+            ) catch {
+                continue;
+            };
+            defer allocator.free(c_source);
+            try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = c_path,
+                .data = c_source,
+            });
+
+            compiler.link.linkGeneratedC(
+                allocator,
+                io,
+                c_path,
+                out_path,
+                switch (product.kind) {
+                    .bin => .bin,
+                    .cdylib => .cdylib,
+                    .lib => unreachable,
+                },
+                &active.pipeline.diagnostics,
+            ) catch {
+                continue;
+            };
+
+            const metadata_doc = metadata_docs.items[index];
+            try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = metadata_path,
+                .data = metadata_doc,
+            });
+
+            try artifacts.append(.{
+                .kind = product.kind,
+                .name = try allocator.dupe(u8, product.name),
+                .path = out_path,
+                .c_path = c_path,
+                .metadata_path = metadata_path,
+            });
+            keep_paths = true;
+        }
+    }
+
+    if (!active.pipeline.diagnostics.hasErrors()) {
+        try workspace.writeLockfile(allocator, io, &loaded_workspace);
+    }
+
+    var pipeline = compiler.session.intoPipeline(&active);
     errdefer pipeline.deinit();
 
-    var result = BuildResult{
+    return .{
         .allocator = allocator,
         .workspace = loaded_workspace,
         .pipeline = pipeline,
-        .artifacts = array_list.Managed(BuildArtifact).init(allocator),
+        .artifacts = artifacts,
     };
-    errdefer result.deinit();
-
-    if (!compiler.target.hostStage0Supported()) {
-        try result.pipeline.diagnostics.add(.@"error", "build.target.unsupported", null, "stage0 build is only implemented for Windows hosts; current host is '{s}'", .{
-            compiler.target.hostName(),
-        });
-        return result;
-    }
-
-    if (result.pipeline.diagnostics.hasErrors()) return result;
-
-    const package_name = result.workspace.manifest.name.?;
-
-    for (result.workspace.products.items, 0..) |product, index| {
-        if (product.kind == .lib) continue;
-
-        const product_dir = try std.fs.path.join(allocator, &.{
-            root_dir,
-            "target",
-            compiler.target.hostName(),
-            "debug",
-            package_name,
-            product.name,
-        });
-        defer allocator.free(product_dir);
-        try ensureDirPath(io, product_dir);
-
-        const c_name = try std.fmt.allocPrint(allocator, "{s}.c", .{product.name});
-        defer allocator.free(c_name);
-        const c_path = try std.fs.path.join(allocator, &.{ product_dir, c_name });
-
-        const out_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{
-            product.name,
-            switch (product.kind) {
-                .bin => compiler.target.hostExecutableExtension(),
-                .cdylib => compiler.target.hostDynamicLibraryExtension(),
-                .lib => unreachable,
-            },
-        });
-        defer allocator.free(out_name);
-        const out_path = try std.fs.path.join(allocator, &.{ product_dir, out_name });
-
-        const metadata_name = try std.fmt.allocPrint(allocator, "{s}.runa.meta", .{product.name});
-        defer allocator.free(metadata_name);
-        const metadata_path = try std.fs.path.join(allocator, &.{ product_dir, metadata_name });
-        var keep_paths = false;
-        defer if (!keep_paths) {
-            allocator.free(c_path);
-            allocator.free(out_path);
-            allocator.free(metadata_path);
-        };
-
-        var root_modules = array_list.Managed(*const compiler.backend_contract.LoweredModule).init(allocator);
-        defer root_modules.deinit();
-        for (result.pipeline.modules.items) |*module_pipeline| {
-            if (module_pipeline.root_index != index) continue;
-            if (module_pipeline.backend_contract) |*lowered| try root_modules.append(lowered);
-        }
-        if (root_modules.items.len == 0) {
-            try result.pipeline.diagnostics.add(.@"error", "build.module.missing", null, "no lowered backend modules found for product '{s}'", .{product.name});
-            continue;
-        }
-
-        var lowered_module = try compiler.backend_contract.mergeLoweredModules(allocator, .{
-            .module_id = .{ .index = 0 },
-            .target_name = compiler.target.hostName(),
-            .output_kind = switch (product.kind) {
-                .bin => .bin,
-                .cdylib => .cdylib,
-                .lib => unreachable,
-            },
-        }, root_modules.items);
-        defer compiler.backend_contract.deinitLoweredModule(allocator, &lowered_module);
-
-        const c_source = compiler.codegen.emitCModule(
-            allocator,
-            product.name,
-            &lowered_module,
-            switch (product.kind) {
-                .bin => .bin,
-                .cdylib => .cdylib,
-                .lib => unreachable,
-            },
-            &result.pipeline.diagnostics,
-        ) catch {
-            continue;
-        };
-        defer allocator.free(c_source);
-        try std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = c_path,
-            .data = c_source,
-        });
-
-        compiler.link.linkGeneratedC(
-            allocator,
-            io,
-            c_path,
-            out_path,
-            switch (product.kind) {
-                .bin => .bin,
-                .cdylib => .cdylib,
-                .lib => unreachable,
-            },
-            &result.pipeline.diagnostics,
-        ) catch {
-            continue;
-        };
-
-        const metadata_doc = metadata_docs.items[index];
-        try std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = metadata_path,
-            .data = metadata_doc,
-        });
-
-        try result.artifacts.append(.{
-            .kind = product.kind,
-            .name = try allocator.dupe(u8, product.name),
-            .path = out_path,
-            .c_path = c_path,
-            .metadata_path = metadata_path,
-        });
-        keep_paths = true;
-    }
-
-    if (!result.pipeline.diagnostics.hasErrors()) {
-        try workspace.writeLockfile(allocator, io, &result.workspace);
-    }
-
-    return result;
 }
 
 fn resolveSelectedTarget(

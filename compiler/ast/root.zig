@@ -1,5 +1,6 @@
 const std = @import("std");
 const array_list = std.array_list;
+const attribute_syntax = @import("attribute_syntax.zig");
 const block_syntax = @import("block_syntax.zig");
 const body_syntax = @import("body_syntax.zig");
 const item_syntax = @import("item_syntax.zig");
@@ -9,14 +10,25 @@ const Allocator = std.mem.Allocator;
 pub const summary = "Parsed syntax tree with explicit ownership syntax.";
 
 pub const Visibility = item_syntax.Visibility;
-
-pub const Attribute = struct {
-    name: []const u8,
-    raw: []const u8,
-    span: source.Span,
-};
+pub const AttributeValue = attribute_syntax.Value;
+pub const AttributeArgument = attribute_syntax.Argument;
+pub const AttributeForm = attribute_syntax.Form;
+pub const Attribute = attribute_syntax.Attribute;
+pub const cloneAttributes = attribute_syntax.cloneAttributes;
+pub const deinitAttributes = attribute_syntax.deinitAttributes;
 
 pub const SpanText = item_syntax.SpanText;
+pub const BorrowAccess = item_syntax.BorrowAccess;
+pub const RawPointerAccess = item_syntax.RawPointerAccess;
+pub const TypeNode = item_syntax.TypeNode;
+pub const TypeSyntax = item_syntax.TypeSyntax;
+pub const ParameterModeSyntax = item_syntax.ParameterMode;
+pub const GenericParamSyntax = item_syntax.GenericParam;
+pub const GenericParamListSyntax = item_syntax.GenericParamList;
+pub const GenericParamKindSyntax = item_syntax.GenericParamKind;
+pub const GenericParamListInvalidKindSyntax = item_syntax.GenericParamListInvalidKind;
+pub const WherePredicateSyntax = item_syntax.WherePredicate;
+pub const WhereClauseSyntax = item_syntax.WhereClause;
 pub const BlockSyntax = block_syntax.Block;
 pub const LineSyntax = block_syntax.Line;
 pub const BodyBlockSyntax = body_syntax.Block;
@@ -33,6 +45,8 @@ pub const UseBindingSyntax = item_syntax.UseBinding;
 pub const ImplSignatureSyntax = item_syntax.ImplSignature;
 pub const ItemSyntax = item_syntax.ItemSyntax;
 pub const FieldDeclSyntax = item_syntax.FieldDecl;
+pub const TuplePayloadSyntax = item_syntax.TuplePayload;
+pub const TuplePayloadInvalidKindSyntax = item_syntax.TuplePayloadInvalidKind;
 pub const EnumVariantSyntax = item_syntax.EnumVariant;
 pub const AssociatedTypeDeclSyntax = item_syntax.AssociatedTypeDecl;
 pub const MethodDeclSyntax = item_syntax.MethodDecl;
@@ -78,7 +92,7 @@ pub const Item = struct {
             var owned_block_syntax = block_syntax_item;
             owned_block_syntax.deinit(allocator);
         }
-        allocator.free(self.attributes);
+        deinitAttributes(allocator, self.attributes);
         allocator.free(self.name);
         if (self.target_path) |value| allocator.free(value);
     }
@@ -97,8 +111,8 @@ pub const Item = struct {
         const name = try allocator.dupe(u8, self.name);
         errdefer allocator.free(name);
 
-        const attributes = try allocator.dupe(Attribute, self.attributes);
-        errdefer allocator.free(attributes);
+        const attributes = try cloneAttributes(allocator, self.attributes);
+        errdefer deinitAttributes(allocator, attributes);
 
         const target_path = if (self.target_path) |value|
             try allocator.dupe(u8, value)

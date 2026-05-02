@@ -6,6 +6,7 @@ const item_syntax_bridge = @import("item_syntax_bridge.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const signatures = @import("signatures.zig");
 const typed_text = @import("text.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const GenericParam = signatures.GenericParam;
@@ -21,7 +22,6 @@ const TraitAssociatedTypeBinding = typed_decls.TraitAssociatedTypeBinding;
 const TraitAssociatedConstBinding = typed_decls.TraitAssociatedConstBinding;
 const ParameterMode = typed_decls.ParameterMode;
 const isPlainIdentifier = typed_text.isPlainIdentifier;
-const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 
 pub const ParsedTraitBody = struct {
     methods: []TraitMethod,
@@ -32,6 +32,7 @@ pub const ParsedTraitBody = struct {
         for (self.methods) |*method| method.deinit(allocator);
         allocator.free(self.methods);
         allocator.free(self.associated_types);
+        for (self.associated_consts) |*associated_const| associated_const.deinit(allocator);
         allocator.free(self.associated_consts);
     }
 };
@@ -61,7 +62,7 @@ pub fn parseFieldsFromSyntax(
             try diagnostics.add(.@"error", "type.struct.field", span, "malformed field declaration '{s}'", .{name.text});
             continue;
         };
-        if (!isPlainIdentifier(name.text) or std.mem.trim(u8, ty.text, " \t").len == 0) {
+        if (!isPlainIdentifier(name.text) or std.mem.trim(u8, ty.text(), " \t").len == 0) {
             try diagnostics.add(.@"error", "type.struct.field", span, "malformed field declaration '{s}'", .{name.text});
             continue;
         }
@@ -84,7 +85,7 @@ pub fn parseFieldsFromSyntax(
         try lowered.append(.{
             .name = name.text,
             .visibility = field.visibility,
-            .type_name = std.mem.trim(u8, ty.text, " \t"),
+            .type_name = std.mem.trim(u8, ty.text(), " \t"),
         });
     }
 
@@ -128,17 +129,21 @@ pub fn parseEnumVariantsFromSyntax(
         }
 
         if (variant.tuple_payload) |tuple_payload| {
-            var tuple_fields = std.array_list.Managed(TupleField).init(allocator);
-            errdefer tuple_fields.deinit();
-            const raw = trimDelimited(tuple_payload.text, '(', ')');
-            const parts = try splitTopLevelCommaParts(allocator, raw);
-            defer allocator.free(parts);
-            for (parts) |part| {
-                const trimmed = std.mem.trim(u8, part, " \t");
-                if (trimmed.len == 0) continue;
-                try tuple_fields.append(.{ .type_name = trimmed });
+            if (tuple_payload.invalid_kind != null) {
+                try diagnostics.add(.@"error", "type.enum.variant", tuple_payload.span, "malformed enum tuple payload for variant '{s}'", .{name.text});
+            } else {
+                var tuple_fields = std.array_list.Managed(TupleField).init(allocator);
+                errdefer tuple_fields.deinit();
+                for (tuple_payload.types) |field_type| {
+                    const trimmed = std.mem.trim(u8, field_type.text(), " \t");
+                    if (trimmed.len == 0) {
+                        try diagnostics.add(.@"error", "type.enum.variant", tuple_payload.span, "malformed enum tuple payload for variant '{s}'", .{name.text});
+                        continue;
+                    }
+                    try tuple_fields.append(.{ .type_name = trimmed });
+                }
+                lowered_variant.payload = .{ .tuple_fields = try tuple_fields.toOwnedSlice() };
             }
-            lowered_variant.payload = .{ .tuple_fields = try tuple_fields.toOwnedSlice() };
         } else if (variant.named_fields.len != 0) {
             lowered_variant.payload = .{
                 .named_fields = try parseFieldsFromSyntax(allocator, variant.named_fields, name.text, span, diagnostics),
@@ -182,7 +187,10 @@ pub fn parseTraitBodyFromSyntax(
     var associated_types = std.array_list.Managed(TraitAssociatedType).init(allocator);
     errdefer associated_types.deinit();
     var associated_consts = std.array_list.Managed(TraitAssociatedConst).init(allocator);
-    errdefer associated_consts.deinit();
+    errdefer {
+        for (associated_consts.items) |*associated_const| associated_const.deinit(allocator);
+        associated_consts.deinit();
+    }
 
     for (body.associated_types) |associated_type| {
         const name = associated_type.name orelse {
@@ -229,7 +237,7 @@ pub fn parseTraitBodyFromSyntax(
         };
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        const type_name = std.mem.trim(u8, type_text.text(), " \t");
         if (!isPlainIdentifier(name_text) or type_name.len == 0) {
             try diagnostics.add(.@"error", "type.trait.associated_const", span, "malformed trait associated const '{s}'", .{name.text});
             continue;
@@ -251,9 +259,9 @@ pub fn parseTraitBodyFromSyntax(
         const builtin = types.Builtin.fromName(type_name);
         try associated_consts.append(.{
             .name = name_text,
-            .type_name = type_name,
+            .type_syntax = try type_text.clone(allocator),
             .ty = builtin,
-            .type_ref = if (builtin == .unsupported) .{ .named = type_name } else types.TypeRef.fromBuiltin(builtin),
+            .type_ref = try type_syntax_support.typeRefFromSyntax(allocator, type_text),
         });
     }
 
@@ -326,7 +334,7 @@ pub fn parseImplAssociatedTypesFromSyntax(
         };
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const value_text = std.mem.trim(u8, value.text, " \t");
+        const value_text = std.mem.trim(u8, value.text(), " \t");
         if (!isPlainIdentifier(name_text) or value_text.len == 0) {
             try diagnostics.add(.@"error", "type.impl.associated_type", span, "malformed impl associated type binding '{s}'", .{name.text});
             continue;
@@ -346,8 +354,8 @@ pub fn parseImplAssociatedTypesFromSyntax(
 
         try lowered.append(.{
             .name = name_text,
-            .value_type_name = value_text,
-            .value_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(value_text)),
+            .value_type_syntax = try value.clone(allocator),
+            .value_type = try type_syntax_support.typeRefFromSyntax(allocator, value),
         });
     }
 
@@ -381,7 +389,7 @@ pub fn parseImplAssociatedConstsFromSyntax(
         }
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        const type_name = std.mem.trim(u8, type_text.text(), " \t");
         if (!isPlainIdentifier(name_text) or type_name.len == 0) {
             try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding '{s}'", .{name.text});
             continue;
@@ -426,12 +434,7 @@ pub fn parseExecutableMethodFromSyntax(
     var function = FunctionData.init(allocator, method.is_suspend, false);
     errdefer function.deinit(allocator);
 
-    const local_generic_params = try item_syntax_bridge.parseGenericParamsFromSpan(
-        allocator,
-        method.signature.generic_params,
-        method.span,
-        diagnostics,
-    );
+    const local_generic_params = try signatures.lowerGenericParams(allocator, method.signature.generic_params, diagnostics);
     errdefer if (local_generic_params.len != 0) allocator.free(local_generic_params);
 
     function.generic_params = try signatures.mergeGenericParams(
@@ -443,12 +446,11 @@ pub fn parseExecutableMethodFromSyntax(
     );
     if (local_generic_params.len != 0) allocator.free(local_generic_params);
 
-    function.where_predicates = try item_syntax_bridge.parseWherePredicatesFromClauses(
+    function.where_predicates = try signatures.lowerWherePredicates(
         allocator,
         method.signature.where_clauses,
         function.generic_params,
         true,
-        method.span,
         diagnostics,
     );
 
@@ -458,6 +460,7 @@ pub fn parseExecutableMethodFromSyntax(
     }
 
     const receiver = try parseMethodReceiverFromSyntax(
+        allocator,
         target_type,
         method.signature.parameters[0],
         method.span,
@@ -467,17 +470,16 @@ pub fn parseExecutableMethodFromSyntax(
 
     if (method.signature.parameters.len > 1) {
         for (method.signature.parameters[1..]) |parameter| {
-            if (try parseOrdinaryParameterFromSyntax(parameter, method.span, diagnostics)) |lowered| {
+            if (try parseOrdinaryParameterFromSyntax(allocator, parameter, method.span, diagnostics)) |lowered| {
                 try function.parameters.append(lowered);
             }
         }
     }
 
     if (method.signature.return_type) |return_type| {
-        const return_name = std.mem.trim(u8, return_type.text, " \t");
-        if (return_name.len != 0) {
-            function.return_type_name = return_name;
-            function.return_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(return_name));
+        if (!type_syntax_support.containsInvalid(return_type)) {
+            function.return_type_syntax = try return_type.clone(allocator);
+            function.return_type = try type_syntax_support.typeRefFromSyntax(allocator, return_type);
         }
     }
 
@@ -518,20 +520,19 @@ fn parseTraitMethodFromSyntax(
     var method_syntax = try method.clone(allocator);
     errdefer method_syntax.deinit(allocator);
 
-    const local_generic_params = try item_syntax_bridge.parseGenericParamsFromSpan(allocator, method.signature.generic_params, span, diagnostics);
+    const local_generic_params = try signatures.lowerGenericParams(allocator, method.signature.generic_params, diagnostics);
     errdefer if (local_generic_params.len != 0) allocator.free(local_generic_params);
     const combined_generic_params = try signatures.mergeGenericParams(allocator, inherited_generic_params, local_generic_params, span, diagnostics);
     defer if (combined_generic_params.len != 0) allocator.free(combined_generic_params);
 
-    const where_predicates = try item_syntax_bridge.parseWherePredicatesFromClauses(
+    const where_predicates = try signatures.lowerWherePredicates(
         allocator,
         method.signature.where_clauses,
         combined_generic_params,
         true,
-        span,
         diagnostics,
     );
-    errdefer if (where_predicates.len != 0) allocator.free(where_predicates);
+    errdefer signatures.deinitWherePredicates(allocator, where_predicates);
 
     return .{
         .name = signature_name.text,
@@ -544,6 +545,7 @@ fn parseTraitMethodFromSyntax(
 }
 
 pub fn parseMethodReceiverFromSyntax(
+    allocator: Allocator,
     target_type: []const u8,
     parameter: ast.ParameterSyntax,
     span: source.Span,
@@ -558,15 +560,14 @@ pub fn parseMethodReceiverFromSyntax(
         return null;
     }
 
-    const mode = try parseParameterMode(parameter.mode, span, diagnostics);
-    const type_name = if (parameter.ty) |ty| std.mem.trim(u8, ty.text, " \t") else "";
-
-    if (type_name.len == 0) {
+    const mode = try item_syntax_bridge.parseParameterMode(parameter.mode, span, diagnostics);
+    const maybe_type_syntax = parameter.ty;
+    if (maybe_type_syntax == null) {
         return switch (mode) {
             .take, .read, .edit => .{
                 .name = "self",
                 .mode = mode,
-                .type_name = target_type,
+                .type_syntax = null,
                 .ty = .{ .named = target_type },
             },
             .owned => {
@@ -576,15 +577,14 @@ pub fn parseMethodReceiverFromSyntax(
         };
     }
 
-    if (mode == .take and std.mem.startsWith(u8, type_name, "hold[") and
-        (std.mem.indexOf(u8, type_name, " read Self") != null or
-            std.mem.indexOf(u8, type_name, " edit Self") != null))
+    const type_syntax = maybe_type_syntax.?;
+    if (mode == .take and type_syntax_support.borrowedSelfAccess(type_syntax) != null)
     {
         return .{
             .name = "self",
             .mode = .take,
-            .type_name = type_name,
-            .ty = types.TypeRef.fromBuiltin(types.Builtin.fromName(type_name)),
+            .type_syntax = try type_syntax.clone(allocator),
+            .ty = try type_syntax_support.typeRefFromSyntax(allocator, type_syntax),
         };
     }
 
@@ -593,6 +593,7 @@ pub fn parseMethodReceiverFromSyntax(
 }
 
 pub fn parseOrdinaryParameterFromSyntax(
+    allocator: Allocator,
     parameter: ast.ParameterSyntax,
     span: source.Span,
     diagnostics: *diag.Bag,
@@ -606,35 +607,12 @@ pub fn parseOrdinaryParameterFromSyntax(
         return null;
     };
 
-    const type_name = std.mem.trim(u8, ty.text, " \t");
     return .{
         .name = std.mem.trim(u8, name.text, " \t"),
-        .mode = try parseParameterMode(parameter.mode, span, diagnostics),
-        .type_name = type_name,
-        .ty = types.TypeRef.fromBuiltin(types.Builtin.fromName(type_name)),
+        .mode = try item_syntax_bridge.parseParameterMode(parameter.mode, span, diagnostics),
+        .type_syntax = try ty.clone(allocator),
+        .ty = try type_syntax_support.typeRefFromSyntax(allocator, ty),
     };
-}
-
-fn parseParameterMode(
-    mode: ?ast.SpanText,
-    span: source.Span,
-    diagnostics: *diag.Bag,
-) !ParameterMode {
-    const raw = if (mode) |value| std.mem.trim(u8, value.text, " \t") else return .owned;
-    if (std.mem.eql(u8, raw, "take")) return .take;
-    if (std.mem.eql(u8, raw, "read")) return .read;
-    if (std.mem.eql(u8, raw, "edit")) return .edit;
-
-    try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter mode '{s}'", .{raw});
-    return .owned;
-}
-
-fn trimDelimited(raw: []const u8, open: u8, close: u8) []const u8 {
-    var trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len >= 2 and trimmed[0] == open and trimmed[trimmed.len - 1] == close) {
-        trimmed = trimmed[1 .. trimmed.len - 1];
-    }
-    return std.mem.trim(u8, trimmed, " \t");
 }
 
 test "executable trait method parsing uses structured typed syntax" {
@@ -651,11 +629,11 @@ test "executable trait method parsing uses structured typed syntax" {
                 .name = .{ .text = "bump", .span = .{ .file_id = 0, .start = 0, .end = 4 } },
                 .parameters = try std.testing.allocator.dupe(ast.ParameterSyntax, &.{
                     .{
-                        .mode = .{ .text = "edit", .span = .{ .file_id = 0, .start = 5, .end = 9 } },
+                        .mode = .{ .edit = .{ .file_id = 0, .start = 5, .end = 9 } },
                         .name = .{ .text = "self", .span = .{ .file_id = 0, .start = 10, .end = 14 } },
                     },
                 }),
-                .return_type = .{ .text = "I32", .span = .{ .file_id = 0, .start = 19, .end = 22 } },
+                .return_type = .{ .source = .{ .text = "I32", .span = .{ .file_id = 0, .start = 19, .end = 22 } } },
             },
             .block_syntax = .{
                 .lines = try std.testing.allocator.dupe(ast.LineSyntax, &.{
@@ -684,8 +662,9 @@ test "executable trait method parsing uses structured typed syntax" {
     try std.testing.expectEqual(ParameterMode.edit, parsed.receiver_mode);
     try std.testing.expectEqual(@as(usize, 1), parsed.function.parameters.items.len);
     try std.testing.expectEqualStrings("self", parsed.function.parameters.items[0].name);
-    try std.testing.expectEqualStrings("Counter", parsed.function.parameters.items[0].type_name);
-    try std.testing.expectEqualStrings("I32", parsed.function.return_type_name);
+    try std.testing.expect(parsed.function.parameters.items[0].type_syntax == null);
+    try std.testing.expect(parsed.function.return_type_syntax != null);
+    try std.testing.expectEqualStrings("I32", parsed.function.return_type_syntax.?.text());
     try std.testing.expect(parsed.function.block_syntax != null);
     try std.testing.expectEqualStrings("return 1", parsed.function.block_syntax.?.lines[0].text.text);
 }

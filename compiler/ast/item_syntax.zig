@@ -15,57 +15,292 @@ pub const SpanText = struct {
     span: source.Span,
 };
 
+pub const BorrowAccess = enum {
+    hold,
+    read,
+    edit,
+};
+
+pub const RawPointerAccess = enum {
+    read,
+    edit,
+};
+
+pub const TypeNode = struct {
+    source: SpanText,
+    child_start: u32 = 0,
+    child_len: u32 = 0,
+    payload: Payload,
+
+    pub const Borrow = struct {
+        access: BorrowAccess,
+        lifetime: ?SpanText = null,
+    };
+
+    pub const RawPointer = struct {
+        access: RawPointerAccess,
+    };
+
+    pub const Assoc = struct {
+        member: SpanText,
+    };
+
+    pub const Payload = union(enum) {
+        invalid,
+        name_ref,
+        lifetime,
+        apply,
+        borrow: Borrow,
+        raw_pointer: RawPointer,
+        assoc: Assoc,
+    };
+};
+
+pub const TypeSyntax = struct {
+    source: SpanText,
+    nodes: []TypeNode = &.{},
+    child_indices: []u32 = &.{},
+
+    pub fn text(self: TypeSyntax) []const u8 {
+        return self.source.text;
+    }
+
+    pub fn span(self: TypeSyntax) source.Span {
+        return self.source.span;
+    }
+
+    pub fn clone(self: TypeSyntax, allocator: Allocator) !TypeSyntax {
+        return .{
+            .source = self.source,
+            .nodes = try cloneSlice(allocator, TypeNode, self.nodes),
+            .child_indices = try cloneSlice(allocator, u32, self.child_indices),
+        };
+    }
+
+    pub fn deinit(self: *TypeSyntax, allocator: Allocator) void {
+        freeSlice(allocator, self.nodes);
+        freeSlice(allocator, self.child_indices);
+        self.* = .{
+            .source = .{
+                .text = "",
+                .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            },
+        };
+    }
+
+    pub fn isStructured(self: TypeSyntax) bool {
+        return self.nodes.len != 0;
+    }
+
+    pub fn rootNode(self: TypeSyntax) TypeNode {
+        if (self.nodes.len != 0) return self.nodes[0];
+        return .{
+            .source = self.source,
+            .payload = legacyPayload(self.source),
+        };
+    }
+
+    pub fn childNodeIndices(self: TypeSyntax, node_index: usize) []const u32 {
+        const node = if (self.nodes.len == 0) self.rootNode() else self.nodes[node_index];
+        return self.child_indices[node.child_start .. node.child_start + node.child_len];
+    }
+
+    fn legacyPayload(source_text: SpanText) TypeNode.Payload {
+        if (source_text.text.len == 0) return .invalid;
+        return if (source_text.text[0] == '\'') .lifetime else .name_ref;
+    }
+};
+
+pub const ParameterMode = union(enum) {
+    owned,
+    take: source.Span,
+    read: source.Span,
+    edit: source.Span,
+    invalid: SpanText,
+
+    pub fn span(self: ParameterMode) ?source.Span {
+        return switch (self) {
+            .owned => null,
+            .take => |mode_span| mode_span,
+            .read => |mode_span| mode_span,
+            .edit => |mode_span| mode_span,
+            .invalid => |value| value.span,
+        };
+    }
+};
+
+pub const GenericParamKind = enum {
+    type_param,
+    lifetime_param,
+};
+
+pub const GenericParam = struct {
+    name: []const u8,
+    span: source.Span,
+    kind: GenericParamKind,
+};
+
+pub const GenericParamListInvalidKind = enum {
+    empty_list,
+    malformed_entry,
+};
+
+pub const GenericParamList = struct {
+    span: source.Span,
+    params: []GenericParam = &.{},
+    invalid_kind: ?GenericParamListInvalidKind = null,
+
+    pub fn clone(self: GenericParamList, allocator: Allocator) !GenericParamList {
+        return .{
+            .span = self.span,
+            .params = try cloneSlice(allocator, GenericParam, self.params),
+            .invalid_kind = self.invalid_kind,
+        };
+    }
+
+    pub fn deinit(self: *GenericParamList, allocator: Allocator) void {
+        freeSlice(allocator, self.params);
+        self.* = .{
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            .params = &.{},
+            .invalid_kind = null,
+        };
+    }
+};
+
+pub const BoundWherePredicate = struct {
+    subject_name: []const u8,
+    contract_name: []const u8,
+    span: source.Span,
+};
+
+pub const ProjectionEqualityWherePredicate = struct {
+    subject_name: []const u8,
+    associated_name: []const u8,
+    value_type: TypeSyntax,
+    span: source.Span,
+};
+
+pub const LifetimeOutlivesWherePredicate = struct {
+    longer_name: []const u8,
+    shorter_name: []const u8,
+    span: source.Span,
+};
+
+pub const TypeOutlivesWherePredicate = struct {
+    type_name: []const u8,
+    lifetime_name: []const u8,
+    span: source.Span,
+};
+
+pub const WherePredicate = union(enum) {
+    bound: BoundWherePredicate,
+    projection_equality: ProjectionEqualityWherePredicate,
+    lifetime_outlives: LifetimeOutlivesWherePredicate,
+    type_outlives: TypeOutlivesWherePredicate,
+    invalid: SpanText,
+};
+
+pub const WhereClauseInvalidKind = enum {
+    empty_clause,
+};
+
+pub const WhereClause = struct {
+    span: source.Span,
+    predicates: []WherePredicate = &.{},
+    invalid_kind: ?WhereClauseInvalidKind = null,
+
+    pub fn clone(self: WhereClause, allocator: Allocator) !WhereClause {
+        const predicates = try allocator.alloc(WherePredicate, self.predicates.len);
+        errdefer allocator.free(predicates);
+        for (self.predicates, 0..) |predicate, index| {
+            predicates[index] = try cloneWherePredicate(predicate, allocator);
+        }
+        return .{
+            .span = self.span,
+            .predicates = predicates,
+            .invalid_kind = self.invalid_kind,
+        };
+    }
+
+    pub fn deinit(self: *WhereClause, allocator: Allocator) void {
+        for (self.predicates) |*predicate| deinitWherePredicate(predicate, allocator);
+        freeSlice(allocator, self.predicates);
+        self.* = .{
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            .predicates = &.{},
+            .invalid_kind = null,
+        };
+    }
+};
+
 pub const BlockSyntax = block_syntax.Block;
 pub const ExprSyntax = body_syntax.Expr;
 
 pub const Parameter = struct {
-    mode: ?SpanText = null,
+    mode: ParameterMode = .owned,
     name: ?SpanText = null,
-    ty: ?SpanText = null,
+    ty: ?TypeSyntax = null,
+
+    pub fn clone(self: Parameter, allocator: Allocator) !Parameter {
+        return .{
+            .mode = self.mode,
+            .name = self.name,
+            .ty = if (self.ty) |ty| try ty.clone(allocator) else null,
+        };
+    }
+
+    pub fn deinit(self: *Parameter, allocator: Allocator) void {
+        if (self.ty) |*ty| ty.deinit(allocator);
+        self.* = .{};
+    }
 };
 
 pub const FunctionSignature = struct {
     name: ?SpanText = null,
-    generic_params: ?SpanText = null,
+    generic_params: ?GenericParamList = null,
     parameters: []Parameter = &.{},
-    return_type: ?SpanText = null,
-    where_clauses: []SpanText = &.{},
+    return_type: ?TypeSyntax = null,
+    where_clauses: []WhereClause = &.{},
     foreign_abi: ?SpanText = null,
 
     pub fn clone(self: FunctionSignature, allocator: Allocator) !FunctionSignature {
         return .{
             .name = self.name,
-            .generic_params = self.generic_params,
-            .parameters = try cloneSlice(allocator, Parameter, self.parameters),
-            .return_type = self.return_type,
-            .where_clauses = try cloneSlice(allocator, SpanText, self.where_clauses),
+            .generic_params = if (self.generic_params) |generic_params| try generic_params.clone(allocator) else null,
+            .parameters = try cloneComplexSlice(allocator, Parameter, self.parameters),
+            .return_type = if (self.return_type) |return_type| try return_type.clone(allocator) else null,
+            .where_clauses = try cloneComplexSlice(allocator, WhereClause, self.where_clauses),
             .foreign_abi = self.foreign_abi,
         };
     }
 
     pub fn deinit(self: *FunctionSignature, allocator: Allocator) void {
-        freeSlice(allocator, self.parameters);
-        freeSlice(allocator, self.where_clauses);
+        if (self.generic_params) |*generic_params| generic_params.deinit(allocator);
+        freeComplexSlice(allocator, Parameter, self.parameters);
+        if (self.return_type) |*return_type| return_type.deinit(allocator);
+        freeComplexSlice(allocator, WhereClause, self.where_clauses);
         self.* = .{};
     }
 };
 
 pub const ConstSignature = struct {
     name: ?SpanText = null,
-    ty: ?SpanText = null,
+    ty: ?TypeSyntax = null,
     initializer: ?SpanText = null,
     initializer_expr: ?*ExprSyntax = null,
 
     pub fn clone(self: ConstSignature, allocator: Allocator) !ConstSignature {
         return .{
             .name = self.name,
-            .ty = self.ty,
+            .ty = if (self.ty) |ty| try ty.clone(allocator) else null,
             .initializer = self.initializer,
             .initializer_expr = if (self.initializer_expr) |expr| try expr.clone(allocator) else null,
         };
     }
 
     pub fn deinit(self: *ConstSignature, allocator: Allocator) void {
+        if (self.ty) |*ty| ty.deinit(allocator);
         if (self.initializer_expr) |expr| {
             expr.deinit(allocator);
             allocator.destroy(expr);
@@ -76,40 +311,43 @@ pub const ConstSignature = struct {
 
 pub const NamedDecl = struct {
     name: ?SpanText = null,
-    generic_params: ?SpanText = null,
-    where_clauses: []SpanText = &.{},
+    generic_params: ?GenericParamList = null,
+    where_clauses: []WhereClause = &.{},
 
     pub fn clone(self: NamedDecl, allocator: Allocator) !NamedDecl {
         return .{
             .name = self.name,
-            .generic_params = self.generic_params,
-            .where_clauses = try cloneSlice(allocator, SpanText, self.where_clauses),
+            .generic_params = if (self.generic_params) |generic_params| try generic_params.clone(allocator) else null,
+            .where_clauses = try cloneComplexSlice(allocator, WhereClause, self.where_clauses),
         };
     }
 
     pub fn deinit(self: *NamedDecl, allocator: Allocator) void {
-        freeSlice(allocator, self.where_clauses);
+        if (self.generic_params) |*generic_params| generic_params.deinit(allocator);
+        freeComplexSlice(allocator, WhereClause, self.where_clauses);
         self.* = .{};
     }
 };
 
 pub const TypeAlias = struct {
     name: ?SpanText = null,
-    generic_params: ?SpanText = null,
-    target: ?SpanText = null,
-    where_clauses: []SpanText = &.{},
+    generic_params: ?GenericParamList = null,
+    target: ?TypeSyntax = null,
+    where_clauses: []WhereClause = &.{},
 
     pub fn clone(self: TypeAlias, allocator: Allocator) !TypeAlias {
         return .{
             .name = self.name,
-            .generic_params = self.generic_params,
-            .target = self.target,
-            .where_clauses = try cloneSlice(allocator, SpanText, self.where_clauses),
+            .generic_params = if (self.generic_params) |generic_params| try generic_params.clone(allocator) else null,
+            .target = if (self.target) |target| try target.clone(allocator) else null,
+            .where_clauses = try cloneComplexSlice(allocator, WhereClause, self.where_clauses),
         };
     }
 
     pub fn deinit(self: *TypeAlias, allocator: Allocator) void {
-        freeSlice(allocator, self.where_clauses);
+        if (self.generic_params) |*generic_params| generic_params.deinit(allocator);
+        if (self.target) |*target| target.deinit(allocator);
+        freeComplexSlice(allocator, WhereClause, self.where_clauses);
         self.* = .{};
     }
 };
@@ -131,22 +369,25 @@ pub const UseBinding = struct {
 };
 
 pub const ImplSignature = struct {
-    generic_params: ?SpanText = null,
-    trait_name: ?SpanText = null,
-    target_type: ?SpanText = null,
-    where_clauses: []SpanText = &.{},
+    generic_params: ?GenericParamList = null,
+    trait_name: ?TypeSyntax = null,
+    target_type: ?TypeSyntax = null,
+    where_clauses: []WhereClause = &.{},
 
     pub fn clone(self: ImplSignature, allocator: Allocator) !ImplSignature {
         return .{
-            .generic_params = self.generic_params,
-            .trait_name = self.trait_name,
-            .target_type = self.target_type,
-            .where_clauses = try cloneSlice(allocator, SpanText, self.where_clauses),
+            .generic_params = if (self.generic_params) |generic_params| try generic_params.clone(allocator) else null,
+            .trait_name = if (self.trait_name) |trait_name| try trait_name.clone(allocator) else null,
+            .target_type = if (self.target_type) |target_type| try target_type.clone(allocator) else null,
+            .where_clauses = try cloneComplexSlice(allocator, WhereClause, self.where_clauses),
         };
     }
 
     pub fn deinit(self: *ImplSignature, allocator: Allocator) void {
-        freeSlice(allocator, self.where_clauses);
+        if (self.generic_params) |*generic_params| generic_params.deinit(allocator);
+        if (self.trait_name) |*trait_name| trait_name.deinit(allocator);
+        if (self.target_type) |*target_type| target_type.deinit(allocator);
+        freeComplexSlice(allocator, WhereClause, self.where_clauses);
         self.* = .{};
     }
 };
@@ -154,51 +395,91 @@ pub const ImplSignature = struct {
 pub const FieldDecl = struct {
     visibility: Visibility = .private,
     name: ?SpanText = null,
-    ty: ?SpanText = null,
+    ty: ?TypeSyntax = null,
 
     pub fn clone(self: FieldDecl, allocator: Allocator) !FieldDecl {
-        _ = allocator;
-        return self;
+        return .{
+            .visibility = self.visibility,
+            .name = self.name,
+            .ty = if (self.ty) |ty| try ty.clone(allocator) else null,
+        };
     }
 
     pub fn deinit(self: *FieldDecl, allocator: Allocator) void {
-        _ = allocator;
+        if (self.ty) |*ty| ty.deinit(allocator);
         self.* = .{};
+    }
+};
+
+pub const TuplePayloadInvalidKind = enum {
+    malformed_payload,
+    empty_payload,
+    empty_entry,
+};
+
+pub const TuplePayload = struct {
+    span: source.Span,
+    types: []TypeSyntax = &.{},
+    invalid_kind: ?TuplePayloadInvalidKind = null,
+
+    pub fn clone(self: TuplePayload, allocator: Allocator) !TuplePayload {
+        const types = try allocator.alloc(TypeSyntax, self.types.len);
+        errdefer allocator.free(types);
+        for (self.types, 0..) |ty, index| {
+            types[index] = try ty.clone(allocator);
+        }
+        return .{
+            .span = self.span,
+            .types = types,
+            .invalid_kind = self.invalid_kind,
+        };
+    }
+
+    pub fn deinit(self: *TuplePayload, allocator: Allocator) void {
+        freeComplexSlice(allocator, TypeSyntax, self.types);
+        self.* = .{
+            .span = .{ .file_id = 0, .start = 0, .end = 0 },
+            .types = &.{},
+            .invalid_kind = null,
+        };
     }
 };
 
 pub const EnumVariant = struct {
     name: ?SpanText = null,
-    tuple_payload: ?SpanText = null,
+    tuple_payload: ?TuplePayload = null,
     discriminant: ?SpanText = null,
     named_fields: []FieldDecl = &.{},
 
     pub fn clone(self: EnumVariant, allocator: Allocator) !EnumVariant {
         return .{
             .name = self.name,
-            .tuple_payload = self.tuple_payload,
+            .tuple_payload = if (self.tuple_payload) |payload| try payload.clone(allocator) else null,
             .discriminant = self.discriminant,
-            .named_fields = try cloneSlice(allocator, FieldDecl, self.named_fields),
+            .named_fields = try cloneComplexSlice(allocator, FieldDecl, self.named_fields),
         };
     }
 
     pub fn deinit(self: *EnumVariant, allocator: Allocator) void {
-        freeSlice(allocator, self.named_fields);
+        if (self.tuple_payload) |*payload| payload.deinit(allocator);
+        freeComplexSlice(allocator, FieldDecl, self.named_fields);
         self.* = .{};
     }
 };
 
 pub const AssociatedTypeDecl = struct {
     name: ?SpanText = null,
-    value: ?SpanText = null,
+    value: ?TypeSyntax = null,
 
     pub fn clone(self: AssociatedTypeDecl, allocator: Allocator) !AssociatedTypeDecl {
-        _ = allocator;
-        return self;
+        return .{
+            .name = self.name,
+            .value = if (self.value) |value| try value.clone(allocator) else null,
+        };
     }
 
     pub fn deinit(self: *AssociatedTypeDecl, allocator: Allocator) void {
-        _ = allocator;
+        if (self.value) |*value| value.deinit(allocator);
         self.* = .{};
     }
 };
@@ -233,14 +514,14 @@ pub const TraitBody = struct {
     pub fn clone(self: TraitBody, allocator: Allocator) !TraitBody {
         return .{
             .methods = try cloneComplexSlice(allocator, MethodDecl, self.methods),
-            .associated_types = try cloneSlice(allocator, AssociatedTypeDecl, self.associated_types),
+            .associated_types = try cloneComplexSlice(allocator, AssociatedTypeDecl, self.associated_types),
             .associated_consts = try cloneComplexSlice(allocator, ConstSignature, self.associated_consts),
         };
     }
 
     pub fn deinit(self: *TraitBody, allocator: Allocator) void {
         freeComplexSlice(allocator, MethodDecl, self.methods);
-        freeSlice(allocator, self.associated_types);
+        freeComplexSlice(allocator, AssociatedTypeDecl, self.associated_types);
         freeComplexSlice(allocator, ConstSignature, self.associated_consts);
         self.* = .{};
     }
@@ -254,14 +535,14 @@ pub const ImplBody = struct {
     pub fn clone(self: ImplBody, allocator: Allocator) !ImplBody {
         return .{
             .methods = try cloneComplexSlice(allocator, MethodDecl, self.methods),
-            .associated_types = try cloneSlice(allocator, AssociatedTypeDecl, self.associated_types),
+            .associated_types = try cloneComplexSlice(allocator, AssociatedTypeDecl, self.associated_types),
             .associated_consts = try cloneComplexSlice(allocator, ConstSignature, self.associated_consts),
         };
     }
 
     pub fn deinit(self: *ImplBody, allocator: Allocator) void {
         freeComplexSlice(allocator, MethodDecl, self.methods);
-        freeSlice(allocator, self.associated_types);
+        freeComplexSlice(allocator, AssociatedTypeDecl, self.associated_types);
         freeComplexSlice(allocator, ConstSignature, self.associated_consts);
         self.* = .{};
     }
@@ -278,8 +559,8 @@ pub const ItemBodySyntax = union(enum) {
     pub fn clone(self: ItemBodySyntax, allocator: Allocator) !ItemBodySyntax {
         return switch (self) {
             .none => .none,
-            .struct_fields => |fields| .{ .struct_fields = try cloneSlice(allocator, FieldDecl, fields) },
-            .union_fields => |fields| .{ .union_fields = try cloneSlice(allocator, FieldDecl, fields) },
+            .struct_fields => |fields| .{ .struct_fields = try cloneComplexSlice(allocator, FieldDecl, fields) },
+            .union_fields => |fields| .{ .union_fields = try cloneComplexSlice(allocator, FieldDecl, fields) },
             .enum_variants => |variants| .{ .enum_variants = try cloneComplexSlice(allocator, EnumVariant, variants) },
             .trait_body => |body| .{ .trait_body = try body.clone(allocator) },
             .impl_body => |body| .{ .impl_body = try body.clone(allocator) },
@@ -289,8 +570,8 @@ pub const ItemBodySyntax = union(enum) {
     pub fn deinit(self: *ItemBodySyntax, allocator: Allocator) void {
         switch (self.*) {
             .none => {},
-            .struct_fields => |fields| freeSlice(allocator, fields),
-            .union_fields => |fields| freeSlice(allocator, fields),
+            .struct_fields => |fields| freeComplexSlice(allocator, FieldDecl, fields),
+            .union_fields => |fields| freeComplexSlice(allocator, FieldDecl, fields),
             .enum_variants => |variants| freeComplexSlice(allocator, EnumVariant, variants),
             .trait_body => |*body| body.deinit(allocator),
             .impl_body => |*body| body.deinit(allocator),
@@ -358,4 +639,26 @@ fn freeSlice(allocator: Allocator, items: anytype) void {
 fn freeComplexSlice(allocator: Allocator, comptime T: type, items: []T) void {
     for (items) |*item| item.deinit(allocator);
     freeSlice(allocator, items);
+}
+
+fn cloneWherePredicate(predicate: WherePredicate, allocator: Allocator) !WherePredicate {
+    return switch (predicate) {
+        .bound => |bound| .{ .bound = bound },
+        .projection_equality => |projection| .{ .projection_equality = .{
+            .subject_name = projection.subject_name,
+            .associated_name = projection.associated_name,
+            .value_type = try projection.value_type.clone(allocator),
+            .span = projection.span,
+        } },
+        .lifetime_outlives => |outlives| .{ .lifetime_outlives = outlives },
+        .type_outlives => |outlives| .{ .type_outlives = outlives },
+        .invalid => |invalid| .{ .invalid = invalid },
+    };
+}
+
+fn deinitWherePredicate(predicate: *WherePredicate, allocator: Allocator) void {
+    switch (predicate.*) {
+        .projection_equality => |*projection| projection.value_type.deinit(allocator),
+        else => {},
+    }
 }

@@ -4,6 +4,7 @@ const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const typed_signatures = @import("signatures.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 
@@ -20,7 +21,7 @@ pub const NamedDeclData = struct {
 
     pub fn deinit(self: *NamedDeclData, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
-        if (self.where_predicates.len != 0) allocator.free(self.where_predicates);
+        typed_signatures.deinitWherePredicates(allocator, self.where_predicates);
         self.* = .{
             .generic_params = &.{},
             .where_predicates = &.{},
@@ -31,17 +32,28 @@ pub const NamedDeclData = struct {
 pub const ImplHeaderData = struct {
     generic_params: []GenericParam,
     where_predicates: []WherePredicate,
-    target_type: []const u8,
-    trait_name: ?[]const u8,
+    target_type_syntax: ast.TypeSyntax,
+    target_type: types.TypeRef,
+    trait_syntax: ?ast.TypeSyntax = null,
+    trait_type: ?types.TypeRef = null,
 
     pub fn deinit(self: *ImplHeaderData, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
-        if (self.where_predicates.len != 0) allocator.free(self.where_predicates);
+        typed_signatures.deinitWherePredicates(allocator, self.where_predicates);
+        self.target_type_syntax.deinit(allocator);
+        if (self.trait_syntax) |*trait_syntax| trait_syntax.deinit(allocator);
         self.* = .{
             .generic_params = &.{},
             .where_predicates = &.{},
-            .target_type = "",
-            .trait_name = null,
+            .target_type_syntax = .{
+                .source = .{
+                    .text = "",
+                    .span = .{ .file_id = 0, .start = 0, .end = 0 },
+                },
+            },
+            .target_type = .unsupported,
+            .trait_syntax = null,
+            .trait_type = null,
         };
     }
 };
@@ -53,18 +65,17 @@ pub fn fillFunctionDataFromSyntax(
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !void {
-    function.generic_params = try parseGenericParamsFromSpan(allocator, signature.generic_params, span, diagnostics);
+    function.generic_params = try typed_signatures.lowerGenericParams(allocator, signature.generic_params, diagnostics);
     errdefer if (function.generic_params.len != 0) allocator.free(function.generic_params);
 
-    function.where_predicates = try parseWherePredicatesFromClauses(
+    function.where_predicates = try typed_signatures.lowerWherePredicates(
         allocator,
         signature.where_clauses,
         function.generic_params,
         false,
-        span,
         diagnostics,
     );
-    errdefer if (function.where_predicates.len != 0) allocator.free(function.where_predicates);
+    errdefer typed_signatures.deinitWherePredicates(allocator, function.where_predicates);
 
     for (signature.parameters) |parameter| {
         const name_text = parameter.name orelse {
@@ -75,20 +86,22 @@ pub fn fillFunctionDataFromSyntax(
             try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter '{s}'", .{name_text.text});
             continue;
         };
-        const type_name = std.mem.trim(u8, type_text.text, " \t");
+        if (type_syntax_support.containsInvalid(type_text)) {
+            try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter '{s}'", .{name_text.text});
+            continue;
+        }
         try function.parameters.append(.{
             .name = std.mem.trim(u8, name_text.text, " \t"),
             .mode = try parseParameterMode(parameter.mode, span, diagnostics),
-            .type_name = type_name,
-            .ty = types.TypeRef.fromBuiltin(types.Builtin.fromName(type_name)),
+            .type_syntax = try type_text.clone(allocator),
+            .ty = try type_syntax_support.typeRefFromSyntax(allocator, type_text),
         });
     }
 
     if (signature.return_type) |return_type| {
-        const return_name = std.mem.trim(u8, return_type.text, " \t");
-        if (return_name.len != 0) {
-            function.return_type_name = return_name;
-            function.return_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(return_name));
+        if (!type_syntax_support.containsInvalid(return_type)) {
+            function.return_type_syntax = try return_type.clone(allocator);
+            function.return_type = try type_syntax_support.typeRefFromSyntax(allocator, return_type);
         }
     }
 }
@@ -99,18 +112,28 @@ pub fn parseConstDataFromSyntax(
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !ConstData {
-    const type_raw = if (signature.ty) |ty| std.mem.trim(u8, ty.text, " \t") else "";
-    const expr_raw = if (signature.initializer) |initializer| std.mem.trim(u8, initializer.text, " \t") else "";
+    const type_syntax = signature.ty orelse {
+        try diagnostics.add(.@"error", "type.const.syntax", span, "const declarations require an explicit type", .{});
+        return .{
+            .type_syntax = .{
+                .source = .{
+                    .text = "",
+                    .span = .{ .file_id = span.file_id, .start = span.start, .end = span.start },
+                },
+            },
+            .ty = .unsupported,
+            .type_ref = .unsupported,
+            .initializer_syntax = if (signature.initializer_expr) |expr| try expr.clone(allocator) else null,
+            .expr = null,
+        };
+    };
 
-    const ty = types.Builtin.fromName(type_raw);
-    _ = diagnostics;
-    _ = span;
+    const ty = type_syntax_support.builtinFromSyntax(type_syntax);
 
     return .{
-        .type_name = type_raw,
+        .type_syntax = try type_syntax.clone(allocator),
         .ty = ty,
-        .type_ref = if (ty == .unsupported) .{ .named = type_raw } else types.TypeRef.fromBuiltin(ty),
-        .initializer_source = expr_raw,
+        .type_ref = try type_syntax_support.typeRefFromSyntax(allocator, type_syntax),
         .initializer_syntax = if (signature.initializer_expr) |expr| try expr.clone(allocator) else null,
         .expr = null,
     };
@@ -123,18 +146,18 @@ pub fn parseNamedDeclData(
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !NamedDeclData {
-    const generic_params = try parseGenericParamsFromSpan(allocator, signature.generic_params, span, diagnostics);
+    _ = span;
+    const generic_params = try typed_signatures.lowerGenericParams(allocator, signature.generic_params, diagnostics);
     errdefer if (generic_params.len != 0) allocator.free(generic_params);
 
-    const where_predicates = try parseWherePredicatesFromClauses(
+    const where_predicates = try typed_signatures.lowerWherePredicates(
         allocator,
         signature.where_clauses,
         generic_params,
         allow_self,
-        span,
         diagnostics,
     );
-    errdefer if (where_predicates.len != 0) allocator.free(where_predicates);
+    errdefer typed_signatures.deinitWherePredicates(allocator, where_predicates);
 
     return .{
         .generic_params = generic_params,
@@ -148,80 +171,78 @@ pub fn parseImplHeaderData(
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !ImplHeaderData {
-    const generic_params = try parseGenericParamsFromSpan(allocator, signature.generic_params, span, diagnostics);
+    const generic_params = try typed_signatures.lowerGenericParams(allocator, signature.generic_params, diagnostics);
     errdefer if (generic_params.len != 0) allocator.free(generic_params);
 
-    const where_predicates = try parseWherePredicatesFromClauses(
+    const where_predicates = try typed_signatures.lowerWherePredicates(
         allocator,
         signature.where_clauses,
         generic_params,
         false,
-        span,
         diagnostics,
     );
-    errdefer if (where_predicates.len != 0) allocator.free(where_predicates);
+    errdefer typed_signatures.deinitWherePredicates(allocator, where_predicates);
+
+    if (signature.target_type) |target_type| {
+        if (type_syntax_support.containsInvalid(target_type)) {
+            try diagnostics.add(.@"error", "type.impl.syntax", span, "impl blocks require a valid target type", .{});
+        }
+    }
+    if (signature.trait_name) |trait_name| {
+        if (type_syntax_support.containsInvalid(trait_name)) {
+            try diagnostics.add(.@"error", "type.impl.syntax", span, "impl blocks require a valid trait type", .{});
+        }
+    }
 
     return .{
         .generic_params = generic_params,
         .where_predicates = where_predicates,
-        .target_type = if (signature.target_type) |target_type| std.mem.trim(u8, target_type.text, " \t") else "",
-        .trait_name = if (signature.trait_name) |trait_name| std.mem.trim(u8, trait_name.text, " \t") else null,
+        .target_type_syntax = if (signature.target_type) |target_type|
+            if (!type_syntax_support.containsInvalid(target_type))
+                try target_type.clone(allocator)
+            else
+                .{
+                    .source = .{
+                        .text = "",
+                        .span = .{ .file_id = span.file_id, .start = span.start, .end = span.start },
+                    },
+                }
+        else
+            .{
+                .source = .{
+                    .text = "",
+                    .span = .{ .file_id = span.file_id, .start = span.start, .end = span.start },
+                },
+            },
+        .target_type = if (signature.target_type) |target_type|
+            try type_syntax_support.typeRefFromSyntax(allocator, target_type)
+        else
+            .unsupported,
+        .trait_syntax = if (signature.trait_name) |trait_name|
+            if (!type_syntax_support.containsInvalid(trait_name)) try trait_name.clone(allocator) else null
+        else
+            null,
+        .trait_type = if (signature.trait_name) |trait_name|
+            try type_syntax_support.typeRefFromSyntax(allocator, trait_name)
+        else
+            null,
     };
 }
 
-pub fn parseGenericParamsFromSpan(
-    allocator: Allocator,
-    generic_params: ?ast.SpanText,
-    span: source.Span,
-    diagnostics: *diag.Bag,
-) ![]GenericParam {
-    const raw = if (generic_params) |value| std.mem.trim(u8, value.text, " \t") else return allocator.alloc(GenericParam, 0);
-    if (raw.len == 0) return allocator.alloc(GenericParam, 0);
-    if (raw[0] == '[' and raw[raw.len - 1] == ']') {
-        return typed_signatures.parseGenericParams(allocator, raw[1 .. raw.len - 1], span, diagnostics);
-    }
-
-    const leading = try typed_signatures.parseLeadingGenericParams(allocator, raw, span, diagnostics);
-    return leading.generic_params;
-}
-
-pub fn parseWherePredicatesFromClauses(
-    allocator: Allocator,
-    clauses: []const ast.SpanText,
-    generic_params: []const GenericParam,
-    allow_self: bool,
-    span: source.Span,
-    diagnostics: *diag.Bag,
-) ![]WherePredicate {
-    var predicates = std.array_list.Managed(WherePredicate).init(allocator);
-    errdefer predicates.deinit();
-
-    for (clauses) |clause| {
-        const parsed = try typed_signatures.parseWherePredicates(
-            allocator,
-            std.mem.trim(u8, clause.text, " \t"),
-            generic_params,
-            allow_self,
-            span,
-            diagnostics,
-        );
-        defer if (parsed.len != 0) allocator.free(parsed);
-        try predicates.appendSlice(parsed);
-    }
-
-    return predicates.toOwnedSlice();
-}
-
-fn parseParameterMode(
-    mode: ?ast.SpanText,
+pub fn parseParameterMode(
+    mode: ast.ParameterModeSyntax,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !ParameterMode {
-    const raw = if (mode) |value| std.mem.trim(u8, value.text, " \t") else return .owned;
-    if (std.mem.eql(u8, raw, "take")) return .take;
-    if (std.mem.eql(u8, raw, "read")) return .read;
-    if (std.mem.eql(u8, raw, "edit")) return .edit;
-
-    try diagnostics.add(.@"error", "type.param.syntax", span, "malformed parameter mode '{s}'", .{raw});
-    return .owned;
+    _ = span;
+    return switch (mode) {
+        .owned => .owned,
+        .take => .take,
+        .read => .read,
+        .edit => .edit,
+        .invalid => |value| blk: {
+            try diagnostics.add(.@"error", "type.param.syntax", value.span, "malformed parameter mode '{s}'", .{std.mem.trim(u8, value.text, " \t")});
+            break :blk .owned;
+        },
+    };
 }

@@ -177,8 +177,10 @@ fn predeclareStructuredBlockConstBindings(
             .const_decl => |binding| {
                 const declared_type_syntax = binding.declared_type orelse continue;
                 const name = std.mem.trim(u8, binding.name.text, " \t");
+                const declared_type_name = std.mem.trim(u8, declared_type_syntax.text(), " \t");
+                if (declared_type_name.len == 0) continue;
                 const declared_type = try resolveDeclaredValueType(
-                    std.mem.trim(u8, declared_type_syntax.text, " \t"),
+                    declared_type_name,
                     struct_prototypes,
                     enum_prototypes,
                     span,
@@ -761,13 +763,18 @@ fn parseBindingStatementSyntax(
     const name = std.mem.trim(u8, binding.name.text, " \t");
     var declared_type: types.TypeRef = .unsupported;
     if (binding.declared_type) |declared_type_syntax| {
-        declared_type = try resolveDeclaredValueType(
-            std.mem.trim(u8, declared_type_syntax.text, " \t"),
-            struct_prototypes,
-            enum_prototypes,
-            span,
-            diagnostics,
-        );
+        const declared_type_name = std.mem.trim(u8, declared_type_syntax.text(), " \t");
+        if (declared_type_name.len == 0) {
+            try diagnostics.add(.@"error", "type.binding.declared", span, "local binding '{s}' requires a type after ':'", .{name});
+        } else {
+            declared_type = try resolveDeclaredValueType(
+                declared_type_name,
+                struct_prototypes,
+                enum_prototypes,
+                span,
+                diagnostics,
+            );
+        }
     } else if (is_const) {
         try diagnostics.add(.@"error", "type.const.type", span, "local const '{s}' requires an explicit const-safe type", .{name});
     }

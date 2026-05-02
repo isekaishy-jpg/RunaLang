@@ -12,6 +12,7 @@ const session_ids = @import("../session/ids.zig");
 const domain_state = @import("domain_state_types.zig");
 const typed = @import("../typed/root.zig");
 const types = @import("../types/root.zig");
+const ast = @import("../ast/root.zig");
 
 pub const QueryFamily = enum {
     canonical_type,
@@ -243,7 +244,7 @@ pub const FunctionSignature = struct {
     generic_params: []const typed.GenericParam,
     where_predicates: []const typed.WherePredicate,
     parameters: []const typed.Parameter,
-    return_type_name: []const u8,
+    return_type_syntax: ?ast.TypeSyntax = null,
     return_type: types.TypeRef,
     export_name: ?[]const u8,
     link_name: ?[]const u8,
@@ -253,7 +254,7 @@ pub const FunctionSignature = struct {
 pub const TypeAliasSignature = struct {
     generic_params: []const typed.GenericParam,
     where_predicates: []const typed.WherePredicate,
-    target_type_name: []const u8,
+    target_type_syntax: ast.TypeSyntax,
     target_type: types.TypeRef,
 };
 
@@ -295,11 +296,10 @@ pub const ConstRequiredExprSite = struct {
 };
 
 pub const ConstSignature = struct {
-    type_name: []const u8,
+    type_syntax: ast.TypeSyntax,
     ty: types.Builtin,
     type_ref: types.TypeRef,
     initializer_type_ref: types.TypeRef,
-    initializer_source: []const u8,
     expr: ?*const const_ir.Expr,
     lower_error: ?anyerror = null,
 };
@@ -341,8 +341,10 @@ pub const AssociatedConstBindingSignature = struct {
 pub const ImplSignature = struct {
     generic_params: []const typed.GenericParam,
     where_predicates: []const typed.WherePredicate,
-    target_type: []const u8,
-    trait_name: ?[]const u8,
+    target_type_syntax: ast.TypeSyntax,
+    target_type: types.TypeRef,
+    trait_syntax: ?ast.TypeSyntax = null,
+    trait_type: ?types.TypeRef = null,
     associated_types: []const typed.TraitAssociatedTypeBinding,
     associated_consts: []const AssociatedConstBindingSignature,
     methods: []const typed.TraitMethod,
@@ -383,10 +385,32 @@ pub const CheckedSignature = struct {
         switch (self.facts) {
             .function => |function| {
                 if (function.generic_params.len != 0) allocator.free(function.generic_params);
-                if (function.where_predicates.len != 0) allocator.free(function.where_predicates);
+                typed.deinitWherePredicates(allocator, function.where_predicates);
+                for (function.parameters) |parameter| {
+                    var owned = parameter;
+                    owned.deinit(allocator);
+                    switch (parameter.ty) {
+                        .named => |name| allocator.free(name),
+                        else => {},
+                    }
+                }
                 if (function.parameters.len != 0) allocator.free(function.parameters);
+                if (function.return_type_syntax) |return_type_syntax| {
+                    var owned = return_type_syntax;
+                    owned.deinit(allocator);
+                }
+                switch (function.return_type) {
+                    .named => |name| allocator.free(name),
+                    else => {},
+                }
             },
             .const_item => |const_item| {
+                var owned_type_syntax = const_item.type_syntax;
+                owned_type_syntax.deinit(allocator);
+                switch (const_item.type_ref) {
+                    .named => |name| allocator.free(name),
+                    else => {},
+                }
                 switch (const_item.initializer_type_ref) {
                     .named => |name| allocator.free(name),
                     else => {},
@@ -395,11 +419,17 @@ pub const CheckedSignature = struct {
             },
             .type_alias => |type_alias| {
                 if (type_alias.generic_params.len != 0) allocator.free(type_alias.generic_params);
-                if (type_alias.where_predicates.len != 0) allocator.free(type_alias.where_predicates);
+                typed.deinitWherePredicates(allocator, type_alias.where_predicates);
+                var owned_target_type_syntax = type_alias.target_type_syntax;
+                owned_target_type_syntax.deinit(allocator);
+                switch (type_alias.target_type) {
+                    .named => |name| allocator.free(name),
+                    else => {},
+                }
             },
             .struct_type => |struct_type| {
                 if (struct_type.generic_params.len != 0) allocator.free(struct_type.generic_params);
-                if (struct_type.where_predicates.len != 0) allocator.free(struct_type.where_predicates);
+                typed.deinitWherePredicates(allocator, struct_type.where_predicates);
                 if (struct_type.fields.len != 0) allocator.free(struct_type.fields);
             },
             .union_type => |union_type| {
@@ -407,7 +437,7 @@ pub const CheckedSignature = struct {
             },
             .enum_type => |enum_type| {
                 if (enum_type.generic_params.len != 0) allocator.free(enum_type.generic_params);
-                if (enum_type.where_predicates.len != 0) allocator.free(enum_type.where_predicates);
+                typed.deinitWherePredicates(allocator, enum_type.where_predicates);
                 for (enum_type.variants) |variant| {
                     var owned = variant;
                     owned.deinit(allocator);
@@ -416,24 +446,58 @@ pub const CheckedSignature = struct {
             },
             .opaque_type => |opaque_type| {
                 if (opaque_type.generic_params.len != 0) allocator.free(opaque_type.generic_params);
-                if (opaque_type.where_predicates.len != 0) allocator.free(opaque_type.where_predicates);
+                typed.deinitWherePredicates(allocator, opaque_type.where_predicates);
             },
             .trait_type => |trait_type| {
                 if (trait_type.generic_params.len != 0) allocator.free(trait_type.generic_params);
-                if (trait_type.where_predicates.len != 0) allocator.free(trait_type.where_predicates);
+                typed.deinitWherePredicates(allocator, trait_type.where_predicates);
                 for (trait_type.methods) |method| {
                     var owned = method;
                     owned.deinit(allocator);
                 }
                 if (trait_type.methods.len != 0) allocator.free(trait_type.methods);
                 if (trait_type.associated_types.len != 0) allocator.free(trait_type.associated_types);
+                for (trait_type.associated_consts) |associated_const| {
+                    var owned = associated_const;
+                    owned.deinit(allocator);
+                    switch (associated_const.type_ref) {
+                        .named => |name| allocator.free(name),
+                        else => {},
+                    }
+                }
                 if (trait_type.associated_consts.len != 0) allocator.free(trait_type.associated_consts);
             },
             .impl_block => |impl_block| {
                 if (impl_block.generic_params.len != 0) allocator.free(impl_block.generic_params);
-                if (impl_block.where_predicates.len != 0) allocator.free(impl_block.where_predicates);
+                typed.deinitWherePredicates(allocator, impl_block.where_predicates);
+                var owned_target_type_syntax = impl_block.target_type_syntax;
+                owned_target_type_syntax.deinit(allocator);
+                switch (impl_block.target_type) {
+                    .named => |name| allocator.free(name),
+                    else => {},
+                }
+                if (impl_block.trait_syntax) |trait_syntax| {
+                    var owned = trait_syntax;
+                    owned.deinit(allocator);
+                }
+                if (impl_block.trait_type) |trait_type| {
+                    switch (trait_type) {
+                        .named => |name| allocator.free(name),
+                        else => {},
+                    }
+                }
+                for (impl_block.associated_types) |binding| {
+                    var owned = binding;
+                    owned.deinit(allocator);
+                }
                 if (impl_block.associated_types.len != 0) allocator.free(impl_block.associated_types);
                 for (impl_block.associated_consts) |binding| {
+                    var owned_type_syntax = binding.const_item.type_syntax;
+                    owned_type_syntax.deinit(allocator);
+                    switch (binding.const_item.type_ref) {
+                        .named => |name| allocator.free(name),
+                        else => {},
+                    }
                     switch (binding.const_item.initializer_type_ref) {
                         .named => |name| allocator.free(name),
                         else => {},

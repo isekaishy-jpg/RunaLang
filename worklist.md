@@ -44,6 +44,121 @@ The goal is to implement all specs, not a partial showcase subset.
 - [x] Structured child-task teardown semantics
 - [x] Detached task rules and `'static` enforcement
 
+## Audit Closure Tranche
+- [x] Slice 1. Tranche setup and audit ledger
+- [x] Slice 2. Delete dead duplicate model files
+- [x] Slice 3. Structured attribute cutover and typed duplicate attribute deletion
+- [x] Slice 4. Structured signature and header cutover
+- [ ] Slice 5. Declaration and body-local type syntax cutover
+- [ ] Slice 6. Canonical query-owned type lowering cutover
+- [ ] Slice 7. Secondary consumer migration and duplicate typed helper deletion
+- [ ] Slice 8. `query/root.zig` overlap collapse and final raw-helper deletion
+- [ ] Slice 9. Manual audit rerun and closure notes
+
+### Audit Closure Ledger
+- `dead-code-duplication-audit.md` high severity
+  `compiler/typed/text.zig` -> Slice 7
+  `compiler/typed/callable_types.zig` -> Slice 7
+  `compiler/typed/attributes.zig` -> Slice 3
+  `compiler/query/root.zig` duplicate lowering overlap -> Slice 8
+- `dead-code-duplication-audit.md` medium severity
+  `compiler/expression_model.zig` -> Slice 2
+  `compiler/declaration_model.zig` -> Slice 2
+  `compiler/query/text.zig` -> Slice 8
+  `compiler/query/tuple_types.zig` -> Slice 8
+  `compiler/query/callable_checks.zig` local tuple parser -> Slice 7
+- `dead-code-duplication-audit.md` low severity
+  `compiler/typed/root.zig` import of `compiler/typed/attributes.zig` -> Slice 3
+  `compiler/query/root.zig` with `item_syntax_bridge.zig` and `body_syntax_bridge.zig` overlap -> Slice 8
+- `dead-code-duplication-audit.md` already resolved
+  duplicate public CLI helper entrypoints under `cmd/` -> already resolved
+- `dead-code-duplication-audit.md` not counted
+  ownership/lifetime clone helpers and user duplicate-declaration diagnostics -> not counted
+- `raw-text-parsing-audit.md` attribute reparsing
+  `compiler/query/attributes.zig`
+  `compiler/query/boundary_checks.zig`
+  `compiler/query/root.zig` attribute handling
+  `compiler/query/const_contexts.zig`
+  `compiler/query/signature_syntax_checks.zig`
+  -> Slice 3
+- `raw-text-parsing-audit.md` raw signature and header reparsing
+  `compiler/query/signatures.zig`
+  `compiler/query/item_syntax_bridge.zig` header surfaces
+  `compiler/query/root.zig` parameter and method header surfaces
+  -> Slice 4
+- `raw-text-parsing-audit.md` declaration and body-local type text truth
+  `compiler/query/item_syntax_bridge.zig` type positions
+  `compiler/query/body_syntax_bridge.zig`
+  `compiler/query/body_parse.zig` declared local const and local binding types
+  `compiler/query/root.zig` alias and impl target text truth
+  -> Slice 5
+- `raw-text-parsing-audit.md` canonical raw type parsers
+  `compiler/query/type_support.zig`
+  `compiler/query/callable_types.zig`
+  `compiler/query/foreign_callable_types.zig`
+  `compiler/query/tuple_types.zig`
+  `compiler/query/standard_families.zig`
+  `compiler/query/root.zig` canonical type formation
+  `compiler/query/backend_contract_query.zig` boundary base type extraction
+  `compiler/query/body_parse.zig` raw pointer pointee parsing
+  -> Slice 6
+- `raw-text-parsing-audit.md` secondary stringly consumers
+  `compiler/query/callable_checks.zig`
+  `compiler/query/expression_parse.zig`
+  `compiler/query/expression_checks.zig`
+  `compiler/query/trait_solver.zig`
+  `compiler/query/coherence_checks.zig`
+  `compiler/query/local_const_checks.zig`
+  `compiler/query/statement_checks.zig`
+  `compiler/query/pattern_checks.zig`
+  `compiler/query/checked_body.zig`
+  `compiler/query/handle_types.zig`
+  `compiler/query/domain_state_checks.zig`
+  -> Slice 7
+- `raw-text-parsing-audit.md` delayed const payload cleanup
+  `compiler/typed/declarations.zig` `initializer_source`
+  `compiler/query/types.zig` `initializer_source`
+  -> Slice 7
+- `raw-text-parsing-audit.md` low severity duplicate helpers
+  `compiler/typed/attributes.zig` -> Slice 3
+  `compiler/typed/callable_types.zig` -> Slice 7
+  `compiler/query/text.zig` -> Slice 8
+  `compiler/query/tuple_types.zig` -> Slice 8
+  `compiler/typed/text.zig` -> Slice 7
+- `raw-text-parsing-audit.md` not counted
+  `compiler/parse/*`, `toolchain/lsp/*`, `toolchain/package/root.zig`, and `toolchain/fmt/root.zig` -> not counted
+
+### Audit Closure Completion Notes
+- Slice 1 status: complete
+  Findings closed: tranche slice ownership recorded for every finding in both root audits.
+  Files manually reviewed: `worklist.md`, `dead-code-duplication-audit.md`, `raw-text-parsing-audit.md`, `fixes.md`.
+  Tests run: `zig build test`.
+  Deleted paths confirmed removed: none in this slice.
+- Slice 2 status: complete
+  Findings closed: `compiler/expression_model.zig`, `compiler/declaration_model.zig`.
+  Files manually reviewed: `compiler/expression_model.zig`, `compiler/declaration_model.zig`, `compiler/root.zig`, `build.zig`.
+  Tests run: `zig build test`.
+  Deleted paths confirmed removed: `compiler/expression_model.zig`, `compiler/declaration_model.zig`.
+- Slice 3 status: complete
+  Findings closed: `compiler/typed/attributes.zig`, attribute semantic consumers in `compiler/query/attributes.zig`, `compiler/query/boundary_checks.zig`, `compiler/query/root.zig`, `compiler/query/const_contexts.zig`, `compiler/query/signature_syntax_checks.zig`, and `compiler/query/test_discovery.zig`.
+  Files manually reviewed: `compiler/ast/root.zig`, `compiler/ast/attribute_syntax.zig`, `compiler/hir/root.zig`, `compiler/parse/cst_lower.zig`, `compiler/parse/attribute_syntax_lower.zig`, `compiler/attribute_support.zig`, `compiler/typed/root.zig`, `compiler/query/attributes.zig`, `compiler/query/boundary_checks.zig`, `compiler/query/const_contexts.zig`, `compiler/query/signature_syntax_checks.zig`, `compiler/query/root.zig`, `compiler/query/test_discovery.zig`.
+  Tests run: `zig build test`.
+  Deleted paths confirmed removed: `compiler/typed/attributes.zig`.
+- Slice 4 status: complete
+  Remaining blockers from the last review are fixed: frontend generic/`where` lowering now fails loudly, projection-equality predicates keep structured value-type syntax through query lowering/validation, impl signatures re-resolve target/trait types from structured syntax before facts are published, and stage0 build keeps the semantic session alive through backend merge/codegen so detached header/type data no longer corrupt standard enum codegen.
+  Files manually reviewed: `compiler/ast/item_syntax.zig`, `compiler/parse/item_syntax_lower.zig`, `compiler/signature_types.zig`, `compiler/query/signatures.zig`, `compiler/query/item_syntax_bridge.zig`, `compiler/query/root.zig`, `compiler/query/trait_solver.zig`, `compiler/query/types.zig`, `toolchain/build/root.zig`, `fixes.md`.
+  Tests run: `zig build test`.
+  Deleted paths confirmed removed: raw generic/`where`/parameter-mode parsing is removed from `compiler/query/signatures.zig`; no stage0 build path still depends on detached trimmed signature/header text for the repaired cases.
+- Slice 5 status: pending acceptance
+  Note: the slice-5 carrier and consumer changes are in tree, but the tranche checkbox stays open until slice 4 is actually closed and the tranche order is valid again.
+  Note: remaining slice-5 debt is concentrated in declaration/body consumers that still store or compare rendered type text, especially `compiler/query/body_syntax_bridge.zig` and the declaration/body carriers that still thread `ty.text()` or equivalent rendered names through field, tuple-payload, associated-value, and body-local declared-type paths.
+- Slice 6 status: pending
+  Note: slice 6 still owns the canonical type-lowering cutover. `compiler/type_syntax_support.zig` still collapses non-builtin `TypeSyntax` to shallow named refs and still recovers retained-borrow access from rendered/source text, while `compiler/query/type_support.zig`, `compiler/query/boundary_checks.zig`, and `compiler/query/abi_query.zig` still classify through rendered/display names instead of one authoritative lowered type path.
+- Slice 7 status: pending
+  Note: slice 7 still owns the downstream consumer sweep. `compiler/query/trait_solver.zig` and peer consumers still compare and canonicalize through rendered type names in several paths even though the upstream signature/header carriers are now structured.
+- Slice 8 status: pending
+- Slice 9 status: pending
+
 ## Typed Decomposition
 - [x] Extract `typed/` text scanning helpers from `compiler/typed/root.zig`
 - [x] Extract `typed/` attribute and symbol helpers from `compiler/typed/root.zig`

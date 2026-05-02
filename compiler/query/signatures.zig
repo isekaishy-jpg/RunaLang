@@ -1,13 +1,10 @@
 const std = @import("std");
+const ast = @import("../ast/root.zig");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
 const base_signatures = @import("../signature_types.zig");
-const typed_text = @import("text.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const Allocator = std.mem.Allocator;
-const findMatchingDelimiter = typed_text.findMatchingDelimiter;
-const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
-const isPlainIdentifier = typed_text.isPlainIdentifier;
-const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 
 pub const GenericParamKind = base_signatures.GenericParamKind;
 pub const GenericParam = base_signatures.GenericParam;
@@ -16,16 +13,8 @@ pub const ProjectionEqualityPredicate = base_signatures.ProjectionEqualityPredic
 pub const LifetimeOutlivesPredicate = base_signatures.LifetimeOutlivesPredicate;
 pub const TypeOutlivesPredicate = base_signatures.TypeOutlivesPredicate;
 pub const WherePredicate = base_signatures.WherePredicate;
-
-pub const NamedHeader = struct {
-    name: []const u8,
-    generic_params: []GenericParam,
-};
-
-pub const LeadingGenericParams = struct {
-    remaining_source: []const u8,
-    generic_params: []GenericParam,
-};
+pub const cloneWherePredicates = base_signatures.cloneWherePredicates;
+pub const deinitWherePredicates = base_signatures.deinitWherePredicates;
 
 pub fn isLifetimeName(raw: []const u8) bool {
     if (raw.len < 2 or raw[0] != '\'') return false;
@@ -42,104 +31,59 @@ pub fn isBuiltinLifetime(raw: []const u8) bool {
     return std.mem.eql(u8, raw, "'static");
 }
 
-pub fn parseGenericParams(allocator: Allocator, raw: []const u8, span: source.Span, diagnostics: *diag.Bag) ![]GenericParam {
-    const inner = std.mem.trim(u8, raw, " \t");
-    if (inner.len == 0) {
-        try diagnostics.add(.@"error", "type.generic.param", span, "generic and lifetime parameter lists may not be empty", .{});
-        return allocator.alloc(GenericParam, 0);
-    }
+pub fn lowerGenericParams(
+    allocator: Allocator,
+    generic_params: ?ast.GenericParamListSyntax,
+    diagnostics: *diag.Bag,
+) ![]GenericParam {
+    const syntax = generic_params orelse return allocator.alloc(GenericParam, 0);
 
-    const parts = try splitTopLevelCommaParts(allocator, inner);
-    defer allocator.free(parts);
+    if (syntax.invalid_kind) |invalid_kind| switch (invalid_kind) {
+        .empty_list => try diagnostics.add(.@"error", "type.generic.param", syntax.span, "generic and lifetime parameter lists may not be empty", .{}),
+        .malformed_entry => try diagnostics.add(.@"error", "type.generic.param", syntax.span, "malformed mixed generic and lifetime parameter list", .{}),
+    };
 
-    var generic_params = std.array_list.Managed(GenericParam).init(allocator);
-    errdefer generic_params.deinit();
+    var lowered = std.array_list.Managed(GenericParam).init(allocator);
+    errdefer lowered.deinit();
 
-    for (parts) |part| {
-        if (part.len == 0) {
-            try diagnostics.add(.@"error", "type.generic.param", span, "malformed mixed generic and lifetime parameter list", .{});
-            continue;
-        }
-
-        const param = if (isLifetimeName(part)) blk: {
-            if (isBuiltinLifetime(part)) {
-                try diagnostics.add(.@"error", "type.lifetime.param", span, "lifetime parameter list may not declare builtin lifetime '{s}'", .{part});
-                continue;
-            }
-            break :blk GenericParam{ .name = part, .kind = .lifetime_param };
-        } else blk: {
-            if (!isPlainIdentifier(part)) {
-                try diagnostics.add(.@"error", "type.generic.param", span, "malformed mixed generic and lifetime parameter list", .{});
-                continue;
-            }
-            break :blk GenericParam{ .name = part, .kind = .type_param };
+    for (syntax.params) |param| {
+        const lowered_param = switch (param.kind) {
+            .lifetime_param => blk: {
+                if (!isLifetimeName(param.name)) {
+                    try diagnostics.add(.@"error", "type.generic.param", param.span, "malformed mixed generic and lifetime parameter list", .{});
+                    continue;
+                }
+                if (isBuiltinLifetime(param.name)) {
+                    try diagnostics.add(.@"error", "type.lifetime.param", param.span, "lifetime parameter list may not declare builtin lifetime '{s}'", .{param.name});
+                    continue;
+                }
+                break :blk GenericParam{ .name = param.name, .kind = .lifetime_param };
+            },
+            .type_param => blk: {
+                if (!isPlainIdentifier(param.name)) {
+                    try diagnostics.add(.@"error", "type.generic.param", param.span, "malformed mixed generic and lifetime parameter list", .{});
+                    continue;
+                }
+                break :blk GenericParam{ .name = param.name, .kind = .type_param };
+            },
         };
 
         var duplicate = false;
-        for (generic_params.items) |existing| {
-            if (std.mem.eql(u8, existing.name, param.name)) {
+        for (lowered.items) |existing| {
+            if (std.mem.eql(u8, existing.name, lowered_param.name)) {
                 duplicate = true;
                 break;
             }
         }
         if (duplicate) {
-            try diagnostics.add(.@"error", "type.generic.param_duplicate", span, "duplicate generic or lifetime parameter '{s}'", .{param.name});
+            try diagnostics.add(.@"error", "type.generic.param_duplicate", param.span, "duplicate generic or lifetime parameter '{s}'", .{lowered_param.name});
             continue;
         }
 
-        try generic_params.append(param);
+        try lowered.append(lowered_param);
     }
 
-    return generic_params.toOwnedSlice();
-}
-
-pub fn parseNamedHeader(allocator: Allocator, raw: []const u8, span: source.Span, diagnostics: *diag.Bag) !NamedHeader {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) return error.InvalidParse;
-
-    if (std.mem.indexOfScalar(u8, trimmed, '[')) |open_index| {
-        const close_index = findMatchingDelimiter(trimmed, open_index, '[', ']') orelse {
-            try diagnostics.add(.@"error", "type.generic.param", span, "malformed mixed generic and lifetime parameter list", .{});
-            return .{ .name = std.mem.trim(u8, trimmed[0..open_index], " \t"), .generic_params = try allocator.alloc(GenericParam, 0) };
-        };
-        const name = std.mem.trim(u8, trimmed[0..open_index], " \t");
-        const trailing = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t");
-        if (!isPlainIdentifier(name) or trailing.len != 0) {
-            try diagnostics.add(.@"error", "type.generic.param", span, "malformed mixed generic and lifetime parameter list", .{});
-        }
-        return .{
-            .name = name,
-            .generic_params = try parseGenericParams(allocator, trimmed[open_index + 1 .. close_index], span, diagnostics),
-        };
-    }
-
-    return .{
-        .name = trimmed,
-        .generic_params = try allocator.alloc(GenericParam, 0),
-    };
-}
-
-pub fn parseLeadingGenericParams(allocator: Allocator, raw: []const u8, span: source.Span, diagnostics: *diag.Bag) !LeadingGenericParams {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0 or trimmed[0] != '[') {
-        return .{
-            .remaining_source = trimmed,
-            .generic_params = try allocator.alloc(GenericParam, 0),
-        };
-    }
-
-    const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse {
-        try diagnostics.add(.@"error", "type.generic.param", span, "malformed mixed generic and lifetime parameter list", .{});
-        return .{
-            .remaining_source = trimmed,
-            .generic_params = try allocator.alloc(GenericParam, 0),
-        };
-    };
-
-    return .{
-        .remaining_source = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t"),
-        .generic_params = try parseGenericParams(allocator, trimmed[1..close_index], span, diagnostics),
-    };
+    return lowered.toOwnedSlice();
 }
 
 pub fn mergeGenericParams(
@@ -190,100 +134,98 @@ pub fn validateLifetimeReference(name: []const u8, generic_params: []const Gener
     try diagnostics.add(.@"error", "type.lifetime.unknown", span, "unknown lifetime name '{s}'", .{name});
 }
 
-pub fn parseWherePredicates(
+pub fn lowerWherePredicates(
     allocator: Allocator,
-    raw: []const u8,
+    clauses: []const ast.WhereClauseSyntax,
     generic_params: []const GenericParam,
     allow_self: bool,
-    span: source.Span,
     diagnostics: *diag.Bag,
 ) ![]WherePredicate {
-    if (!std.mem.startsWith(u8, raw, "where ")) return allocator.alloc(WherePredicate, 0);
-
-    var body = std.mem.trim(u8, raw["where ".len..], " \t");
-    if (std.mem.endsWith(u8, body, ":")) body = std.mem.trim(u8, body[0 .. body.len - 1], " \t");
-    if (body.len == 0) {
-        try diagnostics.add(.@"error", "type.where.syntax", span, "where clauses require at least one predicate", .{});
-        return allocator.alloc(WherePredicate, 0);
+    var predicates = std.array_list.Managed(WherePredicate).init(allocator);
+    errdefer {
+        for (predicates.items) |*predicate| predicate.deinit(allocator);
+        predicates.deinit();
     }
 
-    const parts = try splitTopLevelCommaParts(allocator, body);
-    defer allocator.free(parts);
-
-    var predicates = std.array_list.Managed(WherePredicate).init(allocator);
-    errdefer predicates.deinit();
-
-    for (parts) |part| {
-        if (part.len == 0) {
-            try diagnostics.add(.@"error", "type.where.syntax", span, "malformed where predicate list", .{});
-            continue;
+    for (clauses) |clause| {
+        if (clause.invalid_kind == .empty_clause) {
+            try diagnostics.add(.@"error", "type.where.syntax", clause.span, "where clauses require at least one predicate", .{});
         }
 
-        if (findTopLevelHeaderScalar(part, '=')) |equal_index| {
-            const left = std.mem.trim(u8, part[0..equal_index], " \t");
-            const right = std.mem.trim(u8, part[equal_index + 1 ..], " \t");
-            const dot_index = std.mem.lastIndexOfScalar(u8, left, '.') orelse {
-                try diagnostics.add(.@"error", "type.where.projection", span, "malformed projection equality predicate '{s}'", .{part});
-                continue;
-            };
-            const subject_name = std.mem.trim(u8, left[0..dot_index], " \t");
-            const associated_name = std.mem.trim(u8, left[dot_index + 1 ..], " \t");
-            if ((subject_name.len == 0 or (!allow_self or !std.mem.eql(u8, subject_name, "Self")) and !genericParamExists(generic_params, subject_name, .type_param)) or
-                !isPlainIdentifier(associated_name) or
-                right.len == 0)
-            {
-                try diagnostics.add(.@"error", "type.where.projection", span, "malformed projection equality predicate '{s}'", .{part});
-                continue;
+        for (clause.predicates) |predicate| {
+            switch (predicate) {
+                .bound => |bound| {
+                    if (bound.subject_name.len == 0 or bound.contract_name.len == 0) {
+                        try diagnostics.add(.@"error", "type.where.syntax", bound.span, "malformed where predicate", .{});
+                        continue;
+                    }
+                    if ((!allow_self or !std.mem.eql(u8, bound.subject_name, "Self")) and !genericParamExists(generic_params, bound.subject_name, .type_param)) {
+                        try diagnostics.add(.@"error", "type.where.unknown_name", bound.span, "unknown constrained name '{s}'", .{bound.subject_name});
+                        continue;
+                    }
+                    try predicates.append(.{ .bound = .{
+                        .subject_name = bound.subject_name,
+                        .contract_name = bound.contract_name,
+                    } });
+                },
+                .projection_equality => |projection| {
+                    const rendered_value_type = try type_syntax_support.render(allocator, projection.value_type);
+                    defer allocator.free(rendered_value_type);
+                    if ((!allow_self or !std.mem.eql(u8, projection.subject_name, "Self")) and !genericParamExists(generic_params, projection.subject_name, .type_param)) {
+                        try diagnostics.add(.@"error", "type.where.projection", projection.span, "malformed projection equality predicate '{s}.{s} = {s}'", .{
+                            projection.subject_name,
+                            projection.associated_name,
+                            rendered_value_type,
+                        });
+                        continue;
+                    }
+                    if (!isPlainIdentifier(projection.associated_name) or type_syntax_support.containsInvalid(projection.value_type)) {
+                        try diagnostics.add(.@"error", "type.where.projection", projection.span, "malformed projection equality predicate '{s}.{s} = {s}'", .{
+                            projection.subject_name,
+                            projection.associated_name,
+                            rendered_value_type,
+                        });
+                        continue;
+                    }
+                    try predicates.append(.{ .projection_equality = .{
+                        .subject_name = projection.subject_name,
+                        .associated_name = projection.associated_name,
+                        .value_type_syntax = try projection.value_type.clone(allocator),
+                    } });
+                },
+                .lifetime_outlives => |outlives| try predicates.append(.{ .lifetime_outlives = .{
+                    .longer_name = outlives.longer_name,
+                    .shorter_name = outlives.shorter_name,
+                } }),
+                .type_outlives => |outlives| {
+                    if ((!allow_self or !std.mem.eql(u8, outlives.type_name, "Self")) and !genericParamExists(generic_params, outlives.type_name, .type_param)) {
+                        try diagnostics.add(.@"error", "type.where.unknown_name", outlives.span, "unknown constrained name '{s}'", .{outlives.type_name});
+                        continue;
+                    }
+                    try predicates.append(.{ .type_outlives = .{
+                        .type_name = outlives.type_name,
+                        .lifetime_name = outlives.lifetime_name,
+                    } });
+                },
+                .invalid => |invalid| {
+                    if (std.mem.indexOfScalar(u8, invalid.text, '=')) |_| {
+                        try diagnostics.add(.@"error", "type.where.projection", invalid.span, "malformed projection equality predicate '{s}'", .{invalid.text});
+                    } else {
+                        try diagnostics.add(.@"error", "type.where.syntax", invalid.span, "malformed where predicate '{s}'", .{invalid.text});
+                    }
+                },
             }
-            try predicates.append(.{ .projection_equality = .{
-                .subject_name = subject_name,
-                .associated_name = associated_name,
-                .value_type_name = right,
-            } });
-            continue;
         }
-
-        if (findTopLevelHeaderScalar(part, ':')) |colon_index| {
-            const left = std.mem.trim(u8, part[0..colon_index], " \t");
-            const right = std.mem.trim(u8, part[colon_index + 1 ..], " \t");
-            if (left.len == 0 or right.len == 0) {
-                try diagnostics.add(.@"error", "type.where.syntax", span, "malformed where predicate '{s}'", .{part});
-                continue;
-            }
-
-            if (isLifetimeName(left) and isLifetimeName(right)) {
-                try predicates.append(.{ .lifetime_outlives = .{
-                    .longer_name = left,
-                    .shorter_name = right,
-                } });
-                continue;
-            }
-
-            if (isLifetimeName(right)) {
-                if ((!allow_self or !std.mem.eql(u8, left, "Self")) and !genericParamExists(generic_params, left, .type_param)) {
-                    try diagnostics.add(.@"error", "type.where.unknown_name", span, "unknown constrained name '{s}'", .{left});
-                    continue;
-                }
-                try predicates.append(.{ .type_outlives = .{
-                    .type_name = left,
-                    .lifetime_name = right,
-                } });
-                continue;
-            }
-
-            if ((!allow_self or !std.mem.eql(u8, left, "Self")) and !genericParamExists(generic_params, left, .type_param)) {
-                try diagnostics.add(.@"error", "type.where.unknown_name", span, "unknown constrained name '{s}'", .{left});
-                continue;
-            }
-            try predicates.append(.{ .bound = .{
-                .subject_name = left,
-                .contract_name = right,
-            } });
-            continue;
-        }
-
-        try diagnostics.add(.@"error", "type.where.syntax", span, "malformed where predicate '{s}'", .{part});
     }
 
     return predicates.toOwnedSlice();
+}
+
+fn isPlainIdentifier(raw: []const u8) bool {
+    if (raw.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(raw[0]) or raw[0] == '_')) return false;
+    for (raw[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
 }

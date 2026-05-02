@@ -1492,7 +1492,8 @@ test "checked signature facts come from stored syntax not typed payload" {
         else => return error.UnexpectedStructure,
     };
     try std.testing.expect(function.return_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
-    try std.testing.expectEqualStrings("I32", function.return_type_name);
+    try std.testing.expect(function.return_type_syntax != null);
+    try std.testing.expectEqualStrings("I32", function.return_type_syntax.?.text());
 
     try compiler.query.finalizeSemanticChecks(&active);
     const mir_module = active.pipeline.modules.items[main_entry.pipeline_module_index].mir.?;
@@ -1933,8 +1934,13 @@ test "checked signatures expose declared repr and abi surface facts" {
         \\struct Point:
         \\    x: I32
         \\
-        \\#repr[c, I32]
+        \\#repr[c, CInt]
         \\enum Status:
+        \\    Ok = 0
+        \\    Err = 1
+        \\
+        \\#repr[c, I32]
+        \\enum BuiltinStatus:
         \\    Ok = 0
         \\    Err = 1
         \\
@@ -1970,7 +1976,18 @@ test "checked signatures expose declared repr and abi surface facts" {
         else => return error.UnexpectedStructure,
     };
     switch (compiler.query.testing.canonicalTypeKey(&active, status_repr) orelse return error.UnexpectedStructure) {
-        .builtin_scalar => |scalar| try std.testing.expectEqual(compiler.types.BuiltinScalar.i32, scalar),
+        .c_abi_alias => |alias| try std.testing.expectEqual(compiler.types.CAbiAlias.c_int, alias),
+        else => return error.UnexpectedStructure,
+    }
+
+    const builtin_status_id = compiler.query.testing.findItemIdByName(&active, "BuiltinStatus").?;
+    const builtin_status = try compiler.query.checkedSignature(&active, builtin_status_id);
+    const builtin_status_repr = switch (builtin_status.surface.declared_repr) {
+        .c_enum => |repr_type| repr_type,
+        else => return error.UnexpectedStructure,
+    };
+    switch (compiler.query.testing.canonicalTypeKey(&active, builtin_status_repr) orelse return error.UnexpectedStructure) {
+        .builtin_scalar => |builtin| try std.testing.expectEqual(compiler.types.BuiltinScalar.i32, builtin),
         else => return error.UnexpectedStructure,
     }
 
@@ -3038,7 +3055,7 @@ test "checked signatures expose semantic item facts" {
         .const_item => |const_sig| {
             try std.testing.expectEqual(compiler.types.Builtin.i32, const_sig.ty);
             try std.testing.expect(const_sig.expr != null);
-            try std.testing.expectEqualStrings("4", const_sig.initializer_source);
+            try std.testing.expectEqualStrings("I32", const_sig.type_syntax.text());
         },
         else => return error.UnexpectedStructure,
     }
@@ -6473,6 +6490,116 @@ test "query validates export and link attribute shapes" {
     try std.testing.expect(saw_unknown_key);
     try std.testing.expect(saw_link_target);
     try std.testing.expect(saw_conflict);
+}
+
+test "malformed and argument-bearing declaration attributes do not activate semantics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#export[name = "broken"] junk
+        \\fn exported() -> I32:
+        \\    return 1
+        \\
+        \\#domain_root[name = "oops"]
+        \\struct Root:
+        \\    id: I32
+        \\
+        \\#unsafe[name = "oops"]
+        \\extern["c"] fn puts(value: CInt) -> CInt
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_attr_form = false;
+    var saw_domain_root_args = false;
+    var saw_unsafe_args = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.form")) saw_attr_form = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.domain_root.args")) saw_domain_root_args = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.bare")) saw_unsafe_args = true;
+    }
+    try std.testing.expect(saw_attr_form);
+    try std.testing.expect(saw_domain_root_args);
+    try std.testing.expect(saw_unsafe_args);
+
+    const exported_id = compiler.query.testing.findItemIdByName(&active, "exported").?;
+    const exported = try compiler.query.checkedSignature(&active, exported_id);
+    try std.testing.expectEqual(compiler.query.AbiSurfaceRole.none, exported.surface.abi_role);
+
+    const root_id = compiler.query.testing.findItemIdByName(&active, "Root").?;
+    const root_signature = try compiler.query.checkedSignature(&active, root_id);
+    try std.testing.expect(root_signature.domain_signature == .none);
+
+    const puts_id = compiler.query.testing.findItemIdByName(&active, "puts").?;
+    const puts = try compiler.query.checkedSignature(&active, puts_id);
+    try std.testing.expect(!puts.surface.unsafe_required);
+}
+
+test "quoted boundary and repr arguments do not activate semantics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\#boundary["api"]
+        \\pub fn api_entry() -> I32:
+        \\    return 0
+        \\
+        \\#repr["c"]
+        \\struct Point:
+        \\    x: I32
+        \\
+        \\#repr[c, "CInt"]
+        \\enum Status:
+        \\    Ok
+        \\    Err
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.semantic.openFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    var saw_boundary_kind = false;
+    var saw_repr_args = false;
+    var saw_repr_value = false;
+    for (active.pipeline.diagnostics.items.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code, "type.boundary.kind")) saw_boundary_kind = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.repr.args")) saw_repr_args = true;
+        if (std.mem.eql(u8, diagnostic.code, "type.attr.repr.value")) saw_repr_value = true;
+    }
+    try std.testing.expect(saw_boundary_kind);
+    try std.testing.expect(saw_repr_args);
+    try std.testing.expect(saw_repr_value);
+
+    const api_entry_id = compiler.query.testing.findItemIdByName(&active, "api_entry").?;
+    const api_entry = try compiler.query.checkedSignature(&active, api_entry_id);
+    try std.testing.expectEqual(compiler.query.BoundaryKind.none, api_entry.boundary_kind);
+
+    const point_id = compiler.query.testing.findItemIdByName(&active, "Point").?;
+    const point = try compiler.query.checkedSignature(&active, point_id);
+    try std.testing.expectEqual(compiler.types.DeclaredRepr.default, point.surface.declared_repr);
+
+    const status_id = compiler.query.testing.findItemIdByName(&active, "Status").?;
+    const status = try compiler.query.checkedSignature(&active, status_id);
+    try std.testing.expectEqual(compiler.types.DeclaredRepr.default, status.surface.declared_repr);
 }
 
 test "query ABI validation rejects unsupported stage0 foreign signature types" {
@@ -9923,7 +10050,7 @@ test "semantic accepts trait impl associated type binding" {
     };
     try std.testing.expectEqual(@as(usize, 1), impl_block.associated_types.len);
     try std.testing.expectEqualStrings("Item", impl_block.associated_types[0].name);
-    try std.testing.expectEqualStrings("I32", impl_block.associated_types[0].value_type_name);
+    try std.testing.expectEqualStrings("I32", impl_block.associated_types[0].value_type_syntax.text());
 }
 
 test "semantic rejects missing trait impl associated type binding" {
@@ -10033,7 +10160,7 @@ test "semantic accepts trait impl associated const binding" {
         .trait_type => |signature| {
             try std.testing.expectEqual(@as(usize, 1), signature.associated_consts.len);
             try std.testing.expectEqualStrings("BLOCK_SIZE", signature.associated_consts[0].name);
-            try std.testing.expectEqualStrings("Index", signature.associated_consts[0].type_name);
+            try std.testing.expectEqualStrings("Index", signature.associated_consts[0].type_syntax.text());
         },
         else => return error.UnexpectedTestResult,
     }

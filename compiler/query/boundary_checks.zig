@@ -1,4 +1,5 @@
 const std = @import("std");
+const attribute_support = @import("../attribute_support.zig");
 const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
@@ -17,11 +18,12 @@ pub const BoundaryKind = enum {
 };
 
 pub fn kindForItem(item: *const typed.Item) BoundaryKind {
-    for (item.attributes) |attribute| {
-        if (!std.mem.eql(u8, attribute.name, "boundary")) continue;
-        return parseRawBoundaryKind(attribute.raw) orelse .none;
-    }
-    return .none;
+    const kind = attribute_support.boundaryKind(item.attributes) orelse return .none;
+    return switch (kind) {
+        .api => .api,
+        .value => .value,
+        .capability => .capability,
+    };
 }
 
 pub fn validateItem(item: *const typed.Item, diagnostics: *diag.Bag) !void {
@@ -31,10 +33,10 @@ pub fn validateItem(item: *const typed.Item, diagnostics: *diag.Bag) !void {
     for (item.attributes) |attribute| {
         if (!std.mem.eql(u8, attribute.name, "boundary")) continue;
         boundary_count += 1;
-        if (parseRawBoundaryKind(attribute.raw)) |kind| {
+        if (boundaryKindForAttribute(attribute)) |kind| {
             if (first_kind == null) first_kind = kind;
         } else {
-            try diagnostics.add(.@"error", "type.boundary.kind", item.span, "unsupported boundary attribute form '{s}'", .{attribute.raw});
+            try diagnostics.add(.@"error", "type.boundary.kind", attribute.span, "unsupported boundary attribute form on '#boundary[...]'", .{});
         }
     }
 
@@ -74,13 +76,14 @@ pub fn validateSignature(active: *session.Session, checked: anytype, diagnostics
     }
 }
 
-fn parseRawBoundaryKind(raw: []const u8) ?BoundaryKind {
-    var trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len != 0 and trimmed[0] == '#') trimmed = trimmed[1..];
-    if (std.mem.eql(u8, trimmed, "boundary[api]")) return .api;
-    if (std.mem.eql(u8, trimmed, "boundary[value]")) return .value;
-    if (std.mem.eql(u8, trimmed, "boundary[capability]")) return .capability;
-    return null;
+fn boundaryKindForAttribute(attribute: @import("../ast/root.zig").Attribute) ?BoundaryKind {
+    const attributes = [_]@import("../ast/root.zig").Attribute{attribute};
+    const kind = attribute_support.boundaryKind(attributes[0..]) orelse return null;
+    return switch (kind) {
+        .api => .api,
+        .value => .value,
+        .capability => .capability,
+    };
 }
 
 const BoundaryCategory = enum {
@@ -96,7 +99,7 @@ fn validateApiSignature(active: *session.Session, checked: anytype, diagnostics:
     };
 
     for (function.parameters) |parameter| {
-        const boundary = parseBoundaryType(parameter.type_name);
+        const boundary = parseBoundaryType(parameter.ty.displayName());
         if (parameter.mode == .read or parameter.mode == .edit or boundary.isBoundary()) {
             try diagnostics.add(
                 .@"error",
@@ -108,25 +111,25 @@ fn validateApiSignature(active: *session.Session, checked: anytype, diagnostics:
             continue;
         }
 
-        const category = try classifyTypeName(active, checked.module_id, parameter.type_name, parameter.ty, signature_resolver);
+        const category = try classifyTypeName(active, checked.module_id, parameter.ty.displayName(), parameter.ty, signature_resolver);
         if (category == .local_only) {
             try diagnostics.add(
                 .@"error",
                 "type.boundary.api_param_type",
                 checked.item.span,
                 "boundary API '{s}' parameter '{s}' uses local-only type '{s}'",
-                .{ checked.item.name, parameter.name, parameter.type_name },
+                .{ checked.item.name, parameter.name, parameter.ty.displayName() },
             );
         }
     }
 
-    if (try classifyTypeName(active, checked.module_id, function.return_type_name, function.return_type, signature_resolver) == .local_only) {
+    if (try classifyTypeName(active, checked.module_id, function.return_type.displayName(), function.return_type, signature_resolver) == .local_only) {
         try diagnostics.add(
             .@"error",
             "type.boundary.api_return_type",
             checked.item.span,
             "boundary API '{s}' returns local-only type '{s}'",
-            .{ checked.item.name, function.return_type_name },
+            .{ checked.item.name, function.return_type.displayName() },
         );
     }
 }
