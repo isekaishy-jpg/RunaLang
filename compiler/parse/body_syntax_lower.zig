@@ -2,6 +2,7 @@ const std = @import("std");
 const array_list = std.array_list;
 const ast = @import("../ast/root.zig");
 const cst = @import("../cst/root.zig");
+const type_syntax_lower = @import("type_syntax_lower.zig");
 const source = @import("../source/root.zig");
 const syntax = @import("../syntax/root.zig");
 const Allocator = std.mem.Allocator;
@@ -391,9 +392,19 @@ fn lowerBindingStatement(
         name_text = trimSpanText(makeSubspanText(left_trimmed, 0, colon_index)) orelse left_trimmed;
         const raw_declared_type = makeSubspanText(left_trimmed, colon_index + 1, left_trimmed.text.len);
         if (trimSpanText(raw_declared_type)) |type_text| {
-            declared_type = .{ .source = type_text };
+            declared_type = try type_syntax_lower.lowerStandaloneTypeSyntax(allocator, type_text);
         } else {
-            declared_type = .{ .source = makeSubspanText(raw_declared_type, 0, 0) };
+            declared_type = try type_syntax_lower.invalidTypeSyntax(
+                allocator,
+                .{
+                    .text = "",
+                    .span = .{
+                        .file_id = raw_declared_type.span.file_id,
+                        .start = raw_declared_type.span.start,
+                        .end = raw_declared_type.span.start,
+                    },
+                },
+            );
         }
     }
 

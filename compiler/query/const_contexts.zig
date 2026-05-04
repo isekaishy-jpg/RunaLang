@@ -6,6 +6,7 @@ const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
+const type_support = @import("type_support.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
 const typed = @import("../typed/root.zig");
 const typed_text = @import("text.zig");
@@ -37,9 +38,13 @@ pub fn validateSignature(
     switch (checked.facts) {
         .function => |function| {
             for (function.parameters) |parameter| {
-                try validateTypeName(active, checked.module_id, parameter.ty.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                const parameter_type_name = try ownedTypeNameForSyntaxOrRef(diagnostics.allocator, parameter.type_syntax, parameter.ty);
+                defer diagnostics.allocator.free(parameter_type_name);
+                try validateTypeName(active, checked.module_id, parameter_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
-            try validateTypeName(active, checked.module_id, function.return_type.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            const return_type_name = try ownedTypeNameForSyntaxOrRef(diagnostics.allocator, function.return_type_syntax, function.return_type);
+            defer diagnostics.allocator.free(return_type_name);
+            try validateTypeName(active, checked.module_id, return_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .const_item => |const_item| {
             const type_name = try type_syntax_support.render(diagnostics.allocator, const_item.type_syntax);
@@ -52,29 +57,41 @@ pub fn validateSignature(
             try validateTypeName(active, checked.module_id, target_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .struct_type => |struct_type| for (struct_type.fields) |field| {
-            try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            const field_type_name = try type_syntax_support.render(diagnostics.allocator, field.type_syntax);
+            defer diagnostics.allocator.free(field_type_name);
+            try validateTypeName(active, checked.module_id, field_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .union_type => |union_type| for (union_type.fields) |field| {
-            try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            const field_type_name = try type_syntax_support.render(diagnostics.allocator, field.type_syntax);
+            defer diagnostics.allocator.free(field_type_name);
+            try validateTypeName(active, checked.module_id, field_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .enum_type => |enum_type| {
             for (enum_type.variants) |variant| {
                 switch (variant.payload) {
                     .none => {},
                     .tuple_fields => |fields| for (fields) |field| {
-                        try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                        const field_type_name = try type_syntax_support.render(diagnostics.allocator, field.type_syntax);
+                        defer diagnostics.allocator.free(field_type_name);
+                        try validateTypeName(active, checked.module_id, field_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
                     },
                     .named_fields => |fields| for (fields) |field| {
-                        try validateTypeName(active, checked.module_id, field.type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                        const field_type_name = try type_syntax_support.render(diagnostics.allocator, field.type_syntax);
+                        defer diagnostics.allocator.free(field_type_name);
+                        try validateTypeName(active, checked.module_id, field_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
                     },
                 }
             }
             try validateEnumDiscriminants(active, checked, enum_type.variants, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .impl_block => |impl_block| {
-            try validateTypeName(active, checked.module_id, impl_block.target_type.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            const target_type_name = try type_syntax_support.render(diagnostics.allocator, impl_block.target_type_syntax);
+            defer diagnostics.allocator.free(target_type_name);
+            try validateTypeName(active, checked.module_id, target_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             for (impl_block.associated_types) |binding| {
-                try validateTypeName(active, checked.module_id, binding.value_type.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+                const binding_type_name = try type_syntax_support.render(diagnostics.allocator, binding.value_type_syntax);
+                defer diagnostics.allocator.free(binding_type_name);
+                try validateTypeName(active, checked.module_id, binding_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
             }
             for (impl_block.associated_consts) |binding| {
                 const const_type_name = try type_syntax_support.render(diagnostics.allocator, binding.const_item.type_syntax);
@@ -83,7 +100,9 @@ pub fn validateSignature(
             }
         },
         .trait_type => |trait_type| for (trait_type.associated_consts) |associated_const| {
-            try validateTypeName(active, checked.module_id, associated_const.type_ref.displayName(), checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
+            const associated_type_name = try type_syntax_support.render(diagnostics.allocator, associated_const.type_syntax);
+            defer diagnostics.allocator.free(associated_type_name);
+            try validateTypeName(active, checked.module_id, associated_type_name, checked.item.span, diagnostics, resolve_identifier, resolve_associated_const, &summary);
         },
         .opaque_type, .none => {},
     }
@@ -142,7 +161,7 @@ fn validateEnumDiscriminants(
     const repr = try reprEnumInfo(active, checked.item.attributes);
     if (!repr.has_repr) {
         for (variants) |variant| {
-            if (variant.discriminant != null) {
+            if (variant.discriminant_source != null) {
                 summary.rejected_enum_discriminants += 1;
                 try diagnostics.add(
                     .@"error",
@@ -194,7 +213,7 @@ fn validateEnumDiscriminants(
             );
         }
 
-        const discriminant = variant.discriminant orelse {
+        const discriminant = variant.discriminant_source orelse {
             summary.rejected_enum_discriminants += 1;
             try diagnostics.add(
                 .@"error",
@@ -207,14 +226,14 @@ fn validateEnumDiscriminants(
         };
 
         summary.checked_enum_discriminants += 1;
-        const site = findConstRequiredExpr(checked.const_required_expr_sites, .enum_discriminant, variant.name, discriminant) orelse {
+        const site = findConstRequiredExpr(checked.const_required_expr_sites, .enum_discriminant, variant.name, discriminant.text) orelse {
             summary.rejected_enum_discriminants += 1;
-            try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, error.UnsupportedConstExpr);
+            try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant.text, error.UnsupportedConstExpr);
             continue;
         };
         const value = evalEnumDiscriminant(active, checked.module_id, site, repr_type.stage0Builtin(), resolve_identifier, resolve_associated_const) catch |err| {
             summary.rejected_enum_discriminants += 1;
-            try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant, err);
+            try reportEnumDiscriminantError(diagnostics, checked.item.span, variant.name, discriminant.text, err);
             continue;
         };
 
@@ -226,7 +245,7 @@ fn validateEnumDiscriminants(
                     "type.enum.discriminant_duplicate",
                     checked.item.span,
                     "C-layout enum variant '{s}' reuses discriminant '{s}'",
-                    .{ variant.name, discriminant },
+                    .{ variant.name, discriminant.text },
                 );
                 break;
             }
@@ -254,6 +273,15 @@ fn reprEnumInfo(active: *session.Session, attributes: []const ast.Attribute) !Re
         }
     }
     return result;
+}
+
+fn ownedTypeNameForSyntaxOrRef(
+    allocator: std.mem.Allocator,
+    type_syntax: ?ast.TypeSyntax,
+    ty: types.TypeRef,
+) ![]const u8 {
+    if (type_syntax) |syntax_value| return type_syntax_support.render(allocator, syntax_value);
+    return type_support.renderTypeRef(allocator, ty);
 }
 
 fn evalEnumDiscriminant(

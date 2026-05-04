@@ -1,11 +1,10 @@
 const callee_helpers = @import("callee_helpers.zig");
-const callable_types = @import("callable_types.zig");
 const const_ir = @import("const_ir.zig");
 const c_va_list = @import("../abi/c/va_list.zig");
-const foreign_callable_types = @import("foreign_callable_types.zig");
 const source = @import("../source/root.zig");
 const std = @import("std");
 const typed = @import("../typed/root.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 
 const Allocator = std.mem.Allocator;
@@ -119,7 +118,7 @@ pub const SpawnSite = struct {
     detached: bool,
     callable_arg_type: ?types.TypeRef = null,
     input_arg_type: ?types.TypeRef = null,
-    callable_output_type_name: ?[]const u8 = null,
+    callable_output_type: ?types.TypeRef = null,
 };
 
 pub const FunctionValueIssue = enum {
@@ -145,8 +144,8 @@ pub const CallableDispatchSite = struct {
     kind: CallableDispatchKind,
     arg_count: usize,
     arg_types: []const types.TypeRef,
-    input_type_name: ?[]const u8 = null,
-    output_type_name: ?[]const u8 = null,
+    input_type: ?types.TypeRef = null,
+    output_type: ?types.TypeRef = null,
     is_suspend: bool = false,
 };
 
@@ -927,8 +926,8 @@ const Builder = struct {
                         .detached = callee_helpers.isDetachedSpawnHelper(call.callee),
                         .callable_arg_type = if (call.args.len > 0) call.args[0].ty else null,
                         .input_arg_type = if (call.args.len > 1) call.args[1].ty else null,
-                        .callable_output_type_name = if (call.args.len > 0)
-                            self.callableOutputTypeName(callable_resolver, call.args[0])
+                        .callable_output_type = if (call.args.len > 0)
+                            self.callableOutputType(callable_resolver, call.args[0])
                         else
                             null,
                     });
@@ -1030,18 +1029,19 @@ const Builder = struct {
         }
     }
 
-    fn callableOutputTypeName(self: *Builder, callable_resolver: anytype, expr: *const typed.Expr) ?[]const u8 {
-        switch (expr.ty) {
-            .named => |raw_type_name| {
-                if (callable_types.parseCallableTypeName(raw_type_name, self.allocator) catch null) |callable| {
-                    return callable.output_type_name;
-                }
-            },
-            else => {},
+    fn callableOutputType(self: *Builder, callable_resolver: anytype, expr: *const typed.Expr) ?types.TypeRef {
+        if (type_support.callableFromTypeRef(self.allocator, expr.ty) catch null) |callable| {
+            return callable.output_type;
         }
 
         switch (expr.node) {
-            .identifier => |name| return callable_resolver.outputTypeName(name),
+            .identifier => |name| {
+                const output_name = callable_resolver.outputTypeName(name) orelse return null;
+                return switch (types.Builtin.fromName(output_name)) {
+                    .unsupported => .{ .named = output_name },
+                    else => |builtin| types.TypeRef.fromBuiltin(builtin),
+                };
+            },
             else => return null,
         }
     }
@@ -1197,28 +1197,25 @@ const Builder = struct {
         const arg_types = try self.allocator.alloc(types.TypeRef, call.args.len);
         errdefer self.allocator.free(arg_types);
         for (call.args, 0..) |arg, index| arg_types[index] = arg.ty;
-        switch (local_type) {
-            .named => |type_name| {
-                if (foreign_callable_types.startsForeignCallableType(type_name)) {
-                    self.allocator.free(arg_types);
-                    return;
-                }
-                if (try callable_types.parseCallableTypeName(type_name, self.allocator)) |callable| {
-                    self.summary.callable_dispatch_count += 1;
-                    try self.callable_dispatch_sites.append(.{
-                        .statement_index = statement_index,
-                        .callee_name = call.callee,
-                        .kind = .local_callable,
-                        .arg_count = call.args.len,
-                        .arg_types = arg_types,
-                        .input_type_name = callable.input_type_name,
-                        .output_type_name = callable.output_type_name,
-                        .is_suspend = callable.is_suspend,
-                    });
-                    return;
-                }
-            },
-            else => {},
+        if (try type_support.foreignCallableFromTypeRef(self.allocator, local_type)) |foreign_callable| {
+            var owned = foreign_callable;
+            defer owned.deinit(self.allocator);
+            self.allocator.free(arg_types);
+            return;
+        }
+        if (try type_support.callableFromTypeRef(self.allocator, local_type)) |callable| {
+            self.summary.callable_dispatch_count += 1;
+            try self.callable_dispatch_sites.append(.{
+                .statement_index = statement_index,
+                .callee_name = call.callee,
+                .kind = .local_callable,
+                .arg_count = call.args.len,
+                .arg_types = arg_types,
+                .input_type = callable.input_type,
+                .output_type = callable.output_type,
+                .is_suspend = callable.is_suspend,
+            });
+            return;
         }
         self.summary.callable_dispatch_count += 1;
         try self.callable_dispatch_sites.append(.{

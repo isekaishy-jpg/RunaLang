@@ -47,8 +47,8 @@ pub fn analyzeBody(
             }
         }
         if (!site.detached) {
-            if (site.callable_output_type_name) |output_type_name| {
-                if (!trait_solver.typeNameIsSendInEnvironment(active, body.module_id, output_type_name, body.function.where_predicates)) {
+            if (site.callable_output_type) |output_type| {
+                if (!typeIsSend(active, body, output_type)) {
                     summary.rejected_output_count += 1;
                     try diagnostics.add(
                         .@"error",
@@ -65,18 +65,10 @@ pub fn analyzeBody(
 }
 
 fn typeIsSend(active: *session.Session, body: query_types.CheckedBody, ty: types.TypeRef) bool {
-    return trait_solver.typeNameIsSendInEnvironment(
+    return trait_solver.typeRefIsSendInEnvironment(
         active,
         body.module_id,
-        typeRefName(ty),
+        ty,
         body.function.where_predicates,
     );
-}
-
-fn typeRefName(ty: types.TypeRef) []const u8 {
-    return switch (ty) {
-        .builtin => |builtin| builtin.displayName(),
-        .named => |raw_type_name| raw_type_name,
-        .unsupported => "Unsupported",
-    };
 }

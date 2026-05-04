@@ -3,15 +3,12 @@ const body_scope = @import("body_scope.zig");
 const conversions = @import("conversions.zig");
 const diag = @import("../diag/root.zig");
 const dynamic_library = @import("../runtime/dynamic_library/root.zig");
-const foreign_callable_types = @import("foreign_callable_types.zig");
 const raw_pointer = @import("../raw_pointer/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
-const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -24,11 +21,8 @@ const cVariadicArgumentTypeSupported = type_support.cVariadicArgumentTypeSupport
 const cVariadicCallArityValid = type_support.cVariadicCallArityValid;
 const cVariadicFixedParameterCount = type_support.cVariadicFixedParameterCount;
 const cVariadicTailIndex = type_support.cVariadicTailIndex;
-const findMatchingDelimiter = typed_text.findMatchingDelimiter;
 const findMethodPrototype = type_support.findMethodPrototype;
-const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const inferExprBoundaryTypeInScope = type_support.inferExprBoundaryTypeInScope;
-const parseBoundaryType = type_support.parseBoundaryType;
 
 pub const Summary = struct {
     checked_expression_count: usize = 0,
@@ -89,12 +83,16 @@ pub fn analyzeBody(
         summary.checked_conversion_count += 1;
         if (status == .rejected) {
             summary.rejected_conversion_count += 1;
+            const source_type_name = try type_support.renderTypeRef(diagnostics.allocator, site.source_type);
+            defer diagnostics.allocator.free(source_type_name);
+            const target_type_name = try type_support.renderTypeRef(diagnostics.allocator, site.target_type);
+            defer diagnostics.allocator.free(target_type_name);
             try diagnostics.add(
                 .@"error",
                 diagnostic_code.?,
                 body.item.span,
                 "conversion from '{s}' to '{s}' is not valid in this conversion mode",
-                .{ site.source_type.displayName(), site.target_type.displayName() },
+                .{ source_type_name, target_type_name },
             );
         }
     }
@@ -355,18 +353,16 @@ fn analyzeExpr(
             try analyzeExpr(active, scope, body, field.base, base_typed, diagnostics, summary, effective_unsafe);
 
             const field_name = std.mem.trim(u8, field.field_name.text, " \t");
-            if (tuple_types.projectionIndex(field_name)) |projection_index| {
+            if (tupleProjectionIndex(field_name)) |projection_index| {
                 const base_expr = base_typed orelse return;
-                const tuple_name = switch (base_expr.ty) {
-                    .named => |name| name,
-                    else => {
-                        if (!base_expr.ty.isUnsupported()) {
-                            try emit(diagnostics, summary, "type.tuple.projection", syntax_expr.span, "tuple projection requires a tuple-typed base expression", .{});
-                        }
-                        return;
-                    },
-                };
-                if ((try tuple_types.projectionElementType(diagnostics.allocator, tuple_name, projection_index)) == null) {
+                if ((try type_support.tupleElementType(diagnostics.allocator, base_expr.ty, projection_index)) == null) {
+                    if (!base_expr.ty.isUnsupported()) {
+                        try emit(diagnostics, summary, "type.tuple.projection", syntax_expr.span, "invalid tuple projection '.{s}'", .{field_name});
+                    }
+                } else {
+                    return;
+                }
+                if (!base_expr.ty.isUnsupported()) {
                     try emit(diagnostics, summary, "type.tuple.projection", syntax_expr.span, "invalid tuple projection '.{s}'", .{field_name});
                 }
                 return;
@@ -379,17 +375,15 @@ fn analyzeExpr(
             }
 
             const base_expr = base_typed orelse return;
-            const target_type_name = switch (base_expr.ty) {
-                .named => |name| parseBoundaryType(name).inner_type_name,
-                else => {
-                    if (!base_expr.ty.isUnsupported()) {
-                        try emit(diagnostics, summary, "type.field.base", syntax_expr.span, "field projection requires a struct-typed base expression", .{});
-                    }
-                    return;
-                },
-            };
-            const struct_name = typed_text.baseTypeName(target_type_name);
-            const fields = findStructFields(body, struct_name) orelse {
+            const boundary = type_support.boundaryFromTypeRef(base_expr.ty);
+            const target_type_name = (try type_support.baseTypeNameFromTypeRef(diagnostics.allocator, boundary.inner_type)) orelse "";
+            if (target_type_name.len == 0) {
+                if (!base_expr.ty.isUnsupported()) {
+                    try emit(diagnostics, summary, "type.field.base", syntax_expr.span, "field projection requires a struct-typed base expression", .{});
+                }
+                return;
+            }
+            const fields = findStructFields(body, target_type_name) orelse {
                 try emit(diagnostics, summary, "type.field.struct_unsupported", syntax_expr.span, "stage0 field projection supports only locally declared struct types", .{});
                 return;
             };
@@ -398,7 +392,7 @@ fn analyzeExpr(
             }
             try emit(diagnostics, summary, "type.field.unknown", syntax_expr.span, "unknown field '{s}' on struct '{s}'", .{
                 field_name,
-                struct_name,
+                target_type_name,
             });
         },
         .index => |index_syntax| {
@@ -551,10 +545,9 @@ fn analyzeExpr(
                     try analyzeExpr(active, scope, body, arg_syntax, arg_typed, diagnostics, summary, effective_unsafe);
                 }
 
-                const target_type_name = switch (self_typed.ty) {
-                    .named => |name| parseBoundaryType(name).inner_type_name,
-                    else => return,
-                };
+                const boundary = type_support.boundaryFromTypeRef(self_typed.ty);
+                const target_type_name = (try type_support.baseTypeNameFromTypeRef(diagnostics.allocator, boundary.inner_type)) orelse "";
+                if (target_type_name.len == 0) return;
                 const method_name = std.mem.trim(u8, field.field_name.text, " \t");
                 const prototype = findMethodPrototype(body.method_prototypes, target_type_name, method_name) orelse return;
                 try validateMethodCall(scope, body, target_type_name, method_name, prototype, typed_args, syntax_expr.span, diagnostics, summary);
@@ -945,7 +938,7 @@ fn validateDynamicLibraryCall(
             try emit(diagnostics, summary, "runtime.dynamic.open.path", span, "open_library path must be Str", .{});
         }
         const result_type = if (typed_expr) |expr| expr.ty else types.TypeRef.unsupported;
-        if (!result_type.isNamed(dynamic_library.open_result_type_name) and !result_type.isUnsupported()) {
+        if (!result_type.isUnsupported() and !std.mem.eql(u8, type_support.typeRefRawName(result_type), dynamic_library.open_result_type_name)) {
             try emit(diagnostics, summary, "runtime.dynamic.open.result", span, "open_library returns Result[DynamicLibrary, DynamicLibraryError]", .{});
         }
         return;
@@ -958,7 +951,7 @@ fn validateDynamicLibraryCall(
             try emit(diagnostics, summary, "runtime.dynamic.lookup.arity", span, "lookup_symbol expects a DynamicLibrary and symbol name", .{});
             return;
         }
-        if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+        if (!args[0].ty.isUnsupported() and !std.mem.eql(u8, type_support.typeRefRawName(args[0].ty), dynamic_library.type_name)) {
             try emit(diagnostics, summary, "runtime.dynamic.lookup.library", span, "lookup_symbol first argument must be DynamicLibrary", .{});
         }
         if (!args[1].ty.isUnsupported() and !args[1].ty.eql(types.TypeRef.fromBuiltin(.str))) {
@@ -978,43 +971,37 @@ fn validateDynamicLibraryCall(
             try emit(diagnostics, summary, "runtime.dynamic.close.arity", span, "close_library expects exactly one DynamicLibrary argument", .{});
             return;
         }
-        if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+        if (!args[0].ty.isUnsupported() and !std.mem.eql(u8, type_support.typeRefRawName(args[0].ty), dynamic_library.type_name)) {
             try emit(diagnostics, summary, "runtime.dynamic.close.library", span, "close_library argument must be DynamicLibrary", .{});
         }
         const result_type = if (typed_expr) |expr| expr.ty else types.TypeRef.unsupported;
-        if (!result_type.isNamed(dynamic_library.close_result_type_name) and !result_type.isUnsupported()) {
+        if (!result_type.isUnsupported() and !std.mem.eql(u8, type_support.typeRefRawName(result_type), dynamic_library.close_result_type_name)) {
             try emit(diagnostics, summary, "runtime.dynamic.close.result", span, "close_library returns Result[Unit, DynamicLibraryError]", .{});
         }
     }
 }
 
 fn dynamicLookupTypeSupported(allocator: Allocator, ty: types.TypeRef) !bool {
-    const raw = switch (ty) {
-        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
-        else => return false,
-    };
-    if (std.mem.startsWith(u8, raw, "*read ") or std.mem.startsWith(u8, raw, "*edit ")) return true;
-    var syntax = try foreign_callable_types.parseSyntax(allocator, raw) orelse return false;
-    defer syntax.deinit(allocator);
-    return syntax.variadic_tail == null;
+    if ((try type_support.rawPointerFromTypeRef(allocator, ty)) != null) return true;
+    if (try type_support.foreignCallableFromTypeRef(allocator, ty)) |callable| {
+        defer {
+            var owned = callable;
+            owned.deinit(allocator);
+        }
+        return !callable.variadic;
+    }
+    return false;
 }
 
 fn dynamicLookupResultTypeSupported(allocator: Allocator, ty: types.TypeRef) !bool {
-    const raw = switch (ty) {
-        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
-        else => return false,
-    };
-    if (!std.mem.startsWith(u8, raw, "Result[")) return false;
-    const open_index = "Result".len;
-    const close_index = findMatchingDelimiter(raw, open_index, '[', ']') orelse return false;
-    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t\r\n").len != 0) return false;
-    const args = try typed_text.splitTopLevelCommaParts(allocator, raw[open_index + 1 .. close_index]);
-    defer allocator.free(args);
-    if (args.len != 2) return false;
-    const ok_type = std.mem.trim(u8, args[0], " \t\r\n");
-    const err_type = std.mem.trim(u8, args[1], " \t\r\n");
-    if (!std.mem.eql(u8, err_type, dynamic_library.lookup_error_type_name)) return false;
-    return dynamicLookupTypeSupported(allocator, .{ .named = ok_type });
+    const args = try type_support.applicationArgsFromTypeRef(allocator, ty, "Result");
+    if (args == null) return false;
+    defer allocator.free(args.?);
+    if (args.?.len != 2) return false;
+    const ok_type = args.?[0];
+    const err_type = args.?[1];
+    if (!std.mem.eql(u8, type_support.typeRefRawName(err_type), dynamic_library.lookup_error_type_name)) return false;
+    return dynamicLookupTypeSupported(allocator, ok_type);
 }
 
 fn comparisonOperandsCompatible(operator: []const u8, lhs: types.TypeRef, rhs: types.TypeRef) bool {
@@ -1025,15 +1012,9 @@ fn comparisonOperandsCompatible(operator: []const u8, lhs: types.TypeRef, rhs: t
 
 fn equalityComparable(lhs: types.TypeRef, rhs: types.TypeRef) bool {
     if (lhs.eql(rhs)) return typeSupportsBuiltinEquality(lhs);
-    const lhs_pointer = switch (lhs) {
-        .named => |name| raw_pointer.parse(name) orelse return false,
-        else => return false,
-    };
-    const rhs_pointer = switch (rhs) {
-        .named => |name| raw_pointer.parse(name) orelse return false,
-        else => return false,
-    };
-    return std.mem.eql(u8, lhs_pointer.pointee, rhs_pointer.pointee) and
+    const lhs_pointer = (type_support.rawPointerFromTypeRef(std.heap.page_allocator, lhs) catch return false) orelse return false;
+    const rhs_pointer = (type_support.rawPointerFromTypeRef(std.heap.page_allocator, rhs) catch return false) orelse return false;
+    return lhs_pointer.pointee.eql(rhs_pointer.pointee) and
         (lhs_pointer.access == rhs_pointer.access or lhs_pointer.access == .read or rhs_pointer.access == .read);
 }
 
@@ -1048,8 +1029,8 @@ fn typeSupportsBuiltinEquality(ty: types.TypeRef) bool {
             .str, .unsupported => false,
         },
         .named => |name| blk: {
-            if (raw_pointer.parse(name) != null) break :blk true;
-            if (foreign_callable_types.startsForeignCallableType(name)) break :blk true;
+            if ((type_support.rawPointerFromTypeRef(std.heap.page_allocator, ty) catch null) != null) break :blk true;
+            if ((type_support.foreignCallableFromTypeRef(std.heap.page_allocator, ty) catch null) != null) break :blk true;
             if (types.CAbiAlias.fromName(name)) |alias| break :blk alias != .c_void;
             if (std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "IndexRange")) break :blk true;
             break :blk false;
@@ -1074,10 +1055,7 @@ fn typeSupportsBuiltinOrdering(ty: types.TypeRef) bool {
 }
 
 fn typeIsRawPointer(ty: types.TypeRef) bool {
-    return switch (ty) {
-        .named => |name| raw_pointer.parse(name) != null,
-        else => false,
-    };
+    return (type_support.rawPointerFromTypeRef(std.heap.page_allocator, ty) catch null) != null;
 }
 
 fn importedParameterTypes(binding: *const typed.ImportedBinding) []const types.TypeRef {
@@ -1097,17 +1075,282 @@ fn resolveDirectFunction(active: *session.Session, body: query_types.CheckedBody
         if (!std.mem.eql(u8, prototype.name, name)) continue;
         return .{ .local = .{ .prototype = prototype } };
     }
-
     for (body.module.imports.items) |*binding| {
-        if (!std.mem.eql(u8, binding.local_name, name)) continue;
         if (binding.function_return_type == null) continue;
+        if (!std.mem.eql(u8, binding.local_name, name)) continue;
         return .{ .imported = .{
             .binding = binding,
             .unsafe_required = try importedUnsafeRequired(active, binding.target_symbol),
         } };
     }
-
     return null;
+}
+
+const LifetimeBinding = struct {
+    formal_name: []const u8,
+    actual_name: []const u8,
+};
+
+fn validateRetainedCallArguments(
+    scope: *const ScopeStack,
+    current_where_predicates: []const typed.WherePredicate,
+    parameter_types: []const types.TypeRef,
+    generic_params: []const typed.GenericParam,
+    where_predicates: []const typed.WherePredicate,
+    args: []const *typed.Expr,
+    callee_name: []const u8,
+    span: ?source.Span,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) !void {
+    var lifetime_bindings = std.array_list.Managed(LifetimeBinding).init(diagnostics.allocator);
+    defer lifetime_bindings.deinit();
+
+    for (args, 0..) |arg, index| {
+        if (index >= parameter_types.len) break;
+        const expected = type_support.boundaryFromTypeRef(parameter_types[index]);
+        if (expected.kind != .retained_read and expected.kind != .retained_edit) continue;
+
+        const actual = inferExprBoundaryTypeInScope(scope, arg);
+        switch (actual.kind) {
+            .retained_read, .retained_edit => {},
+            .ephemeral_read, .ephemeral_edit => {
+                try emit(diagnostics, summary, "lifetime.call.ephemeral_source", span, "retained argument {d} to '{s}' is derived only from an ephemeral borrow", .{
+                    index + 1,
+                    callee_name,
+                });
+                continue;
+            },
+            .value => {
+                try emit(diagnostics, summary, "lifetime.call.retained_source", span, "retained argument {d} to '{s}' must be a retained borrow value", .{
+                    index + 1,
+                    callee_name,
+                });
+                continue;
+            },
+        }
+
+        if (!boundaryAccessCompatible(actual, expected)) {
+            try emit(diagnostics, summary, "lifetime.call.mode", span, "retained argument {d} to '{s}' does not match the required borrow mode", .{
+                index + 1,
+                callee_name,
+            });
+            continue;
+        }
+
+        if (!boundaryInnerTypeCompatible(actual.inner_type, expected.inner_type, generic_params, true)) continue;
+
+        const expected_lifetime = expected.lifetime_name orelse continue;
+        const actual_lifetime = actual.lifetime_name orelse continue;
+        if (std.mem.eql(u8, expected_lifetime, "'static")) {
+            if (!lifetimeOutlivesInContext(current_where_predicates, actual_lifetime, "'static")) {
+                try emit(diagnostics, summary, "lifetime.call.outlives", span, "retained argument {d} to '{s}' does not satisfy required outlives relation", .{
+                    index + 1,
+                    callee_name,
+                });
+            }
+            continue;
+        }
+
+        if (findLifetimeBinding(lifetime_bindings.items, expected_lifetime)) |existing| {
+            if (!std.mem.eql(u8, existing, actual_lifetime)) {
+                try emit(diagnostics, summary, "lifetime.call.bind", span, "call to '{s}' would require incompatible lifetime bindings for '{s}'", .{
+                    callee_name,
+                    expected_lifetime,
+                });
+            }
+            continue;
+        }
+
+        try lifetime_bindings.append(.{
+            .formal_name = expected_lifetime,
+            .actual_name = actual_lifetime,
+        });
+    }
+
+    for (where_predicates) |predicate| {
+        switch (predicate) {
+            .lifetime_outlives => |outlives| {
+                const longer_name = resolveBoundLifetimeName(lifetime_bindings.items, outlives.longer_name) orelse continue;
+                const shorter_name = resolveBoundLifetimeName(lifetime_bindings.items, outlives.shorter_name) orelse continue;
+                if (!lifetimeOutlivesInContext(current_where_predicates, longer_name, shorter_name)) {
+                    try emit(diagnostics, summary, "lifetime.call.outlives", span, "call to '{s}' does not satisfy required outlives relation '{s}: {s}'", .{
+                        callee_name,
+                        outlives.longer_name,
+                        outlives.shorter_name,
+                    });
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn validateRetainedStorageArguments(
+    scope: *const ScopeStack,
+    fields: []const typed.StructField,
+    args: []const *typed.Expr,
+    container_name: []const u8,
+    span: ?source.Span,
+    diagnostics: *diag.Bag,
+    summary: *Summary,
+) !void {
+    for (args, 0..) |arg, index| {
+        if (index >= fields.len) break;
+        const expected = type_support.boundaryFromTypeRef(fields[index].ty);
+        if (expected.kind != .retained_read and expected.kind != .retained_edit) continue;
+
+        const actual = inferExprBoundaryTypeInScope(scope, arg);
+        switch (actual.kind) {
+            .retained_read, .retained_edit => {},
+            .ephemeral_read, .ephemeral_edit => {
+                try emit(diagnostics, summary, "lifetime.store.ephemeral_source", span, "stored retained field {d} for '{s}' is derived only from an ephemeral borrow", .{
+                    index + 1,
+                    container_name,
+                });
+                continue;
+            },
+            .value => {
+                try emit(diagnostics, summary, "lifetime.store.retained_source", span, "stored retained field {d} for '{s}' must be a retained borrow value", .{
+                    index + 1,
+                    container_name,
+                });
+                continue;
+            },
+        }
+
+        if (!boundaryAccessCompatible(actual, expected)) {
+            try emit(diagnostics, summary, "lifetime.store.mode", span, "stored retained field {d} for '{s}' does not match the required borrow mode", .{
+                index + 1,
+                container_name,
+            });
+        }
+    }
+}
+
+fn resolvedParameterTypeNames(allocator: std.mem.Allocator, resolved: ResolvedFunction) ![]const []const u8 {
+    _ = allocator;
+    return switch (resolved) {
+        .imported => |imported| importedParameterTypeNames(imported.binding),
+        .local => |local| local.prototype.parameter_type_names,
+    };
+}
+
+fn resolvedParameterTypes(resolved: ResolvedFunction) []const types.TypeRef {
+    return switch (resolved) {
+        .imported => |imported| importedParameterTypes(imported.binding),
+        .local => |local| local.prototype.parameter_types,
+    };
+}
+
+fn findLifetimeBinding(bindings: []const LifetimeBinding, formal_name: []const u8) ?[]const u8 {
+    for (bindings) |binding| {
+        if (std.mem.eql(u8, binding.formal_name, formal_name)) return binding.actual_name;
+    }
+    return null;
+}
+
+fn resolveBoundLifetimeName(bindings: []const LifetimeBinding, name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "'static")) return "'static";
+    return findLifetimeBinding(bindings, name);
+}
+
+fn lifetimeOutlivesInContext(where_predicates: []const typed.WherePredicate, longer_name: []const u8, shorter_name: []const u8) bool {
+    if (std.mem.eql(u8, longer_name, shorter_name)) return true;
+    if (std.mem.eql(u8, longer_name, "'static")) return true;
+    if (std.mem.eql(u8, shorter_name, "'static")) return false;
+
+    var frontier: usize = 0;
+    var queue: [32][]const u8 = undefined;
+    var seen: [32][]const u8 = undefined;
+    var queue_len: usize = 0;
+    var seen_len: usize = 0;
+    queue[queue_len] = longer_name;
+    queue_len += 1;
+    seen[seen_len] = longer_name;
+    seen_len += 1;
+
+    while (frontier < queue_len) : (frontier += 1) {
+        const current = queue[frontier];
+        for (where_predicates) |predicate| {
+            switch (predicate) {
+                .lifetime_outlives => |outlives| {
+                    if (!std.mem.eql(u8, outlives.longer_name, current)) continue;
+                    if (std.mem.eql(u8, outlives.shorter_name, shorter_name)) return true;
+                    if (seenSliceContains(seen[0..seen_len], outlives.shorter_name)) continue;
+                    if (queue_len >= queue.len or seen_len >= seen.len) continue;
+                    queue[queue_len] = outlives.shorter_name;
+                    queue_len += 1;
+                    seen[seen_len] = outlives.shorter_name;
+                    seen_len += 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    return false;
+}
+
+fn seenSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+fn directCallArgs(expr: ?*const typed.Expr) []const *typed.Expr {
+    const value = expr orelse return &.{};
+    return switch (value.node) {
+        .call => |call| call.args,
+        .constructor => |constructor| constructor.args,
+        .enum_construct => |construct| construct.args,
+        else => &.{},
+    };
+}
+
+fn typedFieldBase(expr: ?*const typed.Expr) ?*const typed.Expr {
+    const value = expr orelse return null;
+    return switch (value.node) {
+        .field => |field| field.base,
+        .method_target => |target| target.base,
+        else => null,
+    };
+}
+
+fn moduleHasNamedBinding(body: query_types.CheckedBody, name: []const u8) bool {
+    for (body.module.items.items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return true;
+    }
+    for (body.module.imports.items) |binding| {
+        if (std.mem.eql(u8, binding.local_name, name)) return true;
+    }
+    return false;
+}
+
+fn findStructFields(body: query_types.CheckedBody, name: []const u8) ?[]const typed.StructField {
+    for (body.struct_prototypes) |prototype| {
+        if (std.mem.eql(u8, prototype.name, name)) return prototype.fields;
+    }
+    for (body.module.imports.items) |binding| {
+        const fields = binding.struct_fields orelse continue;
+        if (std.mem.eql(u8, binding.local_name, name)) return fields;
+    }
+    return null;
+}
+
+fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
+    return type_support.fixedArrayElementType(std.heap.page_allocator, ty) catch null;
+}
+
+fn tupleProjectionIndex(raw: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '.') return null;
+    const digits = trimmed[1..];
+    if (digits.len == 0) return null;
+    if (digits[0] == '0' and digits.len > 1) return null;
+    for (digits) |byte| if (byte < '0' or byte > '9') return null;
+    return std.fmt.parseUnsigned(usize, digits, 10) catch null;
 }
 
 fn importedUnsafeRequired(active: *session.Session, target_symbol: []const u8) !bool {
@@ -1152,9 +1395,8 @@ fn validateDirectCall(
     const fixed_count = cVariadicFixedParameterCount(resolved.parameterCount(), parameter_type_names);
     for (args[0..@min(args.len, fixed_count)], 0..) |arg, index| {
         const expected = resolved.parameterType(index);
-        const expected_name = resolved.parameterTypeName(index);
         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
-            !callArgumentTypeCompatible(arg.ty, expected, expected_name, resolved.genericParams(), false))
+            !callArgumentTypeCompatible(arg.ty, expected, resolved.genericParams(), false))
         {
             try emit(diagnostics, summary, "type.call.arg", span, "call to '{s}' argument {d} has wrong type", .{
                 callee_name,
@@ -1178,7 +1420,7 @@ fn validateDirectCall(
     try validateRetainedCallArguments(
         scope,
         body.function.where_predicates,
-        parameter_type_names,
+        resolvedParameterTypes(resolved),
         resolved.genericParams(),
         switch (resolved) {
             .local => |local| local.prototype.where_predicates,
@@ -1212,9 +1454,8 @@ fn validateMethodCall(
     }
 
     for (args, prototype.parameter_types, 0..) |arg, expected, index| {
-        const expected_name = if (index < prototype.parameter_type_names.len) prototype.parameter_type_names[index] else expected.displayName();
         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
-            !callArgumentTypeCompatible(arg.ty, expected, expected_name, prototype.generic_params, true))
+            !callArgumentTypeCompatible(arg.ty, expected, prototype.generic_params, true))
         {
             try emit(diagnostics, summary, "type.method.arg", span, "method call to '{s}.{s}' argument {d} has wrong type", .{
                 target_type_name,
@@ -1238,7 +1479,7 @@ fn validateMethodCall(
     try validateRetainedCallArguments(
         scope,
         body.function.where_predicates,
-        prototype.parameter_type_names,
+        prototype.parameter_types,
         prototype.generic_params,
         prototype.where_predicates,
         args,
@@ -1374,269 +1615,6 @@ fn hasBorrowingParameters(resolved: ResolvedFunction) bool {
 fn hasBorrowingModeSlice(modes: []const typed.ParameterMode) bool {
     for (modes) |mode| if (mode == .read or mode == .edit) return true;
     return false;
-}
-
-const LifetimeBinding = struct {
-    formal_name: []const u8,
-    actual_name: []const u8,
-};
-
-fn validateRetainedCallArguments(
-    scope: *const ScopeStack,
-    current_where_predicates: []const typed.WherePredicate,
-    parameter_type_names: []const []const u8,
-    generic_params: []const typed.GenericParam,
-    where_predicates: []const typed.WherePredicate,
-    args: []const *typed.Expr,
-    callee_name: []const u8,
-    span: ?source.Span,
-    diagnostics: *diag.Bag,
-    summary: *Summary,
-) !void {
-    var lifetime_bindings = std.array_list.Managed(LifetimeBinding).init(diagnostics.allocator);
-    defer lifetime_bindings.deinit();
-
-    for (args, 0..) |arg, index| {
-        if (index >= parameter_type_names.len) break;
-        const expected = parseBoundaryType(parameter_type_names[index]);
-        if (expected.kind != .retained_read and expected.kind != .retained_edit) continue;
-
-        const actual = inferExprBoundaryTypeInScope(scope, arg);
-        switch (actual.kind) {
-            .retained_read, .retained_edit => {},
-            .ephemeral_read, .ephemeral_edit => {
-                try emit(diagnostics, summary, "lifetime.call.ephemeral_source", span, "retained argument {d} to '{s}' is derived only from an ephemeral borrow", .{
-                    index + 1,
-                    callee_name,
-                });
-                continue;
-            },
-            .value => {
-                try emit(diagnostics, summary, "lifetime.call.retained_source", span, "retained argument {d} to '{s}' must be a retained borrow value", .{
-                    index + 1,
-                    callee_name,
-                });
-                continue;
-            },
-        }
-
-        if (!boundaryAccessCompatible(actual, expected)) {
-            try emit(diagnostics, summary, "lifetime.call.mode", span, "retained argument {d} to '{s}' does not match the required borrow mode", .{
-                index + 1,
-                callee_name,
-            });
-            continue;
-        }
-
-        if (!boundaryInnerTypeCompatible(actual.inner_type_name, expected.inner_type_name, generic_params, true)) continue;
-
-        const expected_lifetime = expected.lifetime_name orelse continue;
-        const actual_lifetime = actual.lifetime_name orelse continue;
-        if (std.mem.eql(u8, expected_lifetime, "'static")) {
-            if (!lifetimeOutlivesInContext(current_where_predicates, actual_lifetime, "'static")) {
-                try emit(diagnostics, summary, "lifetime.call.outlives", span, "retained argument {d} to '{s}' does not satisfy required outlives relation", .{
-                    index + 1,
-                    callee_name,
-                });
-            }
-            continue;
-        }
-
-        if (findLifetimeBinding(lifetime_bindings.items, expected_lifetime)) |existing| {
-            if (!std.mem.eql(u8, existing, actual_lifetime)) {
-                try emit(diagnostics, summary, "lifetime.call.bind", span, "call to '{s}' would require incompatible lifetime bindings for '{s}'", .{
-                    callee_name,
-                    expected_lifetime,
-                });
-            }
-            continue;
-        }
-
-        try lifetime_bindings.append(.{
-            .formal_name = expected_lifetime,
-            .actual_name = actual_lifetime,
-        });
-    }
-
-    for (where_predicates) |predicate| {
-        switch (predicate) {
-            .lifetime_outlives => |outlives| {
-                const longer_name = resolveBoundLifetimeName(lifetime_bindings.items, outlives.longer_name) orelse continue;
-                const shorter_name = resolveBoundLifetimeName(lifetime_bindings.items, outlives.shorter_name) orelse continue;
-                if (!lifetimeOutlivesInContext(current_where_predicates, longer_name, shorter_name)) {
-                    try emit(diagnostics, summary, "lifetime.call.outlives", span, "call to '{s}' does not satisfy required outlives relation '{s}: {s}'", .{
-                        callee_name,
-                        outlives.longer_name,
-                        outlives.shorter_name,
-                    });
-                }
-            },
-            else => {},
-        }
-    }
-}
-
-fn validateRetainedStorageArguments(
-    scope: *const ScopeStack,
-    fields: []const typed.StructField,
-    args: []const *typed.Expr,
-    container_name: []const u8,
-    span: ?source.Span,
-    diagnostics: *diag.Bag,
-    summary: *Summary,
-) !void {
-    for (args, 0..) |arg, index| {
-        if (index >= fields.len) break;
-        const expected = parseBoundaryType(fields[index].type_name);
-        if (expected.kind != .retained_read and expected.kind != .retained_edit) continue;
-
-        const actual = inferExprBoundaryTypeInScope(scope, arg);
-        switch (actual.kind) {
-            .retained_read, .retained_edit => {},
-            .ephemeral_read, .ephemeral_edit => {
-                try emit(diagnostics, summary, "lifetime.store.ephemeral_source", span, "stored retained field {d} for '{s}' is derived only from an ephemeral borrow", .{
-                    index + 1,
-                    container_name,
-                });
-                continue;
-            },
-            .value => {
-                try emit(diagnostics, summary, "lifetime.store.retained_source", span, "stored retained field {d} for '{s}' must be a retained borrow value", .{
-                    index + 1,
-                    container_name,
-                });
-                continue;
-            },
-        }
-
-        if (!boundaryAccessCompatible(actual, expected)) {
-            try emit(diagnostics, summary, "lifetime.store.mode", span, "stored retained field {d} for '{s}' does not match the required borrow mode", .{
-                index + 1,
-                container_name,
-            });
-        }
-    }
-}
-
-fn resolvedParameterTypeNames(allocator: std.mem.Allocator, resolved: ResolvedFunction) ![]const []const u8 {
-    _ = allocator;
-    return switch (resolved) {
-        .imported => |imported| importedParameterTypeNames(imported.binding),
-        .local => |local| local.prototype.parameter_type_names,
-    };
-}
-
-fn findLifetimeBinding(bindings: []const LifetimeBinding, formal_name: []const u8) ?[]const u8 {
-    for (bindings) |binding| {
-        if (std.mem.eql(u8, binding.formal_name, formal_name)) return binding.actual_name;
-    }
-    return null;
-}
-
-fn resolveBoundLifetimeName(bindings: []const LifetimeBinding, name: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, name, "'static")) return "'static";
-    return findLifetimeBinding(bindings, name);
-}
-
-fn lifetimeOutlivesInContext(where_predicates: []const typed.WherePredicate, longer_name: []const u8, shorter_name: []const u8) bool {
-    if (std.mem.eql(u8, longer_name, shorter_name)) return true;
-    if (std.mem.eql(u8, longer_name, "'static")) return true;
-    if (std.mem.eql(u8, shorter_name, "'static")) return false;
-
-    var frontier: usize = 0;
-    var queue: [32][]const u8 = undefined;
-    var seen: [32][]const u8 = undefined;
-    var queue_len: usize = 0;
-    var seen_len: usize = 0;
-    queue[queue_len] = longer_name;
-    queue_len += 1;
-    seen[seen_len] = longer_name;
-    seen_len += 1;
-
-    while (frontier < queue_len) : (frontier += 1) {
-        const current = queue[frontier];
-        for (where_predicates) |predicate| {
-            switch (predicate) {
-                .lifetime_outlives => |outlives| {
-                    if (!std.mem.eql(u8, outlives.longer_name, current)) continue;
-                    if (std.mem.eql(u8, outlives.shorter_name, shorter_name)) return true;
-                    if (seenSliceContains(seen[0..seen_len], outlives.shorter_name)) continue;
-                    if (queue_len >= queue.len or seen_len >= seen.len) continue;
-                    queue[queue_len] = outlives.shorter_name;
-                    queue_len += 1;
-                    seen[seen_len] = outlives.shorter_name;
-                    seen_len += 1;
-                },
-                else => {},
-            }
-        }
-    }
-
-    return false;
-}
-
-fn seenSliceContains(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| {
-        if (std.mem.eql(u8, value, needle)) return true;
-    }
-    return false;
-}
-
-fn directCallArgs(expr: ?*const typed.Expr) []const *typed.Expr {
-    const value = expr orelse return &.{};
-    return switch (value.node) {
-        .call => |call| call.args,
-        .constructor => |constructor| constructor.args,
-        .enum_construct => |construct| construct.args,
-        else => &.{},
-    };
-}
-
-fn typedFieldBase(expr: ?*const typed.Expr) ?*const typed.Expr {
-    const value = expr orelse return null;
-    return switch (value.node) {
-        .field => |field| field.base,
-        .method_target => |target| target.base,
-        else => null,
-    };
-}
-
-fn moduleHasNamedBinding(body: query_types.CheckedBody, name: []const u8) bool {
-    for (body.module.items.items) |item| {
-        if (std.mem.eql(u8, item.name, name)) return true;
-    }
-    for (body.module.imports.items) |binding| {
-        if (std.mem.eql(u8, binding.local_name, name)) return true;
-    }
-    return false;
-}
-
-fn findStructFields(body: query_types.CheckedBody, name: []const u8) ?[]const typed.StructField {
-    for (body.struct_prototypes) |prototype| {
-        if (std.mem.eql(u8, prototype.name, name)) return prototype.fields;
-    }
-    for (body.module.imports.items) |binding| {
-        const fields = binding.struct_fields orelse continue;
-        if (std.mem.eql(u8, binding.local_name, name)) return fields;
-    }
-    return null;
-}
-
-fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
-    const raw = switch (ty) {
-        .named => |name| std.mem.trim(u8, name, " \t"),
-        else => return null,
-    };
-    if (!std.mem.startsWith(u8, raw, "[")) return null;
-    const close_index = findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
-    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t").len != 0) return null;
-    const inner = raw[1..close_index];
-    const separator = findTopLevelHeaderScalar(inner, ';') orelse return null;
-    const element_type = std.mem.trim(u8, inner[0..separator], " \t");
-    if (element_type.len == 0) return null;
-    const builtin = types.Builtin.fromName(element_type);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = element_type };
 }
 
 fn isComparisonOperator(operator: []const u8) bool {

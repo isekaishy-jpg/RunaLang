@@ -1,14 +1,19 @@
 const std = @import("std");
 const abi = @import("../abi/root.zig");
+const ast = @import("../ast/root.zig");
+const c_va_list = @import("../abi/c/va_list.zig");
 const layout = @import("../layout/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
+const standard_families = @import("standard_families.zig");
 const types = @import("../types/root.zig");
 
 const array_list = std.array_list;
 
 pub const Resolvers = struct {
     canonical_type_expression: *const fn (*session.Session, session.ModuleId, []const u8) anyerror!types.CanonicalTypeId,
+    canonical_type_ref: *const fn (*session.Session, session.ModuleId, types.TypeRef) anyerror!types.CanonicalTypeId,
+    canonical_type_syntax: *const fn (*session.Session, session.ModuleId, ast.TypeSyntax) anyerror!types.CanonicalTypeId,
     checked_signature: *const fn (*session.Session, session.ItemId) anyerror!query_types.CheckedSignature,
     layout_for_key: *const fn (*session.Session, layout.LayoutKey) anyerror!layout.LayoutResult,
     abi_type_for_key: *const fn (*session.Session, abi.AbiTypeKey) anyerror!abi.AbiTypeResult,
@@ -202,7 +207,7 @@ fn buildItemCallable(
     }
     if (variadic_tail_index) |tail_index| {
         const tail = function.parameters[tail_index];
-        if (!std.mem.eql(u8, tail.name, "...args") or !std.mem.eql(u8, std.mem.trim(u8, tail.ty.displayName(), " \t\r\n"), "CVaList")) {
+        if (!std.mem.eql(u8, tail.name, "...args") or !tail.ty.isNamed(c_va_list.type_name)) {
             callable_safe = false;
             try appendDiagnostic(active.allocator, &diagnostics, "abi.c.variadic.tail", "variadic foreign declarations must end with '...args: CVaList'");
         }
@@ -226,7 +231,13 @@ fn buildItemCallable(
 
     for (function.parameters, 0..) |parameter, index| {
         if (variadic_tail_index != null and index == variadic_tail_index.?) continue;
-        const parameter_type = try resolvers.canonical_type_expression(active, checked.module_id, parameter.ty.displayName());
+        const parameter_type = try canonicalTypeFromSyntaxOrRef(
+            active,
+            checked.module_id,
+            parameter.type_syntax,
+            parameter.ty,
+            resolvers,
+        );
         const parameter_abi = try resolvers.abi_type_for_key(active, .{
             .type_id = parameter_type,
             .target_name = key.target_name,
@@ -248,13 +259,19 @@ fn buildItemCallable(
         try appendValueResult(active.allocator, &params, parameter_type, parameter_abi.safe, passable, parameter_abi.returnable, parameter_abi.pass_mode, parameter_abi.reason);
     }
 
-    const return_type = try resolvers.canonical_type_expression(active, checked.module_id, function.return_type.displayName());
+    const return_type = try canonicalTypeFromSyntaxOrRef(
+        active,
+        checked.module_id,
+        function.return_type_syntax,
+        function.return_type,
+        resolvers,
+    );
     const return_abi = try resolvers.abi_type_for_key(active, .{
         .type_id = return_type,
         .target_name = key.target_name,
         .family = key.family,
     });
-    if (key.role == .foreign_export and isResultTypeName(function.return_type.displayName())) {
+    if (key.role == .foreign_export and isResultCanonicalType(active, return_type)) {
         callable_safe = false;
         try appendDiagnostic(active.allocator, &diagnostics, "abi.c.export.failure", "exported foreign functions cannot expose Result failure across the C ABI; translate explicitly or abort loudly");
     }
@@ -310,8 +327,19 @@ fn buildStructuralCallable(
     };
 }
 
-fn isResultTypeName(raw: []const u8) bool {
-    return std.mem.startsWith(u8, std.mem.trim(u8, raw, " \t\r\n"), "Result[");
+fn canonicalTypeFromSyntaxOrRef(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    type_syntax: ?ast.TypeSyntax,
+    ty: types.TypeRef,
+    resolvers: Resolvers,
+) !types.CanonicalTypeId {
+    if (type_syntax) |syntax_value| return resolvers.canonical_type_syntax(active, module_id, syntax_value);
+    return resolvers.canonical_type_ref(active, module_id, ty);
+}
+
+fn isResultCanonicalType(active: *const session.Session, type_id: types.CanonicalTypeId) bool {
+    return standard_families.familyForCanonicalType(active, type_id) == .result;
 }
 
 fn appendValueResult(
@@ -401,6 +429,6 @@ fn variadicTailIndex(function: query_types.FunctionSignature) ?usize {
     if (function.parameters.len == 0) return null;
     const last_index = function.parameters.len - 1;
     const last = function.parameters[last_index];
-    if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last.ty.displayName(), "...")) return last_index;
+    if (std.mem.startsWith(u8, last.name, "...") or last.ty.isNamed(c_va_list.type_name)) return last_index;
     return null;
 }

@@ -9,6 +9,8 @@ const query_text = @import("text.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
 const typed_decls = @import("../typed/declarations.zig");
+const type_lowering = @import("type_lowering.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const ConstData = typed_decls.ConstData;
@@ -58,7 +60,6 @@ fn validateTypeAliasSyntax(allocator: Allocator, item: hir.Item, diagnostics: *d
         .type_alias => |signature| signature,
         else => return error.InvalidParse,
     };
-    _ = allocator;
     const name = alias.name orelse {
         try diagnostics.add(.@"error", "type.alias.name", item.span, "type alias requires a name", .{});
         return;
@@ -70,7 +71,13 @@ fn validateTypeAliasSyntax(allocator: Allocator, item: hir.Item, diagnostics: *d
     if (!isPlainIdentifier(std.mem.trim(u8, name.text, " \t"))) {
         try diagnostics.add(.@"error", "type.alias.name", item.span, "malformed type alias name '{s}'", .{name.text});
     }
-    if (std.mem.trim(u8, target.text(), " \t").len == 0) {
+    if (type_syntax_support.containsInvalid(target)) {
+        try diagnostics.add(.@"error", "type.alias.target", item.span, "type alias '{s}' requires a target type", .{name.text});
+        return;
+    }
+    const rendered_target_name = try type_syntax_support.render(allocator, target);
+    defer allocator.free(rendered_target_name);
+    if (std.mem.trim(u8, rendered_target_name, " \t").len == 0) {
         try diagnostics.add(.@"error", "type.alias.target", item.span, "type alias '{s}' requires a target type", .{name.text});
     }
 }
@@ -93,7 +100,7 @@ fn validateStructSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag
     switch (item.body_syntax) {
         .struct_fields => |fields| {
             const lowered = try body_syntax_bridge.parseFieldsFromSyntax(allocator, fields, item.name, item.span, diagnostics);
-            defer allocator.free(lowered);
+            defer typed.deinitStructFields(allocator, lowered);
         },
         .none => {},
         else => return error.InvalidParse,
@@ -108,7 +115,7 @@ fn validateUnionSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag.
     switch (item.body_syntax) {
         .union_fields => |fields| {
             const lowered = try body_syntax_bridge.parseFieldsFromSyntax(allocator, fields, item.name, item.span, diagnostics);
-            defer allocator.free(lowered);
+            defer typed.deinitStructFields(allocator, lowered);
         },
         .none => {},
         else => return error.InvalidParse,
@@ -188,9 +195,11 @@ fn validateImplSyntax(allocator: Allocator, item: hir.Item, diagnostics: *diag.B
             }
 
             for (body.methods) |method| {
+                const target_type_name = try type_syntax_support.render(allocator, header.target_type_syntax);
+                defer allocator.free(target_type_name);
                 const parsed = try body_syntax_bridge.parseExecutableMethodFromSyntax(
                     allocator,
-                    header.target_type.displayName(),
+                    target_type_name,
                     header.generic_params,
                     method,
                     diagnostics,
@@ -213,7 +222,10 @@ fn parseImplAssociatedTypes(
     diagnostics: *diag.Bag,
 ) ![]TraitAssociatedTypeBinding {
     var lowered = std.array_list.Managed(TraitAssociatedTypeBinding).init(allocator);
-    errdefer lowered.deinit();
+    errdefer {
+        for (lowered.items) |*binding| binding.deinit(allocator);
+        lowered.deinit();
+    }
 
     for (associated_types) |associated_type| {
         const name = associated_type.name orelse {
@@ -226,7 +238,9 @@ fn parseImplAssociatedTypes(
         };
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const value_text = std.mem.trim(u8, value.text(), " \t");
+        const rendered_value_text = try type_syntax_support.render(allocator, value);
+        defer allocator.free(rendered_value_text);
+        const value_text = std.mem.trim(u8, rendered_value_text, " \t");
         if (!isPlainIdentifier(name_text) or value_text.len == 0) {
             try diagnostics.add(.@"error", "type.impl.associated_type", span, "malformed impl associated type binding '{s}'", .{name.text});
             continue;
@@ -247,7 +261,7 @@ fn parseImplAssociatedTypes(
         try lowered.append(.{
             .name = name_text,
             .value_type_syntax = try value.clone(allocator),
-            .value_type = types.TypeRef.fromBuiltin(types.Builtin.fromName(value_text)),
+            .value_type = try type_lowering.typeRefFromSyntax(allocator, value),
         });
     }
 
@@ -281,7 +295,9 @@ fn parseImplAssociatedConsts(
         }
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const type_name = std.mem.trim(u8, type_text.text(), " \t");
+        const rendered_type_name = try type_syntax_support.render(allocator, type_text);
+        defer allocator.free(rendered_type_name);
+        const type_name = std.mem.trim(u8, rendered_type_name, " \t");
         if (!isPlainIdentifier(name_text) or type_name.len == 0) {
             try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding '{s}'", .{name.text});
             continue;

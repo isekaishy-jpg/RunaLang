@@ -3,9 +3,7 @@ const body_scope = @import("body_scope.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
-const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const std = @import("std");
 
@@ -346,7 +344,7 @@ fn resolveAssignmentTarget(
     switch (target.node) {
         .name => |name| {
             const name_text = std.mem.trim(u8, name.text, " \t");
-            if (!typed_text.isPlainIdentifier(name_text)) {
+            if (!isPlainIdentifier(name_text)) {
                 try emit(diagnostics, summary, "type.assign.target", target.span, "stage0 assignment supports only plain locals or one struct field projection", .{});
                 return null;
             }
@@ -374,11 +372,11 @@ fn resolveAssignmentTarget(
                 },
             };
             const field_name = std.mem.trim(u8, field.field_name.text, " \t");
-            if (tuple_types.projectionIndex(field_name) != null) {
+            if (tupleProjectionIndex(field_name) != null) {
                 try emit(diagnostics, summary, "type.tuple.assign", target.span, "tuple field assignment is not part of v1", .{});
                 return null;
             }
-            if (!typed_text.isPlainIdentifier(base_name) or !typed_text.isPlainIdentifier(field_name)) {
+            if (!isPlainIdentifier(base_name) or !isPlainIdentifier(field_name)) {
                 try emit(diagnostics, summary, "type.assign.target", target.span, "stage0 assignment supports only plain locals or one struct field projection", .{});
                 return null;
             }
@@ -392,8 +390,8 @@ fn resolveAssignmentTarget(
                 return null;
             }
 
-            const struct_name = switch (base_type) {
-                .named => |name| name,
+            const struct_name = (try type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, base_type)) orelse switch (base_type) {
+                .named => type_support.typeRefRawName(base_type),
                 else => {
                     try emit(diagnostics, summary, "type.assign.target", target.span, "field assignment requires a struct-typed base expression", .{});
                     return null;
@@ -471,20 +469,7 @@ fn findStructFields(body: query_types.CheckedBody, name: []const u8) ?[]const ty
 }
 
 fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
-    const raw = switch (ty) {
-        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
-        else => return null,
-    };
-    if (!std.mem.startsWith(u8, raw, "[")) return null;
-    const close_index = typed_text.findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
-    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t\r\n").len != 0) return null;
-    const inner = raw[1..close_index];
-    const separator = typed_text.findTopLevelHeaderScalar(inner, ';') orelse return null;
-    const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
-    if (element_name.len == 0) return null;
-    const builtin = types.Builtin.fromName(element_name);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = element_name };
+    return type_support.fixedArrayElementType(std.heap.page_allocator, ty) catch null;
 }
 
 fn simpleIndexTargetText(expr: *const ast.BodyExprSyntax) ?[]const u8 {
@@ -493,6 +478,25 @@ fn simpleIndexTargetText(expr: *const ast.BodyExprSyntax) ?[]const u8 {
         .name => |name| std.mem.trim(u8, name.text, " \t\r\n"),
         else => null,
     };
+}
+
+fn isPlainIdentifier(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(text[0]) or text[0] == '_')) return false;
+    for (text[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
+}
+
+fn tupleProjectionIndex(raw: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '.') return null;
+    if (trimmed[1] == '0' and trimmed.len > 2) return null;
+    const digits = trimmed[1..];
+    if (digits.len == 0) return null;
+    for (digits) |byte| if (byte < '0' or byte > '9') return null;
+    return std.fmt.parseUnsigned(usize, digits, 10) catch null;
 }
 
 fn blockDefinitelyReturns(block: *const typed.Block) bool {

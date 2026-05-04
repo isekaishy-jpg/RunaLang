@@ -12,6 +12,7 @@ pub const summary = "Parsing from tokens and CST into AST.";
 
 pub const TextEdit = incremental.TextEdit;
 pub const ReparseStats = incremental.ReparseStats;
+pub const type_text_syntax = @import("type_text_syntax.zig");
 
 pub const ParsedFile = struct {
     tokens: syntax.TokenStore,
@@ -133,7 +134,7 @@ test "parse file lowers shallow AST items from CST grouping" {
             switch (signature.where_clauses[0].predicates[0]) {
                 .bound => |predicate| {
                     try std.testing.expectEqualStrings("T", predicate.subject_name);
-                    try std.testing.expectEqualStrings("Send", predicate.contract_name);
+                    try std.testing.expectEqualStrings("Send", predicate.contract_type.text());
                 },
                 else => return error.UnexpectedStructure,
             }

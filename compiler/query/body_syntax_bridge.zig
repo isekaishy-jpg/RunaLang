@@ -6,6 +6,8 @@ const item_syntax_bridge = @import("item_syntax_bridge.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const signatures = @import("signatures.zig");
 const typed_text = @import("text.zig");
+const type_text_syntax = @import("../parse/type_text_syntax.zig");
+const type_lowering = @import("type_lowering.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
@@ -51,6 +53,10 @@ pub fn parseFieldsFromSyntax(
     diagnostics: *diag.Bag,
 ) ![]StructField {
     var lowered = std.array_list.Managed(StructField).init(allocator);
+    errdefer {
+        for (lowered.items) |*field| field.deinit(allocator);
+        lowered.deinit();
+    }
     defer lowered.deinit();
 
     for (fields) |field| {
@@ -62,7 +68,7 @@ pub fn parseFieldsFromSyntax(
             try diagnostics.add(.@"error", "type.struct.field", span, "malformed field declaration '{s}'", .{name.text});
             continue;
         };
-        if (!isPlainIdentifier(name.text) or std.mem.trim(u8, ty.text(), " \t").len == 0) {
+        if (!isPlainIdentifier(name.text) or invalidTypeSyntax(ty)) {
             try diagnostics.add(.@"error", "type.struct.field", span, "malformed field declaration '{s}'", .{name.text});
             continue;
         }
@@ -85,7 +91,8 @@ pub fn parseFieldsFromSyntax(
         try lowered.append(.{
             .name = name.text,
             .visibility = field.visibility,
-            .type_name = std.mem.trim(u8, ty.text(), " \t"),
+            .type_syntax = try ty.clone(allocator),
+            .ty = try type_lowering.typeRefFromSyntax(allocator, ty),
         });
     }
 
@@ -118,11 +125,12 @@ pub fn parseEnumVariantsFromSyntax(
         var lowered_variant = EnumVariant{
             .name = name.text,
             .payload = .none,
-            .discriminant = if (variant.discriminant) |discriminant| std.mem.trim(u8, discriminant.text, " \t") else null,
+            .discriminant_source = variant.discriminant_source,
+            .discriminant_syntax = if (variant.discriminant_expr) |expr| try expr.clone(allocator) else null,
         };
         errdefer lowered_variant.deinit(allocator);
 
-        if (variant.discriminant) |discriminant| {
+        if (variant.discriminant_source) |discriminant| {
             if (std.mem.trim(u8, discriminant.text, " \t").len == 0) {
                 try diagnostics.add(.@"error", "type.enum.discriminant", span, "enum variant '{s}' has an empty discriminant", .{name.text});
             }
@@ -133,14 +141,19 @@ pub fn parseEnumVariantsFromSyntax(
                 try diagnostics.add(.@"error", "type.enum.variant", tuple_payload.span, "malformed enum tuple payload for variant '{s}'", .{name.text});
             } else {
                 var tuple_fields = std.array_list.Managed(TupleField).init(allocator);
-                errdefer tuple_fields.deinit();
+                errdefer {
+                    for (tuple_fields.items) |*field| field.deinit(allocator);
+                    tuple_fields.deinit();
+                }
                 for (tuple_payload.types) |field_type| {
-                    const trimmed = std.mem.trim(u8, field_type.text(), " \t");
-                    if (trimmed.len == 0) {
+                    if (invalidTypeSyntax(field_type)) {
                         try diagnostics.add(.@"error", "type.enum.variant", tuple_payload.span, "malformed enum tuple payload for variant '{s}'", .{name.text});
                         continue;
                     }
-                    try tuple_fields.append(.{ .type_name = trimmed });
+                    try tuple_fields.append(.{
+                        .type_syntax = try field_type.clone(allocator),
+                        .ty = try type_lowering.typeRefFromSyntax(allocator, field_type),
+                    });
                 }
                 lowered_variant.payload = .{ .tuple_fields = try tuple_fields.toOwnedSlice() };
             }
@@ -237,8 +250,7 @@ pub fn parseTraitBodyFromSyntax(
         };
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const type_name = std.mem.trim(u8, type_text.text(), " \t");
-        if (!isPlainIdentifier(name_text) or type_name.len == 0) {
+        if (!isPlainIdentifier(name_text) or invalidTypeSyntax(type_text)) {
             try diagnostics.add(.@"error", "type.trait.associated_const", span, "malformed trait associated const '{s}'", .{name.text});
             continue;
         }
@@ -256,12 +268,11 @@ pub fn parseTraitBodyFromSyntax(
             });
             continue;
         }
-        const builtin = types.Builtin.fromName(type_name);
         try associated_consts.append(.{
             .name = name_text,
             .type_syntax = try type_text.clone(allocator),
-            .ty = builtin,
-            .type_ref = try type_syntax_support.typeRefFromSyntax(allocator, type_text),
+            .ty = type_syntax_support.builtinFromSyntax(type_text),
+            .type_ref = try type_lowering.typeRefFromSyntax(allocator, type_text),
         });
     }
 
@@ -321,7 +332,10 @@ pub fn parseImplAssociatedTypesFromSyntax(
     diagnostics: *diag.Bag,
 ) ![]TraitAssociatedTypeBinding {
     var lowered = std.array_list.Managed(TraitAssociatedTypeBinding).init(allocator);
-    errdefer lowered.deinit();
+    errdefer {
+        for (lowered.items) |*binding| binding.deinit(allocator);
+        lowered.deinit();
+    }
 
     for (associated_types) |associated_type| {
         const name = associated_type.name orelse {
@@ -334,8 +348,7 @@ pub fn parseImplAssociatedTypesFromSyntax(
         };
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const value_text = std.mem.trim(u8, value.text(), " \t");
-        if (!isPlainIdentifier(name_text) or value_text.len == 0) {
+        if (!isPlainIdentifier(name_text) or invalidTypeSyntax(value)) {
             try diagnostics.add(.@"error", "type.impl.associated_type", span, "malformed impl associated type binding '{s}'", .{name.text});
             continue;
         }
@@ -355,7 +368,7 @@ pub fn parseImplAssociatedTypesFromSyntax(
         try lowered.append(.{
             .name = name_text,
             .value_type_syntax = try value.clone(allocator),
-            .value_type = try type_syntax_support.typeRefFromSyntax(allocator, value),
+            .value_type = try type_lowering.typeRefFromSyntax(allocator, value),
         });
     }
 
@@ -389,8 +402,7 @@ pub fn parseImplAssociatedConstsFromSyntax(
         }
 
         const name_text = std.mem.trim(u8, name.text, " \t");
-        const type_name = std.mem.trim(u8, type_text.text(), " \t");
-        if (!isPlainIdentifier(name_text) or type_name.len == 0) {
+        if (!isPlainIdentifier(name_text) or invalidTypeSyntax(type_text)) {
             try diagnostics.add(.@"error", "type.impl.associated_const", span, "malformed impl associated const binding '{s}'", .{name.text});
             continue;
         }
@@ -479,7 +491,7 @@ pub fn parseExecutableMethodFromSyntax(
     if (method.signature.return_type) |return_type| {
         if (!type_syntax_support.containsInvalid(return_type)) {
             function.return_type_syntax = try return_type.clone(allocator);
-            function.return_type = try type_syntax_support.typeRefFromSyntax(allocator, return_type);
+            function.return_type = try type_lowering.typeRefFromSyntax(allocator, return_type);
         }
     }
 
@@ -563,12 +575,13 @@ pub fn parseMethodReceiverFromSyntax(
     const mode = try item_syntax_bridge.parseParameterMode(parameter.mode, span, diagnostics);
     const maybe_type_syntax = parameter.ty;
     if (maybe_type_syntax == null) {
+        const target_type_ref = try recoverTargetTypeRef(allocator, target_type);
         return switch (mode) {
             .take, .read, .edit => .{
                 .name = "self",
                 .mode = mode,
                 .type_syntax = null,
-                .ty = .{ .named = target_type },
+                .ty = target_type_ref,
             },
             .owned => {
                 try diagnostics.add(.@"error", "type.method.receiver", span, "unsupported method receiver form", .{});
@@ -584,7 +597,7 @@ pub fn parseMethodReceiverFromSyntax(
             .name = "self",
             .mode = .take,
             .type_syntax = try type_syntax.clone(allocator),
-            .ty = try type_syntax_support.typeRefFromSyntax(allocator, type_syntax),
+            .ty = try type_lowering.typeRefFromSyntax(allocator, type_syntax),
         };
     }
 
@@ -611,8 +624,20 @@ pub fn parseOrdinaryParameterFromSyntax(
         .name = std.mem.trim(u8, name.text, " \t"),
         .mode = try item_syntax_bridge.parseParameterMode(parameter.mode, span, diagnostics),
         .type_syntax = try ty.clone(allocator),
-        .ty = try type_syntax_support.typeRefFromSyntax(allocator, ty),
+        .ty = try type_lowering.typeRefFromSyntax(allocator, ty),
     };
+}
+
+fn invalidTypeSyntax(ty: ast.TypeSyntax) bool {
+    return type_syntax_support.containsInvalid(ty);
+}
+
+fn recoverTargetTypeRef(allocator: Allocator, target_type: []const u8) !types.TypeRef {
+    var syntax_value = (try type_text_syntax.lowerStandalone(allocator, target_type)) orelse return .{ .named = target_type };
+    defer syntax_value.deinit(allocator);
+    const recovered = try type_lowering.typeRefFromSyntax(allocator, syntax_value);
+    if (!recovered.isUnsupported()) return recovered;
+    return .{ .named = target_type };
 }
 
 test "executable trait method parsing uses structured typed syntax" {

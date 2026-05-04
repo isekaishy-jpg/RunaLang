@@ -32,35 +32,25 @@ pub fn builtinFromSyntax(syntax: ast.TypeSyntax) types.Builtin {
     return types.Builtin.fromName(name);
 }
 
-pub fn typeRefFromSyntax(allocator: Allocator, syntax: ast.TypeSyntax) !types.TypeRef {
-    _ = allocator;
-    if (containsInvalid(syntax)) return .unsupported;
-    const builtin = builtinFromSyntax(syntax);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = syntax.text() };
-}
-
 pub fn borrowedSelfAccess(syntax: ast.TypeSyntax) ?BorrowedSelfAccess {
     if (!syntax.isStructured()) return null;
     const root = syntax.rootNode();
     return switch (root.payload) {
-        .borrow => |borrow| switch (borrow.access) {
-            .hold => blk: {
-                const child_indices = syntax.childNodeIndices(0);
-                if (child_indices.len == 0) break :blk null;
-                const inner = syntax.nodes[child_indices[child_indices.len - 1]];
-                switch (inner.payload) {
-                    .name_ref => {
-                        if (!std.mem.eql(u8, inner.source.text, "Self")) break :blk null;
-                    },
-                    else => break :blk null,
-                }
-                const tail = tokenBorrowTail(root.source.text);
-                if (std.mem.eql(u8, tail, "read")) break :blk .read;
-                if (std.mem.eql(u8, tail, "edit")) break :blk .edit;
-                break :blk null;
-            },
-            else => null,
+        .borrow => |borrow| blk: {
+            if (borrow.lifetime == null) break :blk null;
+            const child_indices = syntax.childNodeIndices(0);
+            if (child_indices.len == 0) break :blk null;
+            const inner = syntax.nodes[child_indices[child_indices.len - 1]];
+            switch (inner.payload) {
+                .name_ref => {
+                    if (!std.mem.eql(u8, inner.source.text, "Self")) break :blk null;
+                },
+                else => break :blk null,
+            }
+            break :blk switch (borrow.access) {
+                .read => .read,
+                .edit => .edit,
+            };
         },
         else => null,
     };
@@ -93,14 +83,12 @@ fn appendRendered(out: *std.array_list.Managed(u8), syntax: ast.TypeSyntax, node
             try out.append(']');
         },
         .borrow => |borrow| {
+            if (borrow.lifetime) |lifetime| {
+                try out.appendSlice("hold[");
+                try out.appendSlice(lifetime.text);
+                try out.appendSlice("] ");
+            }
             switch (borrow.access) {
-                .hold => {
-                    try out.appendSlice("hold[");
-                    if (borrow.lifetime) |lifetime| try out.appendSlice(lifetime.text);
-                    try out.appendSlice("] ");
-                    try out.appendSlice(tokenBorrowTail(node.source.text));
-                    if (tokenBorrowTail(node.source.text).len != 0) try out.append(' ');
-                },
                 .read => try out.appendSlice("read "),
                 .edit => try out.appendSlice("edit "),
             }
@@ -122,11 +110,39 @@ fn appendRendered(out: *std.array_list.Managed(u8), syntax: ast.TypeSyntax, node
             try out.append('.');
             try out.appendSlice(assoc.member.text);
         },
+        .tuple => {
+            const child_indices = syntax.childNodeIndices(node_index);
+            try out.append('(');
+            for (child_indices, 0..) |child_index, index| {
+                if (index != 0) try out.appendSlice(", ");
+                try appendRendered(out, syntax, child_index);
+            }
+            try out.append(')');
+        },
+        .fixed_array => |array| {
+            const child_indices = syntax.childNodeIndices(node_index);
+            try out.append('[');
+            if (child_indices.len != 0) try appendRendered(out, syntax, child_indices[0]);
+            try out.appendSlice("; ");
+            try out.appendSlice(array.length.text);
+            try out.append(']');
+        },
+        .foreign_callable => |callable| {
+            const child_indices = syntax.childNodeIndices(node_index);
+            try out.appendSlice("extern[");
+            try out.appendSlice(callable.abi.text);
+            try out.appendSlice("] fn(");
+            const parameter_count: usize = @intCast(callable.parameter_count);
+            for (0..parameter_count) |index| {
+                if (index != 0) try out.appendSlice(", ");
+                try appendRendered(out, syntax, child_indices[index]);
+            }
+            if (callable.has_variadic_tail) {
+                if (parameter_count != 0) try out.appendSlice(", ");
+                try out.appendSlice("...");
+            }
+            try out.appendSlice(") -> ");
+            if (child_indices.len != 0) try appendRendered(out, syntax, child_indices[child_indices.len - 1]);
+        },
     }
-}
-
-fn tokenBorrowTail(raw: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, raw, "] read ")) |_| return "read";
-    if (std.mem.indexOf(u8, raw, "] edit ")) |_| return "edit";
-    return "";
 }

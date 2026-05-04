@@ -1,6 +1,7 @@
 const std = @import("std");
 const array_list = std.array_list;
 const checked_body = @import("../query/checked_body.zig");
+const query_type_support = @import("../query/type_support.zig");
 const diag = @import("../diag/root.zig");
 const typed = @import("../typed/root.zig");
 const types = @import("../types/root.zig");
@@ -493,23 +494,24 @@ fn classifyLoopCondition(condition: ?*const typed.Expr) LoopCondition {
 }
 
 fn boundaryFromParameter(parameter: typed.Parameter) BoundaryType {
-    const retained = boundaryFromRawType(parameter.ty.displayName());
+    const type_name = typeRefRawName(parameter.ty);
+    const retained = boundaryFromRawType(type_name);
     if (retained.kind == .retained) return retained;
 
     return switch (parameter.mode) {
         .read => .{
             .kind = .ephemeral,
             .access = .read,
-            .inner_type_name = parameter.ty.displayName(),
+            .inner_type_name = type_name,
         },
         .edit => .{
             .kind = .ephemeral,
             .access = .edit,
-            .inner_type_name = parameter.ty.displayName(),
+            .inner_type_name = type_name,
         },
         .owned, .take => .{
             .kind = .value,
-            .inner_type_name = parameter.ty.displayName(),
+            .inner_type_name = type_name,
         },
     };
 }
@@ -681,9 +683,5 @@ fn optionalNameEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
 }
 
 fn typeRefRawName(ty: types.TypeRef) []const u8 {
-    return switch (ty) {
-        .builtin => |builtin| builtin.displayName(),
-        .named => |name| name,
-        .unsupported => "Unsupported",
-    };
+    return query_type_support.typeRefRawName(ty);
 }

@@ -43,6 +43,6 @@ pub const ItemMetadata = struct {
     owns_public_fields: bool = false,
 
     pub fn deinit(self: ItemMetadata, allocator: @import("std").mem.Allocator) void {
-        if (self.owns_public_fields) allocator.free(self.public_fields);
+        if (self.owns_public_fields) typed.deinitStructFields(allocator, @constCast(self.public_fields));
     }
 };

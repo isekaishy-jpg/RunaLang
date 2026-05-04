@@ -4,6 +4,7 @@ const session = @import("../session/root.zig");
 const checked_body = @import("checked_body.zig");
 const query_types = @import("types.zig");
 const domain_state_checks = @import("domain_state_checks.zig");
+const type_support = @import("type_support.zig");
 
 pub const Summary = struct {
     rejected_returns: usize = 0,
@@ -199,6 +200,8 @@ fn analyzeAssignmentWriteSites(
         if (site.target_base_type) |base_type| {
             if (domain_state_checks.classifyTypeRef(active, body.module_id, base_type) != null) continue;
             summary.rejected_storage += 1;
+            const base_type_name = try type_support.renderTypeRef(diagnostics.allocator, base_type);
+            defer diagnostics.allocator.free(base_type_name);
             try diagnostics.add(
                 .@"error",
                 "type.domain_state.storage",
@@ -208,7 +211,7 @@ fn analyzeAssignmentWriteSites(
                     body.item.name,
                     kindLabel(domain_ref.kind),
                     active.item(domain_ref.item_id).name,
-                    base_type.displayName(),
+                    base_type_name,
                 },
             );
             continue;
@@ -216,6 +219,8 @@ fn analyzeAssignmentWriteSites(
 
         if (domain_state_checks.classifyTypeRef(active, body.module_id, site.target_type) != null) continue;
         summary.rejected_storage += 1;
+        const target_type_name = try type_support.renderTypeRef(diagnostics.allocator, site.target_type);
+        defer diagnostics.allocator.free(target_type_name);
         try diagnostics.add(
             .@"error",
             "type.domain_state.storage",
@@ -225,7 +230,7 @@ fn analyzeAssignmentWriteSites(
                 body.item.name,
                 kindLabel(domain_ref.kind),
                 active.item(domain_ref.item_id).name,
-                site.target_type.displayName(),
+                target_type_name,
             },
         );
     }

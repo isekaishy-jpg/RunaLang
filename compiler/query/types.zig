@@ -288,6 +288,7 @@ pub const ConstRequiredExprSite = struct {
 
     pub fn deinit(self: *ConstRequiredExprSite, allocator: @import("std").mem.Allocator) void {
         if (self.expr) |expr| const_ir.destroyExpr(allocator, expr);
+        if (self.source.len != 0) allocator.free(self.source);
         self.* = .{
             .kind = .array_length,
             .source = "",
@@ -430,10 +431,10 @@ pub const CheckedSignature = struct {
             .struct_type => |struct_type| {
                 if (struct_type.generic_params.len != 0) allocator.free(struct_type.generic_params);
                 typed.deinitWherePredicates(allocator, struct_type.where_predicates);
-                if (struct_type.fields.len != 0) allocator.free(struct_type.fields);
+                typed.deinitStructFields(allocator, @constCast(struct_type.fields));
             },
             .union_type => |union_type| {
-                if (union_type.fields.len != 0) allocator.free(union_type.fields);
+                typed.deinitStructFields(allocator, @constCast(union_type.fields));
             },
             .enum_type => |enum_type| {
                 if (enum_type.generic_params.len != 0) allocator.free(enum_type.generic_params);

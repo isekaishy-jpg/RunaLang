@@ -2,13 +2,10 @@ const std = @import("std");
 const attribute_support = @import("../attribute_support.zig");
 const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const typed = @import("../typed/root.zig");
 const type_support = @import("type_support.zig");
-const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
-
-const baseTypeName = typed_text.baseTypeName;
-const parseBoundaryType = type_support.parseBoundaryType;
 
 pub const BoundaryKind = enum {
     none,
@@ -99,7 +96,7 @@ fn validateApiSignature(active: *session.Session, checked: anytype, diagnostics:
     };
 
     for (function.parameters) |parameter| {
-        const boundary = parseBoundaryType(parameter.ty.displayName());
+        const boundary = type_support.boundaryFromParameter(parameter);
         if (parameter.mode == .read or parameter.mode == .edit or boundary.isBoundary()) {
             try diagnostics.add(
                 .@"error",
@@ -111,25 +108,29 @@ fn validateApiSignature(active: *session.Session, checked: anytype, diagnostics:
             continue;
         }
 
-        const category = try classifyTypeName(active, checked.module_id, parameter.ty.displayName(), parameter.ty, signature_resolver);
+        const category = try classifyType(active, checked.module_id, parameter.ty, signature_resolver);
         if (category == .local_only) {
+            const parameter_type_name = try type_support.renderTypeRef(diagnostics.allocator, parameter.ty);
+            defer diagnostics.allocator.free(parameter_type_name);
             try diagnostics.add(
                 .@"error",
                 "type.boundary.api_param_type",
                 checked.item.span,
                 "boundary API '{s}' parameter '{s}' uses local-only type '{s}'",
-                .{ checked.item.name, parameter.name, parameter.ty.displayName() },
+                .{ checked.item.name, parameter.name, parameter_type_name },
             );
         }
     }
 
-    if (try classifyTypeName(active, checked.module_id, function.return_type.displayName(), function.return_type, signature_resolver) == .local_only) {
+    if (try classifyType(active, checked.module_id, function.return_type, signature_resolver) == .local_only) {
+        const return_type_name = try type_support.renderTypeRef(diagnostics.allocator, function.return_type);
+        defer diagnostics.allocator.free(return_type_name);
         try diagnostics.add(
             .@"error",
             "type.boundary.api_return_type",
             checked.item.span,
             "boundary API '{s}' returns local-only type '{s}'",
-            .{ checked.item.name, function.return_type.displayName() },
+            .{ checked.item.name, return_type_name },
         );
     }
 }
@@ -138,13 +139,15 @@ fn validateValueFamily(active: *session.Session, checked: anytype, diagnostics: 
     switch (checked.facts) {
         .struct_type => |struct_type| {
             for (struct_type.fields) |field| {
-                if (try classifyTypeName(active, checked.module_id, field.type_name, field.ty, signature_resolver) == .transfer_safe) continue;
+                if (try classifyType(active, checked.module_id, field.ty, signature_resolver) == .transfer_safe) continue;
+                const field_type_name = try type_syntax_support.render(diagnostics.allocator, field.type_syntax);
+                defer diagnostics.allocator.free(field_type_name);
                 try diagnostics.add(
                     .@"error",
                     "type.boundary.value_member",
                     checked.item.span,
                     "boundary value family '{s}' contains non-transfer-safe member '{s}' of type '{s}'",
-                    .{ checked.item.name, field.name, field.type_name },
+                    .{ checked.item.name, field.name, field_type_name },
                 );
             }
         },
@@ -154,7 +157,7 @@ fn validateValueFamily(active: *session.Session, checked: anytype, diagnostics: 
                     .none => {},
                     .tuple_fields => |fields| {
                         for (fields, 0..) |field, index| {
-                            if (try classifyTypeName(active, checked.module_id, field.type_name, field.ty, signature_resolver) == .transfer_safe) continue;
+                            if (try classifyType(active, checked.module_id, field.ty, signature_resolver) == .transfer_safe) continue;
                             try diagnostics.add(
                                 .@"error",
                                 "type.boundary.value_member",
@@ -166,7 +169,7 @@ fn validateValueFamily(active: *session.Session, checked: anytype, diagnostics: 
                     },
                     .named_fields => |fields| {
                         for (fields) |field| {
-                            if (try classifyTypeName(active, checked.module_id, field.type_name, field.ty, signature_resolver) == .transfer_safe) continue;
+                            if (try classifyType(active, checked.module_id, field.ty, signature_resolver) == .transfer_safe) continue;
                             try diagnostics.add(
                                 .@"error",
                                 "type.boundary.value_member",
@@ -183,14 +186,13 @@ fn validateValueFamily(active: *session.Session, checked: anytype, diagnostics: 
     }
 }
 
-fn classifyTypeName(
+fn classifyType(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
     ty: types.TypeRef,
     signature_resolver: anytype,
 ) anyerror!BoundaryCategory {
-    const boundary = parseBoundaryType(raw_type_name);
+    const boundary = type_support.boundaryFromTypeRef(ty);
     if (boundary.isBoundary()) return .local_only;
 
     switch (ty) {
@@ -199,7 +201,7 @@ fn classifyTypeName(
         .named => {},
     }
 
-    const name = baseTypeName(boundary.inner_type_name);
+    const name = (try type_support.baseTypeNameFromTypeRef(active.allocator, ty)) orelse return .local_only;
     if (name.len == 0) return .local_only;
     if (std.mem.eql(u8, name, "Task")) return .local_only;
 

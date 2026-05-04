@@ -1,6 +1,7 @@
 const std = @import("std");
 const array_list = std.array_list;
 const checked_body = @import("../query/checked_body.zig");
+const query_type_support = @import("../query/type_support.zig");
 const diag = @import("../diag/root.zig");
 const typed = @import("../typed/root.zig");
 const types = @import("../types/root.zig");
@@ -560,7 +561,7 @@ fn validateReturnExpr(
     expr: *const typed.Expr,
     diagnostics: *diag.Bag,
 ) !usize {
-    const expected = boundaryFromRawType(function.return_type.displayName());
+    const expected = boundaryFromRawType(typeRefRawName(function.return_type));
     if (expected.kind != .retained) return 0;
 
     var actual_set = try inferExprOrigins(diagnostics.allocator, state, expr);
@@ -715,23 +716,24 @@ fn projectBoundary(origin: BoundaryType, inner_type_name: []const u8) BoundaryTy
 }
 
 fn boundaryFromParameter(parameter: typed.Parameter) BoundaryType {
-    const retained = boundaryFromRawType(parameter.ty.displayName());
+    const type_name = typeRefRawName(parameter.ty);
+    const retained = boundaryFromRawType(type_name);
     if (retained.kind == .retained) return retained;
 
     return switch (parameter.mode) {
         .read => .{
             .kind = .ephemeral,
             .access = .read,
-            .inner_type_name = parameter.ty.displayName(),
+            .inner_type_name = type_name,
         },
         .edit => .{
             .kind = .ephemeral,
             .access = .edit,
-            .inner_type_name = parameter.ty.displayName(),
+            .inner_type_name = type_name,
         },
         .owned, .take => .{
             .kind = .value,
-            .inner_type_name = parameter.ty.displayName(),
+            .inner_type_name = type_name,
         },
     };
 }
@@ -848,9 +850,5 @@ fn containsName(values: []const []const u8, needle: []const u8) bool {
 }
 
 fn typeRefRawName(ty: types.TypeRef) []const u8 {
-    return switch (ty) {
-        .builtin => |builtin| builtin.displayName(),
-        .named => |name| name,
-        .unsupported => "Unsupported",
-    };
+    return query_type_support.typeRefRawName(ty);
 }

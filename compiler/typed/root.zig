@@ -50,7 +50,7 @@ pub const ImportedBinding = struct {
         if (self.function_parameter_types) |value| allocator.free(value);
         if (self.function_parameter_type_names) |value| allocator.free(value);
         if (self.function_parameter_modes) |value| allocator.free(value);
-        if (self.struct_fields) |fields| allocator.free(fields);
+        if (self.struct_fields) |fields| typed_decls.deinitStructFields(allocator, fields);
         if (self.enum_variants) |variants| {
             for (variants) |*variant| variant.deinit(allocator);
             allocator.free(variants);
@@ -92,6 +92,10 @@ pub const CheckedFunctionData = typed_decls.FunctionData;
 pub const ConstData = typed_decls.ConstData;
 pub const StructField = typed_decls.StructField;
 pub const TupleField = typed_decls.TupleField;
+pub const cloneStructFields = typed_decls.cloneStructFields;
+pub const deinitStructFields = typed_decls.deinitStructFields;
+pub const cloneTupleFields = typed_decls.cloneTupleFields;
+pub const deinitTupleFields = typed_decls.deinitTupleFields;
 pub const StructData = typed_decls.StructData;
 pub const UnionData = typed_decls.UnionData;
 pub const EnumVariantPayload = typed_decls.EnumVariantPayload;

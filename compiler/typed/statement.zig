@@ -1,4 +1,5 @@
 const std = @import("std");
+const ast = @import("../ast/root.zig");
 const typed_expr = @import("expr.zig");
 const source = @import("../source/root.zig");
 const types = @import("../types/root.zig");
@@ -24,9 +25,24 @@ pub const Statement = union(enum) {
     pub const BindingDecl = struct {
         name: []const u8,
         ty: types.TypeRef,
+        declared_type_syntax: ?ast.TypeSyntax = null,
         explicit_type: bool = false,
         span: source.Span = .{ .file_id = 0, .start = 0, .end = 0 },
         expr: *Expr,
+
+        pub fn deinit(self: *BindingDecl, allocator: Allocator) void {
+            if (self.declared_type_syntax) |*declared_type_syntax| declared_type_syntax.deinit(allocator);
+            self.expr.deinit(allocator);
+            allocator.destroy(self.expr);
+            self.* = .{
+                .name = "",
+                .ty = .unsupported,
+                .declared_type_syntax = null,
+                .explicit_type = false,
+                .span = .{ .file_id = 0, .start = 0, .end = 0 },
+                .expr = undefined,
+            };
+        }
     };
 
     pub const AssignData = struct {
@@ -116,8 +132,8 @@ pub const Statement = union(enum) {
     pub fn deinit(self: Statement, allocator: Allocator) void {
         switch (self) {
             .let_decl, .const_decl => |value| {
-                value.expr.deinit(allocator);
-                allocator.destroy(value.expr);
+                var owned = value;
+                owned.deinit(allocator);
             },
             .assign_stmt => |assign| {
                 if (assign.owns_name) allocator.free(assign.name);

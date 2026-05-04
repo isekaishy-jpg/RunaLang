@@ -14,7 +14,27 @@ pub const GenericParam = struct {
 
 pub const BoundPredicate = struct {
     subject_name: []const u8,
-    contract_name: []const u8,
+    contract_type_syntax: ast.TypeSyntax,
+
+    pub fn clone(self: BoundPredicate, allocator: Allocator) !BoundPredicate {
+        return .{
+            .subject_name = self.subject_name,
+            .contract_type_syntax = try self.contract_type_syntax.clone(allocator),
+        };
+    }
+
+    pub fn deinit(self: *BoundPredicate, allocator: Allocator) void {
+        self.contract_type_syntax.deinit(allocator);
+        self.* = .{
+            .subject_name = "",
+            .contract_type_syntax = .{
+                .source = .{
+                    .text = "",
+                    .span = .{ .file_id = 0, .start = 0, .end = 0 },
+                },
+            },
+        };
+    }
 };
 
 pub const ProjectionEqualityPredicate = struct {
@@ -65,7 +85,7 @@ pub const WherePredicate = union(enum) {
 
     pub fn clone(self: WherePredicate, allocator: Allocator) !WherePredicate {
         return switch (self) {
-            .bound => |bound| .{ .bound = bound },
+            .bound => |bound| .{ .bound = try bound.clone(allocator) },
             .projection_equality => |projection| .{ .projection_equality = try projection.clone(allocator) },
             .lifetime_outlives => |outlives| .{ .lifetime_outlives = outlives },
             .type_outlives => |outlives| .{ .type_outlives = outlives },
@@ -74,6 +94,7 @@ pub const WherePredicate = union(enum) {
 
     pub fn deinit(self: *WherePredicate, allocator: Allocator) void {
         switch (self.*) {
+            .bound => |*bound| bound.deinit(allocator),
             .projection_equality => |*projection| projection.deinit(allocator),
             else => {},
         }

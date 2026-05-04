@@ -3,6 +3,7 @@ const array_list = std.array_list;
 const ast = @import("../ast/root.zig");
 const block_syntax_lower = @import("block_syntax_lower.zig");
 const body_syntax_lower = @import("body_syntax_lower.zig");
+const type_syntax_lower = @import("type_syntax_lower.zig");
 const cst = @import("../cst/root.zig");
 const source = @import("../source/root.zig");
 const syntax = @import("../syntax/root.zig");
@@ -182,10 +183,12 @@ fn lowerEnumVariant(
     tree: *const cst.Tree,
     variant_node: cst.NodeId,
 ) !ast.EnumVariantSyntax {
+    const discriminant = spanTextForChildKind(file, tokens, tree, variant_node, .variant_discriminant);
     return .{
         .name = spanTextForChildKind(file, tokens, tree, variant_node, .variant_name),
         .tuple_payload = try lowerTuplePayloadSyntax(file, tokens, tree, variant_node, .variant_tuple_payload, allocator),
-        .discriminant = spanTextForChildKind(file, tokens, tree, variant_node, .variant_discriminant),
+        .discriminant_source = discriminant,
+        .discriminant_expr = if (discriminant) |expr| try body_syntax_lower.lowerStandaloneExprSyntax(allocator, expr) else null,
         .named_fields = if (childNodeByKind(tree, variant_node, .block)) |block_node|
             try lowerFieldSlice(allocator, file, tokens, tree, block_node)
         else
@@ -484,156 +487,7 @@ fn lowerTypeSyntax(
     wrapper_node: cst.NodeId,
     allocator: Allocator,
 ) !ast.TypeSyntax {
-    const source_text = spanTextForNode(file, tokens, tree, wrapper_node) orelse ast.SpanText{
-        .text = "",
-        .span = .{ .file_id = file.id, .start = 0, .end = 0 },
-    };
-    const root_node = childNodeAt(tree, wrapper_node, 0) catch return invalidTypeSyntax(allocator, source_text);
-
-    var nodes = array_list.Managed(ast.TypeNode).init(allocator);
-    errdefer nodes.deinit();
-    var child_indices = array_list.Managed(u32).init(allocator);
-    errdefer child_indices.deinit();
-
-    _ = try appendTypeNode(file, tokens, tree, root_node, &nodes, &child_indices);
-
-    return .{
-        .source = source_text,
-        .nodes = try nodes.toOwnedSlice(),
-        .child_indices = try child_indices.toOwnedSlice(),
-    };
-}
-
-fn appendTypeNode(
-    file: *const source.File,
-    tokens: syntax.TokenStore,
-    tree: *const cst.Tree,
-    node_id: cst.NodeId,
-    nodes: *array_list.Managed(ast.TypeNode),
-    child_indices: *array_list.Managed(u32),
-) !u32 {
-    const source_text = spanTextForNode(file, tokens, tree, node_id) orelse ast.SpanText{
-        .text = "",
-        .span = .{ .file_id = file.id, .start = 0, .end = 0 },
-    };
-    const child_start: u32 = @intCast(child_indices.items.len);
-    const new_index: u32 = @intCast(nodes.items.len);
-    try nodes.append(.{
-        .source = source_text,
-        .payload = .invalid,
-    });
-
-    const payload: ast.TypeNode.Payload = switch (tree.nodeKind(node_id)) {
-        .type_name_ref => .name_ref,
-        .type_lifetime => .lifetime,
-        .type_apply => blk: {
-            for (tree.childSlice(node_id)) |child| {
-                switch (child) {
-                    .node => |child_node| try child_indices.append(try appendTypeNode(file, tokens, tree, child_node, nodes, child_indices)),
-                    else => {},
-                }
-            }
-            break :blk .apply;
-        },
-        .type_borrow => blk: {
-            for (tree.childSlice(node_id)) |child| {
-                switch (child) {
-                    .node => |child_node| try child_indices.append(try appendTypeNode(file, tokens, tree, child_node, nodes, child_indices)),
-                    else => {},
-                }
-            }
-            break :blk .{ .borrow = try lowerBorrowNode(file, tokens, tree, node_id) };
-        },
-        .type_raw_pointer => blk: {
-            for (tree.childSlice(node_id)) |child| {
-                switch (child) {
-                    .node => |child_node| try child_indices.append(try appendTypeNode(file, tokens, tree, child_node, nodes, child_indices)),
-                    else => {},
-                }
-            }
-            break :blk .{ .raw_pointer = try lowerRawPointerNode(tokens, tree, node_id) };
-        },
-        .type_assoc => blk: {
-            for (tree.childSlice(node_id)) |child| {
-                switch (child) {
-                    .node => |child_node| {
-                        try child_indices.append(try appendTypeNode(file, tokens, tree, child_node, nodes, child_indices));
-                        break;
-                    },
-                    else => {},
-                }
-            }
-            break :blk .{ .assoc = .{
-                .member = assocMemberSpanText(file, tokens, tree, node_id) orelse source_text,
-            } };
-        },
-        .@"error" => .invalid,
-        else => .invalid,
-    };
-
-    nodes.items[new_index] = .{
-        .source = source_text,
-        .child_start = child_start,
-        .child_len = @intCast(child_indices.items.len - child_start),
-        .payload = payload,
-    };
-    return new_index;
-}
-
-fn lowerBorrowNode(
-    file: *const source.File,
-    tokens: syntax.TokenStore,
-    tree: *const cst.Tree,
-    node_id: cst.NodeId,
-) !ast.TypeNode.Borrow {
-    const children = tree.childSlice(node_id);
-    const first_token = tokenRefAt(children, 0) orelse return error.InvalidParse;
-    const first_lexeme = tokens.getRef(first_token).lexeme;
-    if (std.mem.eql(u8, first_lexeme, "hold")) {
-        return .{
-            .access = .hold,
-            .lifetime = if (childNodeByKind(tree, node_id, .type_lifetime)) |lifetime_node|
-                spanTextForNode(file, tokens, tree, lifetime_node)
-            else
-                null,
-        };
-    }
-    if (std.mem.eql(u8, first_lexeme, "read")) return .{ .access = .read };
-    if (std.mem.eql(u8, first_lexeme, "edit")) return .{ .access = .edit };
-    return error.InvalidParse;
-}
-
-fn lowerRawPointerNode(tokens: syntax.TokenStore, tree: *const cst.Tree, node_id: cst.NodeId) !ast.TypeNode.RawPointer {
-    const children = tree.childSlice(node_id);
-    const access_token = tokenRefAt(children, 1) orelse return error.InvalidParse;
-    const access_lexeme = tokens.getRef(access_token).lexeme;
-    if (std.mem.eql(u8, access_lexeme, "read")) return .{ .access = .read };
-    if (std.mem.eql(u8, access_lexeme, "edit")) return .{ .access = .edit };
-    return error.InvalidParse;
-}
-
-fn assocMemberSpanText(
-    file: *const source.File,
-    tokens: syntax.TokenStore,
-    tree: *const cst.Tree,
-    node_id: cst.NodeId,
-) ?ast.SpanText {
-    _ = file;
-    const children = tree.childSlice(node_id);
-    const member_token = tokenRefAt(children, 2) orelse return null;
-    const token = tokens.getRef(member_token);
-    return .{
-        .text = token.lexeme,
-        .span = token.span,
-    };
-}
-
-fn tokenRefAt(children: []const cst.Child, child_index: usize) ?syntax.TokenRef {
-    if (child_index >= children.len) return null;
-    return switch (children[child_index]) {
-        .token => |token_ref| token_ref,
-        else => null,
-    };
+    return type_syntax_lower.lowerNodeTypeSyntax(allocator, file, tokens, tree, wrapper_node);
 }
 
 fn lowerTuplePayloadSyntax(
@@ -645,18 +499,17 @@ fn lowerTuplePayloadSyntax(
     allocator: Allocator,
 ) !?ast.TuplePayloadSyntax {
     const span_text = spanTextForChildKind(file, tokens, tree, parent_node, kind) orelse return null;
-    const trimmed = std.mem.trim(u8, span_text.text, " \t");
-    if (trimmed.len < 2 or trimmed[0] != '(' or trimmed[trimmed.len - 1] != ')') {
+    const payload_node = childNodeByKind(tree, parent_node, kind) orelse return null;
+    const token_refs = try tokenRefsForNode(allocator, tree, payload_node);
+    defer allocator.free(token_refs);
+    if (token_refs.len < 2 or tokens.getRef(token_refs[0]).kind != .l_paren or tokens.getRef(token_refs[token_refs.len - 1]).kind != .r_paren) {
         return .{
             .span = span_text.span,
             .types = &.{},
             .invalid_kind = .malformed_payload,
         };
     }
-
-    const inner = trimmed[1 .. trimmed.len - 1];
-    const inner_offset = leadingTrimCount(span_text.text) + 1;
-    if (std.mem.trim(u8, inner, " \t").len == 0) {
+    if (token_refs.len == 2) {
         return .{
             .span = span_text.span,
             .types = &.{},
@@ -667,23 +520,57 @@ fn lowerTuplePayloadSyntax(
     var lowered = array_list.Managed(ast.TypeSyntax).init(allocator);
     errdefer lowered.deinit();
     var invalid_kind: ?ast.TuplePayloadInvalidKindSyntax = null;
-    var entry_start: usize = 0;
-    while (entry_start <= inner.len) {
-        const relative_end = findTopLevelScalar(inner, entry_start, inner.len, ',') orelse inner.len;
-        const raw_entry = inner[entry_start..relative_end];
-        if (trimmedRange(raw_entry)) |entry_range| {
-            const entry = makeSubspanText(
-                span_text,
-                inner_offset + entry_start + entry_range.start,
-                inner_offset + entry_start + entry_range.end,
-            ) orelse unreachable;
-            try lowered.append(.{ .source = entry });
+    var paren_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var entry_start: usize = 1;
+    var index: usize = 1;
+    while (index < token_refs.len - 1) : (index += 1) {
+        const token_kind = tokens.getRef(token_refs[index]).kind;
+        switch (token_kind) {
+            .l_paren => paren_depth += 1,
+            .r_paren => {
+                if (paren_depth != 0) paren_depth -= 1;
+            },
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => {
+                if (bracket_depth != 0) bracket_depth -= 1;
+            },
+            .comma => {
+                if (paren_depth != 0 or bracket_depth != 0) continue;
+                if (entry_start == index) {
+                    invalid_kind = .empty_entry;
+                } else {
+                    try lowered.append(try type_syntax_lower.lowerTokenRangeTypeSyntax(
+                        allocator,
+                        spanTextForTokenRange(file, tokens, token_refs[entry_start..index]),
+                        tokens,
+                        token_refs[entry_start..index],
+                    ));
+                }
+                entry_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    if (entry_start == token_refs.len - 1) {
+        invalid_kind = .empty_entry;
+    } else {
+        try lowered.append(try type_syntax_lower.lowerTokenRangeTypeSyntax(
+            allocator,
+            spanTextForTokenRange(file, tokens, token_refs[entry_start .. token_refs.len - 1]),
+            tokens,
+            token_refs[entry_start .. token_refs.len - 1],
+        ));
+        if (lowered.items.len != 0) {
+            for (lowered.items) |lowered_type| {
+                if (typeSyntaxIsInvalid(lowered_type)) {
+                    invalid_kind = .malformed_payload;
+                    break;
+                }
+            }
         } else {
             invalid_kind = .empty_entry;
         }
-
-        if (relative_end == inner.len) break;
-        entry_start = relative_end + 1;
     }
 
     return .{
@@ -1039,9 +926,10 @@ fn lowerWherePredicateSyntax(
                 .span = span_text.span,
             } };
         }
+        const right_type = try tokenRangeTypeSyntax(allocator, file, tokens, token_refs[colon_index + 1 ..]) orelse return .{ .invalid = span_text };
         return .{ .bound = .{
             .subject_name = left.text,
-            .contract_name = right.text,
+            .contract_type = right_type,
             .span = span_text.span,
         } };
     }
@@ -1118,21 +1006,7 @@ fn tokenRangeTypeSyntax(
     token_refs: []const syntax.TokenRef,
 ) !?ast.TypeSyntax {
     const span_text = tokenRangeText(file, tokens, token_refs) orelse return null;
-    var parser = InlineTypeParser.init(allocator, file, tokens, token_refs);
-    return @as(?ast.TypeSyntax, try parser.parse(span_text));
-}
-
-fn invalidTypeSyntax(allocator: Allocator, span_text: ast.SpanText) !ast.TypeSyntax {
-    const nodes = try allocator.alloc(ast.TypeNode, 1);
-    nodes[0] = .{
-        .source = span_text,
-        .payload = .invalid,
-    };
-    return .{
-        .source = span_text,
-        .nodes = nodes,
-        .child_indices = &.{},
-    };
+    return try type_syntax_lower.lowerTokenRangeTypeSyntax(allocator, span_text, tokens, token_refs);
 }
 
 fn typeSyntaxIsInvalid(syntax_value: ast.TypeSyntax) bool {
@@ -1142,250 +1016,6 @@ fn typeSyntaxIsInvalid(syntax_value: ast.TypeSyntax) bool {
         else => false,
     };
 }
-
-const InlineTypeParser = struct {
-    allocator: Allocator,
-    file: *const source.File,
-    tokens: syntax.TokenStore,
-    token_refs: []const syntax.TokenRef,
-    cursor: usize = 0,
-    nodes: array_list.Managed(ast.TypeNode),
-    child_indices: array_list.Managed(u32),
-
-    fn init(
-        allocator: Allocator,
-        file: *const source.File,
-        tokens: syntax.TokenStore,
-        token_refs: []const syntax.TokenRef,
-    ) InlineTypeParser {
-        return .{
-            .allocator = allocator,
-            .file = file,
-            .tokens = tokens,
-            .token_refs = token_refs,
-            .nodes = array_list.Managed(ast.TypeNode).init(allocator),
-            .child_indices = array_list.Managed(u32).init(allocator),
-        };
-    }
-
-    fn parse(self: *InlineTypeParser, span_text: ast.SpanText) Allocator.Error!ast.TypeSyntax {
-        errdefer self.nodes.deinit();
-        errdefer self.child_indices.deinit();
-
-        const root = self.parseType() catch null;
-        if (root == null or self.cursor != self.token_refs.len) {
-            self.nodes.deinit();
-            self.child_indices.deinit();
-            return invalidTypeSyntax(self.allocator, span_text);
-        }
-        std.debug.assert(root.? == 0);
-        return .{
-            .source = span_text,
-            .nodes = try self.nodes.toOwnedSlice(),
-            .child_indices = try self.child_indices.toOwnedSlice(),
-        };
-    }
-
-    fn parseType(self: *InlineTypeParser) Allocator.Error!?u32 {
-        const token_ref = self.peek() orelse return null;
-        const token = self.tokens.getRef(token_ref);
-        if (token.kind == .star) return self.parseRawPointer();
-        if (token.kind == .lifetime_name) return self.appendLeafNode(1, .lifetime);
-        if (token.kind != .identifier) return null;
-        if (std.mem.eql(u8, token.lexeme, "read") or
-            std.mem.eql(u8, token.lexeme, "edit") or
-            std.mem.eql(u8, token.lexeme, "hold"))
-        {
-            return self.parseBorrow();
-        }
-        return self.parseSuffixedPrimary();
-    }
-
-    fn parseBorrow(self: *InlineTypeParser) Allocator.Error!?u32 {
-        const start_index = self.cursor;
-        const head_ref = self.consume() orelse return null;
-        const head = self.tokens.getRef(head_ref);
-
-        if (std.mem.eql(u8, head.lexeme, "read")) {
-            const child = try self.parseType() orelse return null;
-            return @as(?u32, try self.appendCompositeNode(start_index, self.cursor - 1, .{ .borrow = .{ .access = .read } }, &.{child}));
-        }
-        if (std.mem.eql(u8, head.lexeme, "edit")) {
-            const child = try self.parseType() orelse return null;
-            return @as(?u32, try self.appendCompositeNode(start_index, self.cursor - 1, .{ .borrow = .{ .access = .edit } }, &.{child}));
-        }
-        if (!std.mem.eql(u8, head.lexeme, "hold")) return null;
-
-        if (!self.matchKind(.l_bracket)) return null;
-        const lifetime = if (self.peekTokenKind() == .lifetime_name)
-            self.tokenSpanText(self.consume().?)
-        else
-            null;
-        if (!self.matchKind(.r_bracket)) return null;
-        const access_ref = self.consume() orelse return null;
-        const access = self.tokens.getRef(access_ref);
-        if (!std.mem.eql(u8, access.lexeme, "read") and !std.mem.eql(u8, access.lexeme, "edit")) return null;
-        const child = try self.parseType() orelse return null;
-        return @as(?u32, try self.appendCompositeNode(
-            start_index,
-            self.cursor - 1,
-            .{ .borrow = .{
-                .access = .hold,
-                .lifetime = lifetime,
-            } },
-            &.{child},
-        ));
-    }
-
-    fn parseRawPointer(self: *InlineTypeParser) Allocator.Error!?u32 {
-        const start_index = self.cursor;
-        _ = self.consume() orelse return null;
-        const access_ref = self.consume() orelse return null;
-        const access = self.tokens.getRef(access_ref);
-        const pointer_access: ast.RawPointerAccess = if (std.mem.eql(u8, access.lexeme, "read"))
-            .read
-        else if (std.mem.eql(u8, access.lexeme, "edit"))
-            .edit
-        else
-            return null;
-        const child = try self.parseType() orelse return null;
-        return @as(?u32, try self.appendCompositeNode(
-            start_index,
-            self.cursor - 1,
-            .{ .raw_pointer = .{ .access = pointer_access } },
-            &.{child},
-        ));
-    }
-
-    fn parseSuffixedPrimary(self: *InlineTypeParser) Allocator.Error!?u32 {
-        var current = try self.appendLeafNode(1, .name_ref) orelse return null;
-        while (true) {
-            if (self.peekTokenKind() == .dot) {
-                current = (try self.parseAssocSuffix(current)) orelse return null;
-                continue;
-            }
-            if (self.peekTokenKind() == .l_bracket) {
-                current = (try self.parseApplySuffix(current)) orelse return null;
-                continue;
-            }
-            break;
-        }
-        return current;
-    }
-
-    fn parseAssocSuffix(self: *InlineTypeParser, base: u32) Allocator.Error!?u32 {
-        const start_index = self.nodeTokenStart(base) orelse return null;
-        _ = self.consume() orelse return null;
-        const member_ref = self.consume() orelse return null;
-        const member = self.tokens.getRef(member_ref);
-        if (member.kind != .identifier) return null;
-        return @as(?u32, try self.appendCompositeNode(
-            start_index,
-            self.cursor - 1,
-            .{ .assoc = .{
-                .member = self.tokenSpanText(member_ref),
-            } },
-            &.{base},
-        ));
-    }
-
-    fn parseApplySuffix(self: *InlineTypeParser, base: u32) Allocator.Error!?u32 {
-        const start_index = self.nodeTokenStart(base) orelse return null;
-        _ = self.consume() orelse return null;
-
-        var args = array_list.Managed(u32).init(self.allocator);
-        defer args.deinit();
-        try args.append(base);
-
-        if (self.peekTokenKind() == .r_bracket) return null;
-        while (true) {
-            const arg = try self.parseType() orelse return null;
-            try args.append(arg);
-            if (self.matchKind(.comma)) continue;
-            if (self.matchKind(.r_bracket)) break;
-            return null;
-        }
-
-        return @as(?u32, try self.appendCompositeNode(start_index, self.cursor - 1, .apply, args.items));
-    }
-
-    fn appendLeafNode(self: *InlineTypeParser, count: usize, payload: ast.TypeNode.Payload) Allocator.Error!?u32 {
-        if (self.cursor + count > self.token_refs.len) return null;
-        const start_index = self.cursor;
-        self.cursor += count;
-        return @as(?u32, try self.appendCompositeNode(start_index, self.cursor - 1, payload, &.{}));
-    }
-
-    fn appendCompositeNode(
-        self: *InlineTypeParser,
-        start_index: usize,
-        end_index: usize,
-        payload: ast.TypeNode.Payload,
-        children: []const u32,
-    ) Allocator.Error!u32 {
-        const child_start: u32 = @intCast(self.child_indices.items.len);
-        try self.child_indices.appendSlice(children);
-        const index: u32 = @intCast(self.nodes.items.len);
-        try self.nodes.append(.{
-            .source = self.spanText(start_index, end_index),
-            .child_start = child_start,
-            .child_len = @intCast(children.len),
-            .payload = payload,
-        });
-        return index;
-    }
-
-    fn spanText(self: *const InlineTypeParser, start_index: usize, end_index: usize) ast.SpanText {
-        const first = self.tokens.getRef(self.token_refs[start_index]);
-        const last = self.tokens.getRef(self.token_refs[end_index]);
-        return .{
-            .text = self.file.contents[first.span.start..last.span.end],
-            .span = .{
-                .file_id = first.span.file_id,
-                .start = first.span.start,
-                .end = last.span.end,
-            },
-        };
-    }
-
-    fn tokenSpanText(self: *const InlineTypeParser, token_ref: syntax.TokenRef) ast.SpanText {
-        const token = self.tokens.getRef(token_ref);
-        return .{
-            .text = token.lexeme,
-            .span = token.span,
-        };
-    }
-
-    fn nodeTokenStart(self: *const InlineTypeParser, node_index: u32) ?usize {
-        const start = self.nodes.items[node_index].source.span.start;
-        for (self.token_refs, 0..) |token_ref, index| {
-            if (self.tokens.getRef(token_ref).span.start == start) return index;
-        }
-        return null;
-    }
-
-    fn peek(self: *const InlineTypeParser) ?syntax.TokenRef {
-        if (self.cursor >= self.token_refs.len) return null;
-        return self.token_refs[self.cursor];
-    }
-
-    fn peekTokenKind(self: *const InlineTypeParser) ?syntax.TokenKind {
-        const token_ref = self.peek() orelse return null;
-        return self.tokens.getRef(token_ref).kind;
-    }
-
-    fn consume(self: *InlineTypeParser) ?syntax.TokenRef {
-        const token_ref = self.peek() orelse return null;
-        self.cursor += 1;
-        return token_ref;
-    }
-
-    fn matchKind(self: *InlineTypeParser, kind: syntax.TokenKind) bool {
-        if (self.peekTokenKind() != kind) return false;
-        _ = self.consume();
-        return true;
-    }
-};
 
 fn findTopLevelTokenIndex(
     tokens: syntax.TokenStore,

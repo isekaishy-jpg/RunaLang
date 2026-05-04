@@ -1,6 +1,7 @@
 const std = @import("std");
 const array_list = std.array_list;
 const query = @import("../query/root.zig");
+const query_type_support = @import("../query/type_support.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
 const Allocator = std.mem.Allocator;
@@ -178,11 +179,7 @@ fn renderPackedInputType(allocator: Allocator, parameters: []const typed.Paramet
 }
 
 fn typeName(value: @import("../types/root.zig").TypeRef) []const u8 {
-    return switch (value) {
-        .builtin => |builtin| builtin.displayName(),
-        .named => |name| name,
-        .unsupported => "Unsupported",
-    };
+    return query_type_support.typeRefRawName(value);
 }
 
 fn appendTomlField(out: *array_list.Managed(u8), key: []const u8, value: []const u8) !void {

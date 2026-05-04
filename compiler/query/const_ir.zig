@@ -119,20 +119,34 @@ pub fn destroyExpr(allocator: Allocator, expr: *const Expr) void {
     const mutable_expr = @constCast(expr);
     switch (mutable_expr.node) {
         .literal => |*value| deinitValue(allocator, value),
-        .const_ref,
-        .associated_const_ref,
-        .enum_variant,
-        .enum_tag,
-        => {},
+        .const_ref => |name| allocator.free(name),
+        .associated_const_ref => |ref| {
+            allocator.free(ref.owner_name);
+            allocator.free(ref.const_name);
+        },
+        .enum_variant => |variant| {
+            allocator.free(variant.enum_name);
+            allocator.free(variant.variant_name);
+        },
+        .enum_tag => |variant| {
+            allocator.free(variant.enum_name);
+            allocator.free(variant.variant_name);
+        },
         .enum_construct => |construct| {
+            allocator.free(construct.enum_name);
+            allocator.free(construct.variant_name);
             for (construct.args) |arg| destroyExpr(allocator, arg);
             allocator.free(construct.args);
         },
         .constructor => |constructor| {
+            allocator.free(constructor.type_name);
             for (constructor.args) |arg| destroyExpr(allocator, arg);
             allocator.free(constructor.args);
         },
-        .field => |field| destroyExpr(allocator, field.base),
+        .field => |field| {
+            allocator.free(field.field_name);
+            destroyExpr(allocator, field.base);
+        },
         .array => |array| {
             for (array.items) |item| destroyExpr(allocator, item);
             allocator.free(array.items);
@@ -157,15 +171,21 @@ pub fn destroyExpr(allocator: Allocator, expr: *const Expr) void {
 
 pub fn deinitValue(allocator: Allocator, value: *Value) void {
     switch (value.*) {
+        .str => |payload| allocator.free(payload),
         .array => |items| {
             for (items) |*item| deinitValue(allocator, item);
             allocator.free(items);
         },
         .aggregate => |aggregate| {
+            allocator.free(aggregate.type_name);
+            for (aggregate.fields) |*field| allocator.free(field.name);
             for (aggregate.fields) |*field| deinitValue(allocator, &field.value);
             allocator.free(aggregate.fields);
         },
         .enum_value => |enum_value| {
+            allocator.free(enum_value.enum_name);
+            allocator.free(enum_value.variant_name);
+            for (enum_value.fields) |*field| allocator.free(field.name);
             for (enum_value.fields) |*field| deinitValue(allocator, &field.value);
             allocator.free(enum_value.fields);
         },
@@ -181,7 +201,7 @@ pub fn cloneValue(allocator: Allocator, value: Value) anyerror!Value {
         .i32 => |payload| .{ .i32 = payload },
         .u32 => |payload| .{ .u32 = payload },
         .index => |payload| .{ .index = payload },
-        .str => |payload| .{ .str = payload },
+        .str => |payload| .{ .str = try allocator.dupe(u8, payload) },
         .unsupported => .{ .unsupported = {} },
         .array => |items| blk: {
             const cloned = try allocator.alloc(Value, items.len);
@@ -199,15 +219,15 @@ pub fn cloneValue(allocator: Allocator, value: Value) anyerror!Value {
         .aggregate => |aggregate| blk: {
             const fields = try cloneFields(allocator, aggregate.fields);
             break :blk .{ .aggregate = .{
-                .type_name = aggregate.type_name,
+                .type_name = try allocator.dupe(u8, aggregate.type_name),
                 .fields = fields,
             } };
         },
         .enum_value => |enum_value| blk: {
             const fields = try cloneFields(allocator, enum_value.fields);
             break :blk .{ .enum_value = .{
-                .enum_name = enum_value.enum_name,
-                .variant_name = enum_value.variant_name,
+                .enum_name = try allocator.dupe(u8, enum_value.enum_name),
+                .variant_name = try allocator.dupe(u8, enum_value.variant_name),
                 .tag = enum_value.tag,
                 .fields = fields,
             } };
@@ -219,12 +239,15 @@ fn cloneFields(allocator: Allocator, fields: []const FieldValue) anyerror![]Fiel
     const cloned = try allocator.alloc(FieldValue, fields.len);
     var initialized: usize = 0;
     errdefer {
-        for (cloned[0..initialized]) |*field| deinitValue(allocator, &field.value);
+        for (cloned[0..initialized]) |*field| {
+            allocator.free(field.name);
+            deinitValue(allocator, &field.value);
+        }
         allocator.free(cloned);
     }
     for (fields, 0..) |field, index| {
         cloned[index] = .{
-            .name = field.name,
+            .name = try allocator.dupe(u8, field.name),
             .value = try cloneValue(allocator, field.value),
         };
         initialized += 1;
@@ -244,38 +267,38 @@ pub fn lowerExpr(allocator: Allocator, expr: *const typed.Expr) anyerror!*Expr {
     lowered.node = switch (expr.node) {
         .integer => |value| .{ .literal = try integerLiteralValue(lowered.result_type, value) },
         .bool_lit => |value| .{ .literal = .{ .bool = value } },
-        .string => |value| .{ .literal = .{ .str = value } },
-        .identifier => |name| .{ .const_ref = name },
+        .string => |value| .{ .literal = .{ .str = try allocator.dupe(u8, value) } },
+        .identifier => |name| .{ .const_ref = try allocator.dupe(u8, name) },
         .enum_variant => |value| .{ .enum_variant = .{
-            .enum_name = value.enum_name,
-            .variant_name = value.variant_name,
+            .enum_name = try allocator.dupe(u8, value.enum_name),
+            .variant_name = try allocator.dupe(u8, value.variant_name),
         } },
         .enum_tag => |value| .{ .enum_tag = .{
-            .enum_name = value.enum_name,
-            .variant_name = value.variant_name,
+            .enum_name = try allocator.dupe(u8, value.enum_name),
+            .variant_name = try allocator.dupe(u8, value.variant_name),
         } },
         .enum_construct => |construct| .{ .enum_construct = .{
-            .enum_name = construct.enum_name,
-            .variant_name = construct.variant_name,
+            .enum_name = try allocator.dupe(u8, construct.enum_name),
+            .variant_name = try allocator.dupe(u8, construct.variant_name),
             .args = try lowerExprSlice(allocator, construct.args),
         } },
         .constructor => |constructor| .{ .constructor = .{
-            .type_name = constructor.type_name,
+            .type_name = try allocator.dupe(u8, constructor.type_name),
             .args = try lowerExprSlice(allocator, constructor.args),
         } },
         .field => |field| blk: {
             if (field.base.ty.isUnsupported()) {
                 switch (field.base.node) {
                     .identifier => |base_name| break :blk .{ .associated_const_ref = .{
-                        .owner_name = base_name,
-                        .const_name = field.field_name,
+                        .owner_name = try allocator.dupe(u8, base_name),
+                        .const_name = try allocator.dupe(u8, field.field_name),
                     } },
                     else => {},
                 }
             }
             break :blk .{ .field = .{
                 .base = try lowerExpr(allocator, field.base),
-                .field_name = field.field_name,
+                .field_name = try allocator.dupe(u8, field.field_name),
             } };
         },
         .tuple => .{ .literal = .unsupported },
@@ -337,6 +360,90 @@ fn lowerExprSlice(allocator: Allocator, exprs: anytype) ![]*Expr {
     return lowered;
 }
 
+pub fn cloneExpr(allocator: Allocator, expr: *const Expr) anyerror!*Expr {
+    const result = try allocator.create(Expr);
+    var initialized = false;
+    errdefer {
+        if (initialized) {
+            destroyExpr(allocator, result);
+        } else {
+            allocator.destroy(result);
+        }
+    }
+
+    result.result_type = expr.result_type;
+    result.node = switch (expr.node) {
+        .literal => |value| .{ .literal = try cloneValue(allocator, value) },
+        .const_ref => |name| .{ .const_ref = try allocator.dupe(u8, name) },
+        .associated_const_ref => |ref| .{ .associated_const_ref = .{
+            .owner_name = try allocator.dupe(u8, ref.owner_name),
+            .const_name = try allocator.dupe(u8, ref.const_name),
+        } },
+        .enum_variant => |variant| .{ .enum_variant = .{
+            .enum_name = try allocator.dupe(u8, variant.enum_name),
+            .variant_name = try allocator.dupe(u8, variant.variant_name),
+        } },
+        .enum_tag => |variant| .{ .enum_tag = .{
+            .enum_name = try allocator.dupe(u8, variant.enum_name),
+            .variant_name = try allocator.dupe(u8, variant.variant_name),
+        } },
+        .enum_construct => |construct| .{ .enum_construct = .{
+            .enum_name = try allocator.dupe(u8, construct.enum_name),
+            .variant_name = try allocator.dupe(u8, construct.variant_name),
+            .args = try cloneExprSlice(allocator, construct.args),
+        } },
+        .constructor => |constructor| .{ .constructor = .{
+            .type_name = try allocator.dupe(u8, constructor.type_name),
+            .args = try cloneExprSlice(allocator, constructor.args),
+        } },
+        .field => |field| .{ .field = .{
+            .base = try cloneExpr(allocator, field.base),
+            .field_name = try allocator.dupe(u8, field.field_name),
+        } },
+        .array => |array| .{ .array = .{
+            .items = try cloneExprSlice(allocator, array.items),
+        } },
+        .array_repeat => |array_repeat| .{ .array_repeat = .{
+            .value = try cloneExpr(allocator, array_repeat.value),
+            .length = try cloneExpr(allocator, array_repeat.length),
+        } },
+        .index => |index| .{ .index = .{
+            .base = try cloneExpr(allocator, index.base),
+            .index = try cloneExpr(allocator, index.index),
+        } },
+        .conversion => |conversion| .{ .conversion = .{
+            .operand = try cloneExpr(allocator, conversion.operand),
+            .mode = conversion.mode,
+            .target_type = conversion.target_type,
+        } },
+        .unary => |unary| .{ .unary = .{
+            .op = unary.op,
+            .operand = try cloneExpr(allocator, unary.operand),
+        } },
+        .binary => |binary| .{ .binary = .{
+            .op = binary.op,
+            .lhs = try cloneExpr(allocator, binary.lhs),
+            .rhs = try cloneExpr(allocator, binary.rhs),
+        } },
+    };
+    initialized = true;
+    return result;
+}
+
+fn cloneExprSlice(allocator: Allocator, exprs: []*Expr) anyerror![]*Expr {
+    const cloned = try allocator.alloc(*Expr, exprs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |item| destroyExpr(allocator, item);
+        allocator.free(cloned);
+    }
+    for (exprs, 0..) |item, index| {
+        cloned[index] = try cloneExpr(allocator, item);
+        initialized += 1;
+    }
+    return cloned;
+}
+
 pub fn evalExpr(allocator: Allocator, context: anytype, expr: *const Expr, resolve_identifier: anytype) anyerror!Value {
     switch (expr.node) {
         .literal => |value| return cloneValue(allocator, value),
@@ -371,7 +478,7 @@ pub fn evalExpr(allocator: Allocator, context: anytype, expr: *const Expr, resol
                 resolve_identifier,
             );
             return .{ .aggregate = .{
-                .type_name = constructor.type_name,
+                .type_name = try allocator.dupe(u8, constructor.type_name),
                 .fields = fields,
             } };
         },
@@ -472,13 +579,16 @@ fn evalFieldArgs(
     const fields = try allocator.alloc(FieldValue, args.len);
     var initialized: usize = 0;
     errdefer {
-        for (fields[0..initialized]) |*field| deinitValue(allocator, &field.value);
+        for (fields[0..initialized]) |*field| {
+            allocator.free(field.name);
+            deinitValue(allocator, &field.value);
+        }
         allocator.free(fields);
     }
     for (args, 0..) |arg, index| {
         const field_name = fieldNameAt(context, type_name, variant_name, index) orelse return error.UnsupportedConstExpr;
         fields[index] = .{
-            .name = field_name,
+            .name = try allocator.dupe(u8, field_name),
             .value = try evalExpr(allocator, context, arg, resolve_identifier),
         };
         initialized += 1;
@@ -495,8 +605,8 @@ fn evalEnumValue(
 ) !Value {
     const tag = contextEnumVariantTag(context, enum_name, variant_name) orelse return error.UnsupportedConstExpr;
     return .{ .enum_value = .{
-        .enum_name = enum_name,
-        .variant_name = variant_name,
+        .enum_name = try allocator.dupe(u8, enum_name),
+        .variant_name = try allocator.dupe(u8, variant_name),
         .tag = tag,
         .fields = if (fields.len == 0) try allocator.alloc(FieldValue, 0) else fields,
     } };
@@ -514,7 +624,7 @@ fn projectField(allocator: Allocator, base: Value, field_name: []const u8) !Valu
             if (std.mem.eql(u8, field_name, "tag")) break :blk .{ .i32 = enum_value.tag };
             if (std.mem.eql(u8, field_name, "payload")) {
                 break :blk .{ .aggregate = .{
-                    .type_name = enum_value.variant_name,
+                    .type_name = try allocator.dupe(u8, enum_value.variant_name),
                     .fields = try cloneFields(allocator, enum_value.fields),
                 } };
             }
@@ -576,12 +686,12 @@ fn checkedConversionResult(allocator: Allocator, value: Value, target_type: type
     if (checkedConvertScalar(value, target_type)) |payload| {
         const fields = try allocator.alloc(FieldValue, 1);
         fields[0] = .{
-            .name = "value",
+            .name = try allocator.dupe(u8, "value"),
             .value = payload,
         };
         return .{ .enum_value = .{
-            .enum_name = "Result",
-            .variant_name = "Ok",
+            .enum_name = try allocator.dupe(u8, "Result"),
+            .variant_name = try allocator.dupe(u8, "Ok"),
             .tag = 0,
             .fields = fields,
         } };
@@ -591,17 +701,17 @@ fn checkedConversionResult(allocator: Allocator, value: Value, target_type: type
     errdefer allocator.free(error_fields);
     const fields = try allocator.alloc(FieldValue, 1);
     fields[0] = .{
-        .name = "error",
+        .name = try allocator.dupe(u8, "error"),
         .value = .{ .enum_value = .{
-            .enum_name = "ConvertError",
-            .variant_name = "OutOfRange",
+            .enum_name = try allocator.dupe(u8, "ConvertError"),
+            .variant_name = try allocator.dupe(u8, "OutOfRange"),
             .tag = 0,
             .fields = error_fields,
         } },
     };
     return .{ .enum_value = .{
-        .enum_name = "Result",
-        .variant_name = "Err",
+        .enum_name = try allocator.dupe(u8, "Result"),
+        .variant_name = try allocator.dupe(u8, "Err"),
         .tag = 1,
         .fields = fields,
     } };

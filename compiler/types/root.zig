@@ -1,4 +1,5 @@
 const std = @import("std");
+const type_registry = @import("../query/type_registry.zig");
 
 pub const Builtin = enum {
     unit,
@@ -411,7 +412,7 @@ pub const TypeRef = union(enum) {
 
     pub fn isNamed(self: TypeRef, name: []const u8) bool {
         return switch (self) {
-            .named => |existing| std.mem.eql(u8, existing, name),
+            .named => |existing| std.mem.eql(u8, type_registry.displayNameForKey(existing) orelse existing, name),
             else => false,
         };
     }
@@ -419,7 +420,7 @@ pub const TypeRef = union(enum) {
     pub fn displayName(self: TypeRef) []const u8 {
         return switch (self) {
             .builtin => |builtin| builtin.displayName(),
-            .named => |name| name,
+            .named => |name| type_registry.displayNameForKey(name) orelse name,
             .unsupported => "Unsupported",
         };
     }

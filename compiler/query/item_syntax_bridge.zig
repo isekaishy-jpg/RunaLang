@@ -4,6 +4,7 @@ const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const typed_signatures = @import("signatures.zig");
+const type_lowering = @import("type_lowering.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
@@ -94,14 +95,14 @@ pub fn fillFunctionDataFromSyntax(
             .name = std.mem.trim(u8, name_text.text, " \t"),
             .mode = try parseParameterMode(parameter.mode, span, diagnostics),
             .type_syntax = try type_text.clone(allocator),
-            .ty = try type_syntax_support.typeRefFromSyntax(allocator, type_text),
+            .ty = try type_lowering.typeRefFromSyntax(allocator, type_text),
         });
     }
 
     if (signature.return_type) |return_type| {
         if (!type_syntax_support.containsInvalid(return_type)) {
             function.return_type_syntax = try return_type.clone(allocator);
-            function.return_type = try type_syntax_support.typeRefFromSyntax(allocator, return_type);
+            function.return_type = try type_lowering.typeRefFromSyntax(allocator, return_type);
         }
     }
 }
@@ -133,7 +134,7 @@ pub fn parseConstDataFromSyntax(
     return .{
         .type_syntax = try type_syntax.clone(allocator),
         .ty = ty,
-        .type_ref = try type_syntax_support.typeRefFromSyntax(allocator, type_syntax),
+        .type_ref = try type_lowering.typeRefFromSyntax(allocator, type_syntax),
         .initializer_syntax = if (signature.initializer_expr) |expr| try expr.clone(allocator) else null,
         .expr = null,
     };
@@ -215,7 +216,7 @@ pub fn parseImplHeaderData(
                 },
             },
         .target_type = if (signature.target_type) |target_type|
-            try type_syntax_support.typeRefFromSyntax(allocator, target_type)
+            try type_lowering.typeRefFromSyntax(allocator, target_type)
         else
             .unsupported,
         .trait_syntax = if (signature.trait_name) |trait_name|
@@ -223,7 +224,7 @@ pub fn parseImplHeaderData(
         else
             null,
         .trait_type = if (signature.trait_name) |trait_name|
-            try type_syntax_support.typeRefFromSyntax(allocator, trait_name)
+            try type_lowering.typeRefFromSyntax(allocator, trait_name)
         else
             null,
     };

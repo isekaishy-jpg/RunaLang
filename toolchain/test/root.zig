@@ -586,7 +586,6 @@ fn buildPackageHarness(
     try copyHarnessSourceTree(allocator, io, package_node.root_dir, scratch_root, root_path, active, package_result, emit_status_markers);
 
     const harness_path = try std.fs.path.join(allocator, &.{ scratch_root, root_relative });
-    errdefer allocator.free(harness_path);
     defer allocator.free(harness_path);
 
     const artifact = try buildHarnessExecutable(allocator, io, command_root, package_node.package_name, harness_stem, harness_path, diagnostics);

@@ -155,7 +155,7 @@ pub fn lowerWherePredicates(
         for (clause.predicates) |predicate| {
             switch (predicate) {
                 .bound => |bound| {
-                    if (bound.subject_name.len == 0 or bound.contract_name.len == 0) {
+                    if (bound.subject_name.len == 0 or type_syntax_support.containsInvalid(bound.contract_type)) {
                         try diagnostics.add(.@"error", "type.where.syntax", bound.span, "malformed where predicate", .{});
                         continue;
                     }
@@ -165,7 +165,7 @@ pub fn lowerWherePredicates(
                     }
                     try predicates.append(.{ .bound = .{
                         .subject_name = bound.subject_name,
-                        .contract_name = bound.contract_name,
+                        .contract_type_syntax = try bound.contract_type.clone(allocator),
                     } });
                 },
                 .projection_equality => |projection| {

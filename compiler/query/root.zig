@@ -10,7 +10,6 @@ const borrow = @import("../borrow/root.zig");
 const boundary_checks = @import("boundary_checks.zig");
 pub const checked_body = @import("checked_body.zig");
 const callable_checks = @import("callable_checks.zig");
-const callable_types = @import("callable_types.zig");
 const coherence_checks = @import("coherence_checks.zig");
 const const_contexts = @import("const_contexts.zig");
 pub const const_ir = @import("const_ir.zig");
@@ -24,7 +23,6 @@ const domain_state_checks = @import("domain_state_checks.zig");
 const dynamic_library = @import("../runtime/dynamic_library/root.zig");
 const expression_parse = @import("expression_parse.zig");
 const expression_checks = @import("expression_checks.zig");
-const foreign_callable_types = @import("foreign_callable_types.zig");
 const handle_types = @import("handle_types.zig");
 const hir = @import("../hir/root.zig");
 const item_syntax_bridge = @import("item_syntax_bridge.zig");
@@ -53,10 +51,11 @@ const test_discovery = @import("test_discovery.zig");
 const trait_solver = @import("trait_solver.zig");
 const typed = @import("../typed/root.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
+const type_lowering = @import("type_lowering.zig");
+const type_forms = @import("type_forms.zig");
 const attribute_checks = @import("attributes.zig");
 const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
-const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const query_types = @import("types.zig");
 const Allocator = std.mem.Allocator;
@@ -147,8 +146,20 @@ pub const testing = if (@import("builtin").is_test) struct {
         return canonicalType(active, key);
     }
 
-    pub fn canonicalTypeForName(active: *session.Session, module_id: session.ModuleId, name: []const u8) !types.CanonicalTypeId {
-        return canonicalTypeForNameInModule(active, module_id, name);
+    pub fn canonicalTypeForSyntax(active: *session.Session, module_id: session.ModuleId, syntax_value: ast.TypeSyntax) !types.CanonicalTypeId {
+        var owned: ast.TypeSyntax = if (syntax_value.isStructured()) try syntax_value.clone(active.allocator) else .{
+            .source = syntax_value.source,
+        };
+        defer owned.deinit(active.allocator);
+        return canonicalTypeFromSyntax(active, module_id, owned);
+    }
+
+    pub fn typeRefFromSyntax(syntax_value: ast.TypeSyntax) !types.TypeRef {
+        var owned: ast.TypeSyntax = if (syntax_value.isStructured()) try syntax_value.clone(std.heap.page_allocator) else .{
+            .source = syntax_value.source,
+        };
+        defer owned.deinit(std.heap.page_allocator);
+        return type_lowering.typeRefFromSyntax(std.heap.page_allocator, owned);
     }
 
     pub fn canonicalTypeForTypeRef(active: *session.Session, module_id: session.ModuleId, ty: types.TypeRef) !types.CanonicalTypeId {
@@ -315,6 +326,8 @@ pub fn abiCallableForKey(active: *session.Session, key: abi.AbiCallableKey) !abi
 
     const value = try abi_query.buildCallable(active, entry.key, .{
         .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .canonical_type_ref = canonicalTypeFromTypeRef,
+        .canonical_type_syntax = canonicalTypeFromSyntax,
         .checked_signature = checkedSignature,
         .layout_for_key = layoutForKey,
         .abi_type_for_key = abiTypeForKey,
@@ -351,6 +364,8 @@ pub fn loweredBackendModuleForKey(
 
     const value = try backend_contract_query.build(active, entry.key, .{
         .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .canonical_type_ref = canonicalTypeFromTypeRef,
+        .canonical_type_syntax = canonicalTypeFromSyntax,
         .checked_signature = checkedSignature,
         .checked_body = checkedBody,
         .statements_by_body = statementsByBody,
@@ -500,6 +515,7 @@ fn buildLayoutResult(active: *session.Session, key: layout.LayoutKey) !layout.La
     return layout_query.build(active, key, .{
         .canonical_key = canonicalType,
         .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .canonical_type_syntax = canonicalTypeFromSyntax,
         .checked_signature = checkedSignature,
         .layout_for_key = layoutForKey,
     });
@@ -508,6 +524,8 @@ fn buildLayoutResult(active: *session.Session, key: layout.LayoutKey) !layout.La
 fn buildAbiTypeResult(active: *session.Session, key: abi.AbiTypeKey) !abi.AbiTypeResult {
     return abi_query.buildType(active, key, .{
         .canonical_type_expression = canonicalTypeFromTypeExpression,
+        .canonical_type_ref = canonicalTypeFromTypeRef,
+        .canonical_type_syntax = canonicalTypeFromSyntax,
         .checked_signature = checkedSignature,
         .layout_for_key = layoutForKey,
         .abi_type_for_key = abiTypeForKey,
@@ -520,165 +538,194 @@ pub fn canonicalTypeFromTypeRef(active: *session.Session, module_id: session.Mod
             canonicalType(active, .{ .builtin_scalar = scalar })
         else
             canonicalType(active, .unsupported),
-        .named => |name| canonicalTypeFromTypeExpression(active, module_id, name),
+        .named => |name| blk: {
+            if (try type_lowering.clonedSyntaxForTypeRef(active.allocator, .{ .named = name })) |owned_syntax| {
+                var syntax_value = owned_syntax;
+                defer syntax_value.deinit(active.allocator);
+                break :blk canonicalTypeFromSyntax(active, module_id, syntax_value);
+            }
+            break :blk canonicalType(active, .unsupported);
+        },
         .unsupported => canonicalType(active, .unsupported),
     };
 }
 
 pub fn canonicalTypeFromTypeExpression(active: *session.Session, module_id: session.ModuleId, raw_name: []const u8) anyerror!types.CanonicalTypeId {
-    const name = std.mem.trim(u8, raw_name, " \t\r\n");
-    if (name.len == 0) return canonicalType(active, .unsupported);
+    return canonicalTypeForNameInModule(active, module_id, raw_name);
+}
 
-    if (std.mem.startsWith(u8, name, "[")) {
-        const close_index = findMatchingDelimiter(name, 0, '[', ']') orelse return canonicalType(active, .unsupported);
-        if (std.mem.trim(u8, name[close_index + 1 ..], " \t\r\n").len != 0) return canonicalType(active, .unsupported);
-        const inner = name[1..close_index];
-        const separator = findTopLevelHeaderScalar(inner, ';') orelse return canonicalType(active, .unsupported);
-        const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
-        const length_name = std.mem.trim(u8, inner[separator + 1 ..], " \t\r\n");
-        const element = try canonicalTypeFromTypeExpression(active, module_id, element_name);
-        const length = std.fmt.parseInt(u64, length_name, 10) catch return canonicalType(active, .unsupported);
+fn canonicalTypeFromSyntax(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    syntax_value: ast.TypeSyntax,
+) anyerror!types.CanonicalTypeId {
+    if (!syntax_value.isStructured()) {
+        const plain_name = type_syntax_support.isPlainName(syntax_value) orelse return canonicalType(active, .unsupported);
+        return canonicalTypeForNameInModule(active, module_id, plain_name);
+    }
+    if (type_syntax_support.containsInvalid(syntax_value)) return canonicalType(active, .unsupported);
+    var view = try type_forms.View.fromSyntax(active.allocator, syntax_value);
+    defer view.deinit();
+    return canonicalTypeFromStructuredView(active, module_id, view);
+}
+
+fn canonicalTypeFromStructuredView(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    view: type_forms.View,
+) anyerror!types.CanonicalTypeId {
+    const root = view.rootNode();
+    if (root.payload == .borrow) {
+        const boundary = type_forms.boundaryFromView(view);
+        return canonicalTypeFromTypeRef(active, module_id, boundary.inner_type);
+    }
+
+    if (type_forms.rawPointerFromView(view)) |pointer| {
+        return canonicalType(active, .{ .raw_pointer = .{
+            .access = switch (pointer.access) {
+                .read => .read,
+                .edit => .edit,
+            },
+            .pointee = try canonicalTypeFromTypeRef(active, module_id, pointer.pointee),
+        } });
+    }
+
+    if (try type_forms.tupleElementTypeRefs(active.allocator, view)) |elements| {
+        defer active.allocator.free(elements);
+        const canonical_elements = try active.allocator.alloc(types.CanonicalTypeId, elements.len);
+        defer active.allocator.free(canonical_elements);
+        for (elements, 0..) |element, index| {
+            canonical_elements[index] = try canonicalTypeFromTypeRef(active, module_id, element);
+        }
+        return canonicalType(active, .{ .tuple = .{ .elements = canonical_elements } });
+    }
+
+    if (type_forms.fixedArrayShapeFromView(view)) |shape| {
+        const length = shape.length orelse return canonicalType(active, .unsupported);
         return canonicalType(active, .{ .fixed_array = .{
-            .element = element,
+            .element = try canonicalTypeFromTypeRef(active, module_id, shape.element_type),
             .length = length,
         } });
     }
 
-    if (std.mem.startsWith(u8, name, "(")) {
-        const parts = (try tuple_types.splitTypeParts(active.allocator, name)) orelse return canonicalType(active, .unsupported);
-        defer active.allocator.free(parts);
-        if (!tuple_types.validTupleParts(parts)) return canonicalType(active, .unsupported);
-        const elements = try active.allocator.alloc(types.CanonicalTypeId, parts.len);
-        defer active.allocator.free(elements);
-        for (parts, 0..) |part, index| {
-            elements[index] = try canonicalTypeFromTypeExpression(active, module_id, part);
-        }
-        return canonicalType(active, .{ .tuple = .{ .elements = elements } });
-    }
-
-    if (std.mem.startsWith(u8, name, "*read ")) {
-        const pointee = try canonicalTypeFromTypeExpression(active, module_id, name["*read ".len..]);
-        return canonicalType(active, .{ .raw_pointer = .{
-            .access = .read,
-            .pointee = pointee,
-        } });
-    }
-    if (std.mem.startsWith(u8, name, "*edit ")) {
-        const pointee = try canonicalTypeFromTypeExpression(active, module_id, name["*edit ".len..]);
-        return canonicalType(active, .{ .raw_pointer = .{
-            .access = .edit,
-            .pointee = pointee,
-        } });
-    }
-
-    if (try foreign_callable_types.parseCanonical(active, module_id, name, .{
-        .canonical_type_expression = canonicalTypeFromTypeExpression,
-    })) |parsed_callable| {
-        var owned = parsed_callable;
+    if (try type_forms.foreignCallableFromView(active.allocator, view)) |foreign_callable| {
+        var owned = foreign_callable;
         defer owned.deinit(active.allocator);
-        return canonicalType(active, .{ .callable = owned.callable });
+        if (owned.variadic) return canonicalType(active, .unsupported);
+        const parameters = try canonicalCallableParametersFromRefs(active, module_id, owned.parameters);
+        defer if (parameters.len != 0) active.allocator.free(parameters);
+        return canonicalType(active, .{ .callable = .{
+            .abi = owned.abi,
+            .parameters = parameters,
+            .return_type = try canonicalTypeFromTypeRef(active, module_id, owned.return_type),
+        } });
     }
 
-    if (try callable_types.parseCallableTypeName(name, active.allocator)) |callable| {
-        return canonicalOrdinaryCallableType(active, module_id, callable);
+    if (type_forms.callableFromView(view)) |callable| {
+        const parameters = try canonicalCallableParametersFromInputType(active, module_id, callable.input_type);
+        defer if (parameters.len != 0) active.allocator.free(parameters);
+        return canonicalType(active, .{ .callable = .{
+            .abi = .runa,
+            .is_suspend = callable.is_suspend,
+            .parameters = parameters,
+            .return_type = try canonicalTypeFromTypeRef(active, module_id, callable.output_type),
+        } });
     }
 
-    if (try canonicalStandardFamilyType(active, module_id, name)) |standard| return standard;
-    if (try canonicalGenericApplicationType(active, module_id, name)) |application| return application;
+    if (type_forms.assocPath(view)) |assoc_path| {
+        return canonicalTypeForNameInModule(active, module_id, assoc_path);
+    }
 
-    return canonicalTypeForNameInModule(active, module_id, name);
+    const base_name = type_forms.baseName(view) orelse return canonicalType(active, .unsupported);
+    const arg_refs = try type_forms.applicationArgs(active.allocator, view, base_name);
+    if (root.payload == .apply) {
+        const refs = arg_refs orelse return canonicalType(active, .unsupported);
+        defer active.allocator.free(refs);
+
+        const base = try canonicalTypeForNameInModule(active, module_id, base_name);
+        if (standard_families.familyForResolvedBase(
+            active,
+            if (base.index < active.caches.canonical_types.items.len and active.caches.canonical_types.items[base.index].key != .unsupported) base else null,
+            base_name,
+        )) |family| {
+            return switch (family) {
+                .option => if (refs.len == 1)
+                    canonicalType(active, .{ .option = .{
+                        .payload = try canonicalTypeFromTypeRef(active, module_id, refs[0]),
+                    } })
+                else
+                    canonicalType(active, .unsupported),
+                .result => if (refs.len == 2)
+                    canonicalType(active, .{ .result = .{
+                        .ok = try canonicalTypeFromTypeRef(active, module_id, refs[0]),
+                        .err = try canonicalTypeFromTypeRef(active, module_id, refs[1]),
+                    } })
+                else
+                    canonicalType(active, .unsupported),
+            };
+        }
+        if (base.index >= active.caches.canonical_types.items.len or active.caches.canonical_types.items[base.index].key == .unsupported) {
+            return canonicalType(active, .unsupported);
+        }
+
+        const args = try active.allocator.alloc(types.CanonicalTypeId, refs.len);
+        defer active.allocator.free(args);
+        for (refs, 0..) |arg, index| {
+            args[index] = try canonicalTypeFromTypeRef(active, module_id, arg);
+        }
+
+        return canonicalType(active, .{ .generic_application = .{
+            .base = base,
+            .args = args,
+        } });
+    }
+
+    return canonicalTypeForNameInModule(active, module_id, base_name);
 }
 
-fn canonicalOrdinaryCallableType(active: *session.Session, module_id: session.ModuleId, callable: callable_types.CallableType) !types.CanonicalTypeId {
-    const input_parts = try canonicalCallableInputTypeParts(active.allocator, callable.input_type_name);
-    defer active.allocator.free(input_parts);
-
-    var parameters: []types.CallableParameter = &.{};
-    if (input_parts.len != 0) {
-        parameters = try active.allocator.alloc(types.CallableParameter, input_parts.len);
-    }
-    defer if (parameters.len != 0) active.allocator.free(parameters);
-
-    for (input_parts, 0..) |parameter_type, index| {
+fn canonicalCallableParametersFromRefs(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    refs: []const types.TypeRef,
+) ![]types.CallableParameter {
+    const parameters = try active.allocator.alloc(types.CallableParameter, refs.len);
+    for (refs, 0..) |ty, index| {
         parameters[index] = .{
             .mode = .owned,
-            .ty = try canonicalTypeFromTypeExpression(active, module_id, parameter_type),
+            .ty = try canonicalTypeFromTypeRef(active, module_id, ty),
         };
     }
-
-    return canonicalType(active, .{ .callable = .{
-        .abi = .runa,
-        .is_suspend = callable.is_suspend,
-        .parameters = parameters,
-        .return_type = try canonicalTypeFromTypeExpression(active, module_id, callable.output_type_name),
-    } });
+    return parameters;
 }
 
-fn canonicalCallableInputTypeParts(allocator: Allocator, input_type_name: []const u8) ![][]const u8 {
-    const trimmed = std.mem.trim(u8, input_type_name, " \t\r\n");
-    if (std.mem.eql(u8, trimmed, "Unit")) return allocator.alloc([]const u8, 0);
-
-    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
-        const inside = trimmed[1 .. trimmed.len - 1];
-        if (hasTopLevelComma(inside)) return splitTopLevelCommaParts(allocator, inside);
+fn canonicalCallableParametersFromInputType(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    input_type: types.TypeRef,
+) ![]types.CallableParameter {
+    if (input_type.eql(types.TypeRef.fromBuiltin(.unit))) {
+        return active.allocator.alloc(types.CallableParameter, 0);
     }
-
-    const parts = try allocator.alloc([]const u8, 1);
-    parts[0] = trimmed;
-    return parts;
+    if (try type_support.tupleElementTypes(active.allocator, input_type)) |elements| {
+        defer active.allocator.free(elements);
+        return canonicalCallableParametersFromRefs(active, module_id, elements);
+    }
+    const single = [_]types.TypeRef{input_type};
+    return canonicalCallableParametersFromRefs(active, module_id, &single);
 }
 
-fn canonicalGenericApplicationType(active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!?types.CanonicalTypeId {
-    const open_index = std.mem.indexOfScalar(u8, name, '[') orelse return null;
-    const close_index = findMatchingDelimiter(name, open_index, '[', ']') orelse return null;
-    if (std.mem.trim(u8, name[close_index + 1 ..], " \t\r\n").len != 0) return null;
-
-    const base_name = std.mem.trim(u8, name[0..open_index], " \t\r\n");
-    if (base_name.len == 0) return try canonicalType(active, .unsupported);
-
-    const arg_parts = try splitTopLevelCommaParts(active.allocator, name[open_index + 1 .. close_index]);
-    defer active.allocator.free(arg_parts);
-    if (arg_parts.len == 0) return try canonicalType(active, .unsupported);
-
-    const args = try active.allocator.alloc(types.CanonicalTypeId, arg_parts.len);
-    defer active.allocator.free(args);
-    for (arg_parts, 0..) |arg, index| {
-        const trimmed_arg = std.mem.trim(u8, arg, " \t\r\n");
-        if (trimmed_arg.len == 0) return try canonicalType(active, .unsupported);
-        args[index] = try canonicalTypeFromTypeExpression(active, module_id, trimmed_arg);
-    }
-
-    const base = try canonicalTypeForNameInModule(active, module_id, base_name);
-    if (base.index >= active.caches.canonical_types.items.len or active.caches.canonical_types.items[base.index].key == .unsupported) {
-        return try canonicalType(active, .unsupported);
-    }
-    return try canonicalType(active, .{ .generic_application = .{
-        .base = base,
-        .args = args,
-    } });
-}
-
-fn canonicalStandardFamilyType(active: *session.Session, module_id: session.ModuleId, name: []const u8) anyerror!?types.CanonicalTypeId {
-    if (try standard_families.applicationArgs(active.allocator, name, .option)) |args| {
-        defer active.allocator.free(args);
-        if (args.len != 1) return try canonicalType(active, .unsupported);
-        return try canonicalType(active, .{ .option = .{
-            .payload = try canonicalTypeFromTypeExpression(active, module_id, args[0]),
-        } });
-    }
-    if (try standard_families.applicationArgs(active.allocator, name, .result)) |args| {
-        defer active.allocator.free(args);
-        if (args.len != 2) return try canonicalType(active, .unsupported);
-        return try canonicalType(active, .{ .result = .{
-            .ok = try canonicalTypeFromTypeExpression(active, module_id, args[0]),
-            .err = try canonicalTypeFromTypeExpression(active, module_id, args[1]),
-        } });
-    }
+fn parseForeignCallableAbi(raw: []const u8) ?types.CallableAbi {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '"' or trimmed[trimmed.len - 1] != '"') return null;
+    const abi_name = trimmed[1 .. trimmed.len - 1];
+    if (std.mem.eql(u8, abi_name, "c")) return .c;
+    if (std.mem.eql(u8, abi_name, "system")) return .system;
     return null;
 }
 
 pub fn canonicalTypeForNameInModule(active: *session.Session, module_id: session.ModuleId, raw_name: []const u8) !types.CanonicalTypeId {
     const name = std.mem.trim(u8, raw_name, " \t\r\n");
+    if (!isPlainIdentifier(name)) return canonicalType(active, .unsupported);
     const builtin = types.Builtin.fromName(name);
     if (types.BuiltinScalar.fromBuiltin(builtin)) |scalar| {
         return canonicalType(active, .{ .builtin_scalar = scalar });
@@ -696,7 +743,6 @@ pub fn canonicalTypeForNameInModule(active: *session.Session, module_id: session
             .pointee = void_type,
         } });
     }
-    if (try canonicalStandardFamilyType(active, module_id, name)) |standard| return standard;
     var alias_stack = std.array_list.Managed([]const u8).init(active.allocator);
     defer alias_stack.deinit();
     if (try canonicalTypeForAliasName(active, module_id, name, &alias_stack)) |aliased| return aliased;
@@ -728,27 +774,29 @@ fn canonicalTypeForAliasName(
         else => return null,
     };
     const alias_target = signature.target orelse return try canonicalType(active, .unsupported);
-    const target_name = std.mem.trim(u8, alias_target.text(), " \t\r\n");
-    if (target_name.len == 0) return try canonicalType(active, .unsupported);
-    const target_builtin = types.Builtin.fromName(target_name);
-    if (types.BuiltinScalar.fromBuiltin(target_builtin)) |scalar| {
-        return try canonicalType(active, .{ .builtin_scalar = scalar });
-    }
-    if (types.CAbiAlias.fromName(target_name)) |alias| {
-        return try canonicalType(active, .{ .c_abi_alias = alias });
-    }
-    if (c_va_list.isTypeName(target_name)) {
-        return try canonicalType(active, .c_va_list);
-    }
-    if (try canonicalTypeForAliasName(active, alias_source.module_id, target_name, alias_stack)) |aliased| return aliased;
-    if (resolveNominalTypeItemId(active, alias_source.module_id, target_name)) |item_id| {
-        const nominal = try canonicalType(active, .{ .nominal = .{ .item_index = item_id.index } });
-        if (handle_types.itemIsHandleFamily(active, item_id)) {
-            return try canonicalType(active, .{ .handle = .{ .target = nominal } });
+    if (type_syntax_support.isPlainName(alias_target)) |target_name| {
+        const trimmed_target_name = std.mem.trim(u8, target_name, " \t\r\n");
+        if (trimmed_target_name.len == 0) return try canonicalType(active, .unsupported);
+        const target_builtin = types.Builtin.fromName(trimmed_target_name);
+        if (types.BuiltinScalar.fromBuiltin(target_builtin)) |scalar| {
+            return try canonicalType(active, .{ .builtin_scalar = scalar });
         }
-        return nominal;
+        if (types.CAbiAlias.fromName(trimmed_target_name)) |alias| {
+            return try canonicalType(active, .{ .c_abi_alias = alias });
+        }
+        if (c_va_list.isTypeName(trimmed_target_name)) {
+            return try canonicalType(active, .c_va_list);
+        }
+        if (try canonicalTypeForAliasName(active, alias_source.module_id, trimmed_target_name, alias_stack)) |aliased| return aliased;
+        if (resolveNominalTypeItemId(active, alias_source.module_id, trimmed_target_name)) |item_id| {
+            const nominal = try canonicalType(active, .{ .nominal = .{ .item_index = item_id.index } });
+            if (handle_types.itemIsHandleFamily(active, item_id)) {
+                return try canonicalType(active, .{ .handle = .{ .target = nominal } });
+            }
+            return nominal;
+        }
     }
-    return try canonicalTypeFromTypeExpression(active, alias_source.module_id, target_name);
+    return try canonicalTypeFromSyntax(active, alias_source.module_id, alias_target);
 }
 
 fn resolveNominalTypeItemId(active: *const session.Session, module_id: session.ModuleId, name: []const u8) ?session.ItemId {
@@ -769,6 +817,7 @@ fn resolveNominalTypeItemId(active: *const session.Session, module_id: session.M
         return item_id;
     }
 
+    if (standard_families.itemIdForName(active, name)) |item_id| return item_id;
     return null;
 }
 
@@ -894,7 +943,7 @@ fn variadicTailIndex(function: query_types.FunctionSignature) ?usize {
     if (function.parameters.len == 0) return null;
     const last_index = function.parameters.len - 1;
     const last = function.parameters[last_index];
-    const last_type_name = last.ty.displayName();
+    const last_type_name = type_support.typeRefRawName(last.ty);
     if (std.mem.startsWith(u8, last.name, "...") or std.mem.startsWith(u8, last_type_name, "...")) return last_index;
     return null;
 }
@@ -1105,7 +1154,7 @@ fn validateImplTraitRequirements(
     diagnostics: *diag.Bag,
 ) anyerror!void {
     const trait_name = impl_block.trait_type orelse return;
-    const resolved = try resolveTraitMethods(active, module_id, trait_name.displayName()) orelse return;
+    const resolved = try resolveTraitMethods(active, module_id, type_support.typeRefRawName(trait_name)) orelse return;
     for (resolved.methods) |trait_method| {
         if (implContainsTraitMethod(impl_block.methods, trait_method.name)) continue;
         if (trait_method.has_default_body) {
@@ -1121,7 +1170,7 @@ fn validateImplTraitRequirements(
             continue;
         }
         try diagnostics.add(.@"error", "type.impl.method_missing", span, "trait impl for '{s}' is missing required method '{s}'", .{
-            impl_block.target_type.displayName(),
+            type_support.typeRefRawName(impl_block.target_type),
             trait_method.name,
         });
     }
@@ -1366,14 +1415,14 @@ fn validateExecutableMethodPhase(
 
         if (phase == .local) {
             for (impl_block.methods) |method| {
-                if (try validateExecutableMethodSite(seen_methods, impl_block.target_type.displayName(), method.name, checked.item.span, diagnostics)) {
+                if (try validateExecutableMethodSite(seen_methods, type_support.typeRefRawName(impl_block.target_type), method.name, checked.item.span, diagnostics)) {
                     issue_count.* += 1;
                 }
             }
         }
 
         const trait_name = impl_block.trait_type orelse continue;
-        const resolved = try resolveTraitMethods(active, checked.module_id, trait_name.displayName()) orelse continue;
+        const resolved = try resolveTraitMethods(active, checked.module_id, type_support.typeRefRawName(trait_name)) orelse continue;
         const expected_source: TraitMethodSource = switch (phase) {
             .local => .local,
             .imported => .imported,
@@ -1383,7 +1432,7 @@ fn validateExecutableMethodPhase(
         for (resolved.methods) |trait_method| {
             if (implContainsTraitMethod(impl_block.methods, trait_method.name)) continue;
             if (!trait_method.has_default_body or trait_method.syntax == null) continue;
-            if (try validateExecutableMethodSite(seen_methods, impl_block.target_type.displayName(), trait_method.name, checked.item.span, diagnostics)) {
+            if (try validateExecutableMethodSite(seen_methods, type_support.typeRefRawName(impl_block.target_type), trait_method.name, checked.item.span, diagnostics)) {
                 issue_count.* += 1;
             }
         }
@@ -1948,23 +1997,20 @@ fn collectBoundaryApiCapabilityFamilies(active: *session.Session, module_id: ses
     }
 
     for (function.parameters) |parameter| {
-        const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(active.allocator, parameter.type_syntax, parameter.ty);
-        defer active.allocator.free(parameter_type_name);
-        try appendBoundaryCapabilityFamily(active, module_id, parameter_type_name, &families);
+        try appendBoundaryCapabilityFamily(active, module_id, parameter.ty, &families);
     }
-    const return_type_name = try ownedTypeNameFromSyntaxOrRef(active.allocator, function.return_type_syntax, function.return_type);
-    defer active.allocator.free(return_type_name);
-    try appendBoundaryCapabilityFamily(active, module_id, return_type_name, &families);
+    try appendBoundaryCapabilityFamily(active, module_id, function.return_type, &families);
     return families.toOwnedSlice();
 }
 
 fn appendBoundaryCapabilityFamily(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    ty: types.TypeRef,
     families: *std.array_list.Managed([]const u8),
 ) !void {
-    const name = baseTypeName(type_support.parseBoundaryType(raw_type_name).inner_type_name);
+    const boundary = type_support.boundaryFromTypeRef(ty);
+    const name = (try type_support.baseTypeNameFromTypeRef(active.allocator, boundary.inner_type)) orelse return;
     if (name.len == 0) return;
     const item_id = resolveBoundaryTypeItemId(active, module_id, name) orelse return;
     const signature = try checkedSignature(active, item_id);
@@ -2111,6 +2157,8 @@ pub fn finalizeSemanticChecks(active: *session.Session) !void {
                 .output_kind = .module,
             }, .{
                 .canonical_type_expression = canonicalTypeFromTypeExpression,
+                .canonical_type_ref = canonicalTypeFromTypeRef,
+                .canonical_type_syntax = canonicalTypeFromSyntax,
                 .checked_signature = checkedSignature,
                 .checked_body = checkedBody,
                 .statements_by_body = statementsByBody,
@@ -2274,7 +2322,7 @@ fn lowerBackendProgramFromCheckedFacts(
                     if (field_index >= struct_type_facts.field_types.len) return error.InvalidMirLowering;
                     fields[field_index] = .{
                         .name = field.name,
-                        .type_name = field.type_name,
+                        .type_name = type_support.typeRefRawName(field.ty),
                         .ty = try backendValueTypeFromCanonicalType(active, struct_type_facts.field_types[field_index]),
                     };
                     initialized += 1;
@@ -2548,10 +2596,10 @@ fn buildBackendSignatureTypeFacts(
 ) !BackendSignatureTypeFacts {
     return switch (checked.facts) {
         .function => |function| .{ .function = .{
-            .return_type = try canonicalTypeFromTypeRef(active, checked.module_id, function.return_type),
+            .return_type = try canonicalTypeFromOptionalSyntaxOrRef(active, checked.module_id, function.return_type_syntax, function.return_type),
         } },
         .const_item => |const_item| .{ .const_item = .{
-            .type_ref = try canonicalTypeFromTypeRef(active, checked.module_id, const_item.type_ref),
+            .type_ref = try canonicalTypeFromSyntax(active, checked.module_id, const_item.type_syntax),
         } },
         .struct_type => |struct_type| .{ .struct_type = .{
             .field_types = try canonicalStructFieldTypes(active, checked.module_id, struct_type.fields),
@@ -2572,7 +2620,7 @@ fn canonicalStructFieldTypes(
     const result = try active.allocator.alloc(types.CanonicalTypeId, fields.len);
     errdefer active.allocator.free(result);
     for (fields, 0..) |field, index| {
-        result[index] = try canonicalTypeFromTypeRef(active, module_id, field.ty);
+        result[index] = try canonicalTypeFromSyntax(active, module_id, field.type_syntax);
     }
     return result;
 }
@@ -2585,7 +2633,7 @@ fn canonicalTupleFieldTypes(
     const result = try active.allocator.alloc(types.CanonicalTypeId, fields.len);
     errdefer active.allocator.free(result);
     for (fields, 0..) |field, index| {
-        result[index] = try canonicalTypeFromTypeRef(active, module_id, field.ty);
+        result[index] = try canonicalTypeFromSyntax(active, module_id, field.type_syntax);
     }
     return result;
 }
@@ -2641,7 +2689,7 @@ fn canonicalTypedParameters(
     const result = try active.allocator.alloc(types.CanonicalTypeId, parameters.len);
     errdefer active.allocator.free(result);
     for (parameters, 0..) |parameter, index| {
-        result[index] = try canonicalTypeFromTypeRef(active, module_id, parameter.ty);
+        result[index] = try canonicalTypeFromOptionalSyntaxOrRef(active, module_id, parameter.type_syntax, parameter.ty);
     }
     return result;
 }
@@ -2782,7 +2830,7 @@ fn lowerBackendEnumVariants(
                     for (tuple_fields, 0..) |field, field_index| {
                         if (field_index >= tuple_type_facts.len) return error.InvalidMirLowering;
                         fields[field_index] = .{
-                            .type_name = field.type_name,
+                            .type_name = type_support.typeRefRawName(field.ty),
                             .ty = try backendValueTypeFromCanonicalType(active, tuple_type_facts[field_index]),
                         };
                         field_initialized += 1;
@@ -2804,7 +2852,7 @@ fn lowerBackendEnumVariants(
                         if (field_index >= named_type_facts.len) return error.InvalidMirLowering;
                         fields[field_index] = .{
                             .name = field.name,
-                            .type_name = field.type_name,
+                            .type_name = type_support.typeRefRawName(field.ty),
                             .ty = try backendValueTypeFromCanonicalType(active, named_type_facts[field_index]),
                         };
                         field_initialized += 1;
@@ -3163,7 +3211,7 @@ fn backendCallReturnCanonicalType(
         const item_id = findItemIdForModuleItem(active, module_id, item_index) orelse return null;
         const checked = try checkedSignature(active, item_id);
         return switch (checked.facts) {
-            .function => |function| try canonicalTypeFromTypeRef(active, checked.module_id, function.return_type),
+            .function => |function| try canonicalTypeFromOptionalSyntaxOrRef(active, checked.module_id, function.return_type_syntax, function.return_type),
             else => null,
         };
     }
@@ -3586,7 +3634,7 @@ fn duplicateMirImportInput(allocator: Allocator, binding: typed.ImportedBinding)
     else
         null;
     cloned.struct_fields = if (binding.struct_fields) |fields|
-        try allocator.dupe(typed.StructField, fields)
+        try typed.cloneStructFields(allocator, fields)
     else
         null;
     cloned.enum_variants = if (binding.enum_variants) |variants|
@@ -3617,25 +3665,7 @@ fn duplicateMirEnumVariants(allocator: Allocator, variants: []typed.EnumVariant)
 }
 
 fn duplicateMirEnumVariant(allocator: Allocator, variant: typed.EnumVariant) !typed.EnumVariant {
-    var cloned = typed.EnumVariant{
-        .name = variant.name,
-        .payload = .none,
-        .discriminant = variant.discriminant,
-    };
-    errdefer cloned.deinit(allocator);
-
-    cloned.payload = switch (variant.payload) {
-        .none => .none,
-        .tuple_fields => |tuple_fields| blk: {
-            const fields = try allocator.dupe(typed.TupleField, tuple_fields);
-            break :blk .{ .tuple_fields = fields };
-        },
-        .named_fields => |named_fields| blk: {
-            const fields = try allocator.dupe(typed.StructField, named_fields);
-            break :blk .{ .named_fields = fields };
-        },
-    };
-    return cloned;
+    return variant.clone(allocator);
 }
 
 fn duplicateMirTraitMethods(allocator: Allocator, methods: []typed.TraitMethod) ![]typed.TraitMethod {
@@ -4028,7 +4058,7 @@ const CheckedCallableResolver = struct {
         const item_id = resolveCallableItemId(self.active, self.module_id, callee_name) orelse return null;
         const signature = checkedSignature(self.active, item_id) catch return null;
         return switch (signature.facts) {
-            .function => |function| function.return_type.displayName(),
+            .function => |function| type_support.typeRefRawName(function.return_type),
             else => null,
         };
     }
@@ -4311,7 +4341,7 @@ fn findAssociatedConstIdInModule(
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
-        if (!std.mem.eql(u8, baseTypeName(impl_block.target_type.displayName()), owner_base)) continue;
+        if (!std.mem.eql(u8, baseTypeName(type_support.typeRefRawName(impl_block.target_type)), owner_base)) continue;
         if (associated_entry.associated_index >= impl_block.associated_consts.len) continue;
         const binding = impl_block.associated_consts[associated_entry.associated_index];
         if (!std.mem.eql(u8, binding.name, const_name)) continue;
@@ -4331,7 +4361,7 @@ fn findAssociatedConstIdInModule(
                 .impl_block => |impl_block| impl_block,
                 else => continue,
             };
-            if (!std.mem.eql(u8, baseTypeName(impl_block.target_type.displayName()), owner_base)) continue;
+            if (!std.mem.eql(u8, baseTypeName(type_support.typeRefRawName(impl_block.target_type)), owner_base)) continue;
             if (associated_entry.associated_index >= impl_block.associated_consts.len) continue;
             const binding = impl_block.associated_consts[associated_entry.associated_index];
             if (!std.mem.eql(u8, binding.name, const_name)) continue;
@@ -4559,10 +4589,10 @@ fn metadataForCheckedSignature(active: *session.Session, signature: CheckedSigna
             metadata.read_parameter_count = parameterModeCount(function.parameters, .read);
             metadata.edit_parameter_count = parameterModeCount(function.parameters, .edit);
             metadata.generic_param_count = function.generic_params.len;
-            metadata.return_type_name = function.return_type.displayName();
+            metadata.return_type_name = type_support.typeRefRawName(function.return_type);
         },
         .const_item => |const_item| {
-            metadata.const_type_name = const_item.type_ref.displayName();
+            metadata.const_type_name = type_support.typeRefRawName(const_item.type_ref);
             if (const_item.expr != null) {
                 const const_id = active.semantic_index.itemEntry(signature.item_id).const_id orelse return error.NotAConst;
                 const value = try constById(active, const_id);
@@ -4618,15 +4648,30 @@ fn publicFields(allocator: Allocator, fields: []const typed.StructField) ![]cons
     if (count == 0) return &.{};
 
     var result = try allocator.alloc(typed.StructField, count);
-    errdefer allocator.free(result);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(result);
+    }
 
     var index: usize = 0;
     for (fields) |field| {
         if (field.visibility != .pub_item) continue;
-        result[index] = field;
+        result[index] = try field.clone(allocator);
+        initialized += 1;
         index += 1;
     }
     return result;
+}
+
+fn canonicalTypeFromOptionalSyntaxOrRef(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    type_syntax: ?ast.TypeSyntax,
+    ty: types.TypeRef,
+) !types.CanonicalTypeId {
+    if (type_syntax) |syntax_value| return canonicalTypeFromSyntax(active, module_id, syntax_value);
+    return canonicalTypeFromTypeRef(active, module_id, ty);
 }
 
 fn variantPayloadCount(variants: []const typed.EnumVariant) usize {
@@ -4754,7 +4799,7 @@ fn cloneFunctionPrototypeFromSignature(
     errdefer allocator.free(parameter_modes);
     for (signature.parameters, 0..) |parameter, index| {
         parameter_types[index] = parameter.ty;
-        parameter_type_names[index] = parameter.ty.displayName();
+        parameter_type_names[index] = type_support.typeRefRawName(parameter.ty);
         parameter_modes[index] = parameter.mode;
     }
 
@@ -4866,7 +4911,7 @@ fn appendImportedMethodPrototypesForBinding(
             .impl_block => |impl_block| impl_block,
             else => continue,
         };
-        if (!std.mem.eql(u8, impl_block.target_type.displayName(), source_type_name)) continue;
+        if (!std.mem.eql(u8, type_support.typeRefRawName(impl_block.target_type), source_type_name)) continue;
 
         for (impl_block.methods) |method| {
             if (dedupe and findMethodPrototype(prototypes.items, local_type_name, method.name) != null) continue;
@@ -4886,7 +4931,7 @@ fn appendImportedMethodPrototypesForBinding(
         }
 
         const trait_name = impl_block.trait_type orelse continue;
-        const resolved = try resolveTraitMethods(active, source_module_id, trait_name.displayName()) orelse continue;
+        const resolved = try resolveTraitMethods(active, source_module_id, type_support.typeRefRawName(trait_name)) orelse continue;
         for (resolved.methods) |trait_method| {
             if (!trait_method.has_default_body) continue;
             if (implContainsMethod(impl_block.methods, trait_method.name)) continue;
@@ -4967,7 +5012,7 @@ fn buildImportedMethodPrototype(
     errdefer allocator.free(parameter_modes);
     for (function.parameters.items, 0..) |parameter, index| {
         parameter_types[index] = remapImportedMethodType(parameter.ty, source_type_name, local_type_name);
-        parameter_type_names[index] = remapImportedMethodTypeName(parameter.ty.displayName(), source_type_name, local_type_name);
+        parameter_type_names[index] = remapImportedMethodTypeName(type_support.typeRefRawName(parameter.ty), source_type_name, local_type_name);
         parameter_modes[index] = parameter.mode;
     }
 
@@ -5117,8 +5162,8 @@ fn buildSynthesizedDefaultMethods(
             else => continue,
         };
         const trait_name = impl_block.trait_type orelse continue;
-        const target_type_name = impl_block.target_type.displayName();
-        const resolved = try resolveTraitMethods(active, module_id, trait_name.displayName()) orelse continue;
+        const target_type_name = type_support.typeRefRawName(impl_block.target_type);
+        const resolved = try resolveTraitMethods(active, module_id, type_support.typeRefRawName(trait_name)) orelse continue;
         for (resolved.methods) |trait_method| {
             if (!trait_method.has_default_body) continue;
             if (implContainsMethod(impl_block.methods, trait_method.name)) continue;
@@ -5243,13 +5288,9 @@ fn resolveExecutableMethodFunction(
     };
 
     for (function.parameters.items) |*parameter| {
-        const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
-        defer allocator.free(parameter_type_name);
-        parameter.ty = try resolveValueTypeWithContext(parameter_type_name, context, span, diagnostics);
+        parameter.ty = try resolveValueTypeFromSyntaxOrRef(parameter.type_syntax, parameter.ty, context, span, diagnostics);
     }
-    const return_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, function.return_type_syntax, function.return_type);
-    defer allocator.free(return_type_name);
-    function.return_type = try resolveValueTypeWithContext(return_type_name, context, span, diagnostics);
+    function.return_type = try resolveValueTypeFromSyntaxOrRef(function.return_type_syntax, function.return_type, context, span, diagnostics);
     try validateWherePredicates(active, module_id, module, function.where_predicates, context, span, diagnostics);
 }
 
@@ -5266,7 +5307,7 @@ fn methodPrototypeFromOwnedExecutableMethod(
     errdefer allocator.free(parameter_modes);
     for (function.parameters.items, 0..) |parameter, index| {
         parameter_types[index] = parameter.ty;
-        parameter_type_names[index] = parameter.ty.displayName();
+        parameter_type_names[index] = type_support.typeRefRawName(parameter.ty);
         parameter_modes[index] = parameter.mode;
     }
 
@@ -5973,7 +6014,7 @@ fn buildConstRequiredExprSites(
                 try collectTypeConstRequiredExprSites(
                     active.allocator,
                     &sites,
-                    parameter.ty.displayName(),
+                    type_support.typeRefRawName(parameter.ty),
                     &scope,
                     module_pipeline.prototypes.items,
                     imported_method_prototypes,
@@ -5986,7 +6027,7 @@ fn buildConstRequiredExprSites(
             try collectTypeConstRequiredExprSites(
                 active.allocator,
                 &sites,
-                function.return_type.displayName(),
+                type_support.typeRefRawName(function.return_type),
                 &scope,
                 module_pipeline.prototypes.items,
                 imported_method_prototypes,
@@ -6029,10 +6070,12 @@ fn buildConstRequiredExprSites(
             );
         },
         .struct_type => |struct_type| for (struct_type.fields) |field| {
+            const field_type_name = try ownedTypeNameFromSyntax(active.allocator, field.type_syntax);
+            defer active.allocator.free(field_type_name);
             try collectTypeConstRequiredExprSites(
                 active.allocator,
                 &sites,
-                field.type_name,
+                field_type_name,
                 &scope,
                 module_pipeline.prototypes.items,
                 imported_method_prototypes,
@@ -6043,10 +6086,12 @@ fn buildConstRequiredExprSites(
             );
         },
         .union_type => |union_type| for (union_type.fields) |field| {
+            const field_type_name = try ownedTypeNameFromSyntax(active.allocator, field.type_syntax);
+            defer active.allocator.free(field_type_name);
             try collectTypeConstRequiredExprSites(
                 active.allocator,
                 &sites,
-                field.type_name,
+                field_type_name,
                 &scope,
                 module_pipeline.prototypes.items,
                 imported_method_prototypes,
@@ -6061,10 +6106,12 @@ fn buildConstRequiredExprSites(
                 switch (variant.payload) {
                     .none => {},
                     .tuple_fields => |fields| for (fields) |field| {
+                        const field_type_name = try ownedTypeNameFromSyntax(active.allocator, field.type_syntax);
+                        defer active.allocator.free(field_type_name);
                         try collectTypeConstRequiredExprSites(
                             active.allocator,
                             &sites,
-                            field.type_name,
+                            field_type_name,
                             &scope,
                             module_pipeline.prototypes.items,
                             imported_method_prototypes,
@@ -6075,10 +6122,12 @@ fn buildConstRequiredExprSites(
                         );
                     },
                     .named_fields => |fields| for (fields) |field| {
+                        const field_type_name = try ownedTypeNameFromSyntax(active.allocator, field.type_syntax);
+                        defer active.allocator.free(field_type_name);
                         try collectTypeConstRequiredExprSites(
                             active.allocator,
                             &sites,
-                            field.type_name,
+                            field_type_name,
                             &scope,
                             module_pipeline.prototypes.items,
                             imported_method_prototypes,
@@ -6093,13 +6142,15 @@ fn buildConstRequiredExprSites(
 
             const discriminant_type = enumDiscriminantExpectedType(item.attributes);
             for (enum_type.variants) |variant| {
-                const discriminant = variant.discriminant orelse continue;
-                if (std.mem.trim(u8, discriminant, " \t").len == 0) continue;
-                try appendConstRequiredExprSite(
+                const discriminant_source = variant.discriminant_source orelse continue;
+                const discriminant_syntax = variant.discriminant_syntax orelse continue;
+                if (std.mem.trim(u8, discriminant_source.text, " \t").len == 0) continue;
+                try appendConstRequiredExprSiteFromSyntax(
                     active.allocator,
                     &sites,
                     .enum_discriminant,
-                    discriminant,
+                    discriminant_source.text,
+                    discriminant_syntax,
                     variant.name,
                     discriminant_type,
                     &scope,
@@ -6243,9 +6294,7 @@ fn seedConstExprScope(active: *session.Session, module_id: session.ModuleId, sco
             else => continue,
         };
         const type_syntax = signature.ty orelse continue;
-        const type_name = try type_syntax_support.render(active.allocator, type_syntax);
-        defer active.allocator.free(type_name);
-        try scope.putConst(item.name, try resolveValueTypeWithContext(type_name, context, source_item.span, &diagnostics));
+        try scope.putConst(item.name, try resolveValueTypeSyntaxWithContext(type_syntax, context, source_item.span, &diagnostics));
     }
     for (module.imports.items) |binding| {
         if (binding.const_type) |ty| try scope.putConst(binding.local_name, ty);
@@ -6354,7 +6403,7 @@ fn buildEnumPrototypes(
 
 fn deinitQueryStructPrototypes(allocator: Allocator, prototypes: []const QueryStructPrototype) void {
     for (prototypes) |prototype| {
-        if (prototype.owns_fields and prototype.fields.len != 0) allocator.free(prototype.fields);
+        if (prototype.owns_fields) typed.deinitStructFields(allocator, @constCast(prototype.fields));
     }
     if (prototypes.len != 0) allocator.free(prototypes);
 }
@@ -6439,7 +6488,7 @@ fn appendConstRequiredExprSite(
 ) !void {
     var site = query_types.ConstRequiredExprSite{
         .kind = kind,
-        .source = source_text,
+        .source = try allocator.dupe(u8, source_text),
         .owner_name = owner_name,
     };
     errdefer site.deinit(allocator);
@@ -6452,6 +6501,66 @@ fn appendConstRequiredExprSite(
         syntax_expr.deinit(allocator);
         allocator.destroy(syntax_expr);
     }
+
+    const parsed = expression_parse.parseExpressionSyntax(
+        allocator,
+        syntax_expr,
+        expected_type,
+        scope,
+        &.{},
+        prototypes,
+        method_prototypes,
+        struct_prototypes,
+        enum_prototypes,
+        diagnostics,
+        span,
+        false,
+        false,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            site.lower_error = err;
+            try sites.append(site);
+            return;
+        },
+    };
+    defer {
+        parsed.deinit(allocator);
+        allocator.destroy(parsed);
+    }
+
+    site.expr = const_ir.lowerExpr(allocator, parsed) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => blk: {
+            site.lower_error = err;
+            break :blk null;
+        },
+    };
+    try sites.append(site);
+}
+
+fn appendConstRequiredExprSiteFromSyntax(
+    allocator: Allocator,
+    sites: *std.array_list.Managed(query_types.ConstRequiredExprSite),
+    kind: query_types.ConstRequiredExprKind,
+    source_text: []const u8,
+    syntax_expr: *const ast.BodyExprSyntax,
+    owner_name: []const u8,
+    expected_type: types.TypeRef,
+    scope: *ConstExprScope,
+    prototypes: []const typed.FunctionPrototype,
+    method_prototypes: []const typed.MethodPrototype,
+    struct_prototypes: []const QueryStructPrototype,
+    enum_prototypes: []const QueryEnumPrototype,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) !void {
+    var site = query_types.ConstRequiredExprSite{
+        .kind = kind,
+        .source = try allocator.dupe(u8, source_text),
+        .owner_name = owner_name,
+    };
+    errdefer site.deinit(allocator);
 
     const parsed = expression_parse.parseExpressionSyntax(
         allocator,
@@ -6649,188 +6758,190 @@ fn validateSimpleTypeName(name: []const u8, context: TypeResolutionContext, span
     try diagnostics.add(.@"error", "type.name.unknown_type", span, "unknown type name '{s}'", .{name});
 }
 
-fn validateForeignCallableTypeExpression(
-    raw: []const u8,
+fn validateTypeSyntax(
+    syntax_value: ast.TypeSyntax,
     context: TypeResolutionContext,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) anyerror!void {
-    var syntax = try foreign_callable_types.parseSyntax(context.type_scope.allocator, raw) orelse {
-        try diagnostics.add(.@"error", "type.foreign_callable.syntax", span, "malformed foreign function pointer type '{s}'", .{raw});
-        return;
-    };
-    defer syntax.deinit(context.type_scope.allocator);
-
-    for (syntax.parameters) |parameter_type| {
-        try validateTypeExpression(parameter_type, context, span, diagnostics);
-    }
-    if (syntax.variadic_tail) |tail| {
-        try validateTypeExpression(tail, context, span, diagnostics);
-        try diagnostics.add(.@"error", "abi.c.variadic.callback", span, "variadic foreign function pointer types are not implemented in stage0", .{});
-    }
-    try validateTypeExpression(syntax.return_type, context, span, diagnostics);
-}
-
-fn validateTypeExpression(
-    raw: []const u8,
-    context: TypeResolutionContext,
-    span: source.Span,
-    diagnostics: *diag.Bag,
-) anyerror!void {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) {
+    if (type_syntax_support.containsInvalid(syntax_value)) {
         try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type name", .{});
         return;
     }
-
-    if (rawPointerPointee(trimmed)) |pointee| return validateTypeExpression(pointee, context, span, diagnostics);
-    if (trimmed[0] == '*') {
-        try diagnostics.add(.@"error", "type.raw_pointer.syntax", span, "malformed raw pointer type '{s}'", .{trimmed});
-        return;
-    }
-    if (foreign_callable_types.startsForeignCallableType(trimmed)) {
-        return validateForeignCallableTypeExpression(trimmed, context, span, diagnostics);
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "hold[")) {
-        const close_index = findMatchingDelimiter(trimmed, "hold[".len - 1, '[', ']') orelse {
-            try diagnostics.add(.@"error", "type.lifetime.syntax", span, "malformed retained-borrow syntax '{s}'", .{trimmed});
-            return;
-        };
-        const lifetime_name = std.mem.trim(u8, trimmed["hold[".len..close_index], " \t");
-        try validateLifetimeReference(lifetime_name, context.generic_params, span, diagnostics);
-
-        const rest = std.mem.trim(u8, trimmed[close_index + 1 ..], " \t");
-        if (std.mem.startsWith(u8, rest, "read ")) return validateTypeExpression(rest["read ".len..], context, span, diagnostics);
-        if (std.mem.startsWith(u8, rest, "edit ")) return validateTypeExpression(rest["edit ".len..], context, span, diagnostics);
-        if (std.mem.startsWith(u8, rest, "take ")) {
-            try diagnostics.add(.@"error", "type.lifetime.hold_take", span, "retained borrows do not support 'hold[...] take T'", .{});
-            return;
-        }
-        try diagnostics.add(.@"error", "type.lifetime.syntax", span, "malformed retained-borrow syntax '{s}'", .{trimmed});
-        return;
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "read ")) return validateTypeExpression(trimmed["read ".len..], context, span, diagnostics);
-    if (std.mem.startsWith(u8, trimmed, "edit ")) return validateTypeExpression(trimmed["edit ".len..], context, span, diagnostics);
-
-    if (std.mem.startsWith(u8, trimmed, "[")) {
-        const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse {
-            try diagnostics.add(.@"error", "type.array.syntax", span, "malformed fixed array type '{s}'", .{trimmed});
-            return;
-        };
-        if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t").len != 0) {
-            try diagnostics.add(.@"error", "type.array.syntax", span, "malformed fixed array type '{s}'", .{trimmed});
-            return;
-        }
-        const inner = trimmed[1..close_index];
-        const separator = findTopLevelHeaderScalar(inner, ';') orelse {
-            try diagnostics.add(.@"error", "type.array.syntax", span, "fixed array type '{s}' requires '[T; N]'", .{trimmed});
-            return;
-        };
-        const element_type = std.mem.trim(u8, inner[0..separator], " \t");
-        const length_expr = std.mem.trim(u8, inner[separator + 1 ..], " \t");
-        if (element_type.len == 0 or length_expr.len == 0) {
-            try diagnostics.add(.@"error", "type.array.syntax", span, "fixed array type '{s}' requires '[T; N]'", .{trimmed});
-            return;
-        }
-        try validateTypeExpression(element_type, context, span, diagnostics);
-        return;
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "(")) {
-        const parts = (try tuple_types.splitTypeParts(context.type_scope.allocator, trimmed)) orelse {
-            try diagnostics.add(.@"error", "type.tuple.syntax", span, "malformed tuple type '{s}'", .{trimmed});
-            return;
-        };
-        defer context.type_scope.allocator.free(parts);
-        if (parts.len < 2) {
-            try diagnostics.add(.@"error", "type.tuple.arity", span, "tuple type '{s}' must have at least two elements", .{trimmed});
-            return;
-        }
-        for (parts) |part| {
-            if (part.len == 0) {
-                try diagnostics.add(.@"error", "type.tuple.syntax", span, "malformed tuple type '{s}'", .{trimmed});
-                continue;
-            }
-            try validateTypeExpression(part, context, span, diagnostics);
-        }
-        return;
-    }
-
-    if (std.mem.indexOfScalar(u8, trimmed, '[')) |open_index| {
-        const close_index = findMatchingDelimiter(trimmed, open_index, '[', ']') orelse {
-            try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type application '{s}'", .{trimmed});
-            return;
-        };
-        if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t").len != 0) {
-            try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type application '{s}'", .{trimmed});
-            return;
-        }
-        const base_name = std.mem.trim(u8, trimmed[0..open_index], " \t");
-        try validateSimpleTypeName(base_name, context, span, diagnostics);
-        const args = try splitTopLevelCommaParts(context.type_scope.allocator, trimmed[open_index + 1 .. close_index]);
-        defer context.type_scope.allocator.free(args);
-        for (args) |arg| {
-            if (arg.len == 0) {
-                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type application '{s}'", .{trimmed});
-                continue;
-            }
-            if (isLifetimeName(arg)) {
-                try validateLifetimeReference(arg, context.generic_params, span, diagnostics);
-            } else {
-                try validateTypeExpression(arg, context, span, diagnostics);
-            }
-        }
-        try validateMapKeyContracts(base_name, args, context, span, diagnostics);
-        return;
-    }
-
-    if (std.mem.indexOfScalar(u8, trimmed, '.')) |_| {
-        var parts = std.mem.splitScalar(u8, trimmed, '.');
-        var part_index: usize = 0;
-        while (parts.next()) |part| : (part_index += 1) {
-            if (part_index == 0) {
-                try validateSimpleTypeName(part, context, span, diagnostics);
-            } else if (!isPlainIdentifier(part)) {
-                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed associated type reference '{s}'", .{trimmed});
-            }
-        }
-        return;
-    }
-
-    try validateSimpleTypeName(trimmed, context, span, diagnostics);
+    try validateTypeSyntaxNode(syntax_value, 0, context, span, diagnostics);
 }
 
-fn validateMapKeyContracts(
+fn validateTypeSyntaxNode(
+    syntax_value: ast.TypeSyntax,
+    node_index: usize,
+    context: TypeResolutionContext,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) anyerror!void {
+    const node = blk: {
+        if (syntax_value.isStructured()) break :blk syntax_value.nodes[node_index];
+        if (node_index != 0) {
+            try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type name", .{});
+            return;
+        }
+        break :blk syntax_value.rootNode();
+    };
+    const children = syntax_value.childNodeIndices(node_index);
+    switch (node.payload) {
+        .invalid => {
+            try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type name", .{});
+        },
+        .name_ref => try validateSimpleTypeName(node.source.text, context, span, diagnostics),
+        .lifetime => try diagnostics.add(.@"error", "type.name.syntax", span, "lifetime '{s}' cannot be used as a standalone type", .{node.source.text}),
+        .borrow => |borrow_syntax| {
+            if (borrow_syntax.lifetime) |lifetime| {
+                try validateLifetimeReference(std.mem.trim(u8, lifetime.text, " \t\r\n"), context.generic_params, span, diagnostics);
+            }
+            if (children.len == 0) {
+                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type name", .{});
+                return;
+            }
+            try validateTypeSyntaxNode(syntax_value, children[children.len - 1], context, span, diagnostics);
+        },
+        .raw_pointer => {
+            if (children.len == 0) {
+                try diagnostics.add(.@"error", "type.raw_pointer.syntax", span, "malformed raw pointer type '{s}'", .{node.source.text});
+                return;
+            }
+            try validateTypeSyntaxNode(syntax_value, children[children.len - 1], context, span, diagnostics);
+        },
+        .tuple => {
+            if (children.len < 2) {
+                try diagnostics.add(.@"error", "type.tuple.arity", span, "tuple type '{s}' must have at least two elements", .{node.source.text});
+                return;
+            }
+            for (children) |child_index| try validateTypeSyntaxNode(syntax_value, child_index, context, span, diagnostics);
+        },
+        .fixed_array => |array| {
+            if (children.len != 1 or std.mem.trim(u8, array.length.text, " \t\r\n").len == 0) {
+                try diagnostics.add(.@"error", "type.array.syntax", span, "fixed array type '{s}' requires '[T; N]'", .{node.source.text});
+                return;
+            }
+            try validateTypeSyntaxNode(syntax_value, children[0], context, span, diagnostics);
+        },
+        .foreign_callable => |callable| {
+            if (parseForeignCallableAbi(callable.abi.text) == null) {
+                try diagnostics.add(.@"error", "type.foreign_callable.syntax", span, "malformed foreign function pointer type '{s}'", .{node.source.text});
+                return;
+            }
+            const parameter_count: usize = @intCast(callable.parameter_count);
+            if (children.len != parameter_count + 1) {
+                try diagnostics.add(.@"error", "type.foreign_callable.syntax", span, "malformed foreign function pointer type '{s}'", .{node.source.text});
+                return;
+            }
+            for (0..parameter_count) |index| try validateTypeSyntaxNode(syntax_value, children[index], context, span, diagnostics);
+            if (callable.has_variadic_tail) {
+                try diagnostics.add(.@"error", "abi.c.variadic.callback", span, "variadic foreign function pointer types are not implemented in stage0", .{});
+            }
+            try validateTypeSyntaxNode(syntax_value, children[children.len - 1], context, span, diagnostics);
+        },
+        .apply => {
+            if (children.len < 2) {
+                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type application '{s}'", .{node.source.text});
+                return;
+            }
+            const base_node = syntax_value.nodes[children[0]];
+            if (base_node.payload != .name_ref) {
+                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed type application '{s}'", .{node.source.text});
+                return;
+            }
+            const base_name = std.mem.trim(u8, base_node.source.text, " \t\r\n");
+            try validateSimpleTypeName(base_name, context, span, diagnostics);
+            for (children[1..]) |child_index| {
+                const child = syntax_value.nodes[child_index];
+                if (child.payload == .lifetime) {
+                    try validateLifetimeReference(std.mem.trim(u8, child.source.text, " \t\r\n"), context.generic_params, span, diagnostics);
+                } else {
+                    try validateTypeSyntaxNode(syntax_value, child_index, context, span, diagnostics);
+                }
+            }
+            try validateMapKeyContractsFromSyntax(base_name, syntax_value, children[1..], context, span, diagnostics);
+        },
+        .assoc => |assoc| {
+            if (children.len != 1) {
+                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed associated type reference '{s}'", .{node.source.text});
+                return;
+            }
+            try validateTypeSyntaxNode(syntax_value, children[0], context, span, diagnostics);
+            if (!isPlainIdentifier(assoc.member.text)) {
+                try diagnostics.add(.@"error", "type.name.syntax", span, "malformed associated type reference '{s}'", .{node.source.text});
+            }
+        },
+    }
+}
+
+fn validateMapKeyContractsFromSyntax(
     base_name: []const u8,
-    args: []const []const u8,
+    syntax_value: ast.TypeSyntax,
+    arg_indices: []const u32,
     context: TypeResolutionContext,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !void {
     if (!std.mem.eql(u8, base_name, "Map")) return;
-    if (args.len != 2) return;
+    if (arg_indices.len != 2) return;
     const active = context.active orelse return;
-    const key_type = std.mem.trim(u8, args[0], " \t");
-    if (key_type.len == 0) return;
-    if (!trait_solver.typeNameIsEqInEnvironment(active, context.module_id, key_type, context.where_predicates)) {
-        try diagnostics.add(.@"error", "type.map.key_eq", span, "Map key type '{s}' must satisfy Eq", .{key_type});
+    var view = try type_forms.View.fromSyntax(diagnostics.allocator, syntax_value);
+    defer view.deinit();
+    const key_type = view.typeRef(arg_indices[0]) catch .unsupported;
+    if (key_type.isUnsupported()) return;
+    const key_name = try type_support.renderTypeRef(diagnostics.allocator, key_type);
+    defer diagnostics.allocator.free(key_name);
+    if (!trait_solver.typeRefIsEqInEnvironment(active, context.module_id, key_type, context.where_predicates)) {
+        try diagnostics.add(.@"error", "type.map.key_eq", span, "Map key type '{s}' must satisfy Eq", .{key_name});
     }
-    if (!trait_solver.typeNameIsHashInEnvironment(active, context.module_id, key_type, context.where_predicates)) {
-        try diagnostics.add(.@"error", "type.map.key_hash", span, "Map key type '{s}' must satisfy Hash", .{key_type});
+    if (!trait_solver.typeRefIsHashInEnvironment(active, context.module_id, key_type, context.where_predicates)) {
+        try diagnostics.add(.@"error", "type.map.key_hash", span, "Map key type '{s}' must satisfy Hash", .{key_name});
     }
 }
 
-fn resolveValueTypeWithContext(
-    type_name: []const u8,
+fn resolveValueTypeFromSyntaxOrRef(
+    type_syntax: ?ast.TypeSyntax,
+    ty: types.TypeRef,
     context: TypeResolutionContext,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !types.TypeRef {
-    const trimmed = std.mem.trim(u8, type_name, " \t");
-    try validateTypeExpression(trimmed, context, span, diagnostics);
+    if (type_syntax) |syntax_value| {
+        try validateTypeSyntax(syntax_value, context, span, diagnostics);
+        return resolveValueTypeSyntaxWithContext(syntax_value, context, span, diagnostics);
+    }
+    if (try type_lowering.clonedSyntaxForTypeRef(diagnostics.allocator, ty)) |syntax_value| {
+        var owned = syntax_value;
+        defer owned.deinit(diagnostics.allocator);
+        try validateTypeSyntax(owned, context, span, diagnostics);
+        return resolveValueTypeSyntaxWithContext(owned, context, span, diagnostics);
+    }
+    return ty;
+}
 
+fn resolveValueTypeSyntaxWithContext(
+    syntax_value: ast.TypeSyntax,
+    context: TypeResolutionContext,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) anyerror!types.TypeRef {
+    if (type_syntax_support.containsInvalid(syntax_value)) return .unsupported;
+    const root = syntax_value.rootNode();
+    return switch (root.payload) {
+        .invalid, .lifetime => .unsupported,
+        .name_ref => resolveSimpleTypeWithContext(root.source.text, context, span, diagnostics),
+        else => type_lowering.typeRefFromSyntax(diagnostics.allocator, syntax_value),
+    };
+}
+
+fn resolveSimpleTypeWithContext(
+    type_name: []const u8,
+    context: TypeResolutionContext,
+    span: source.Span,
+    diagnostics: *diag.Bag,
+) anyerror!types.TypeRef {
+    const trimmed = std.mem.trim(u8, type_name, " \t\r\n");
     const builtin = types.Builtin.fromName(trimmed);
     if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
     if (context.self_type_name) |self_type_name| {
@@ -6856,7 +6967,7 @@ fn resolveTypeAliasTargetType(
     span: source.Span,
     diagnostics: *diag.Bag,
     alias_stack: *std.array_list.Managed([]const u8),
-) !?types.TypeRef {
+) anyerror!?types.TypeRef {
     const alias_source = findTypeAliasSourceItem(active, module_id, name) orelse return null;
     for (alias_stack.items) |active_name| {
         if (std.mem.eql(u8, active_name, name)) {
@@ -6872,21 +6983,23 @@ fn resolveTypeAliasTargetType(
         else => return null,
     };
     const alias_target = signature.target orelse return .unsupported;
-    const target_name = std.mem.trim(u8, alias_target.text(), " \t");
-    if (target_name.len == 0) return .unsupported;
-
-    const builtin = types.Builtin.fromName(target_name);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    if (types.CAbiAlias.fromName(target_name) != null) return .{ .named = target_name };
-    if (context.self_type_name) |self_type_name| {
-        if (std.mem.eql(u8, target_name, "Self")) return .{ .named = self_type_name };
-    }
     var target_context = context;
     target_context.module_id = alias_source.module_id;
-    if (try resolveTypeAliasTargetType(active, alias_source.module_id, target_name, target_context, span, diagnostics, alias_stack)) |aliased| {
-        return aliased;
+    if (type_syntax_support.isPlainName(alias_target)) |plain_target_name| {
+        const target_name = std.mem.trim(u8, plain_target_name, " \t\r\n");
+        if (target_name.len == 0) return .unsupported;
+
+        const builtin = types.Builtin.fromName(target_name);
+        if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+        if (types.CAbiAlias.fromName(target_name) != null) return .{ .named = target_name };
+        if (context.self_type_name) |self_type_name| {
+            if (std.mem.eql(u8, target_name, "Self")) return .{ .named = self_type_name };
+        }
+        if (try resolveTypeAliasTargetType(active, alias_source.module_id, target_name, target_context, span, diagnostics, alias_stack)) |aliased| {
+            return aliased;
+        }
     }
-    return .{ .named = target_name };
+    return try resolveValueTypeSyntaxWithContext(alias_target, target_context, span, diagnostics);
 }
 
 const TypeAliasSource = struct {
@@ -6928,15 +7041,6 @@ fn duplicateTypeRefIfOwned(allocator: Allocator, value: types.TypeRef) !types.Ty
     };
 }
 
-fn ownedTypeNameFromSyntaxOrRef(
-    allocator: Allocator,
-    maybe_syntax: ?ast.TypeSyntax,
-    fallback: types.TypeRef,
-) ![]const u8 {
-    if (maybe_syntax) |syntax_value| return type_syntax_support.render(allocator, syntax_value);
-    return allocator.dupe(u8, fallback.displayName());
-}
-
 fn ownedTypeNameFromSyntax(allocator: Allocator, syntax_value: ast.TypeSyntax) ![]const u8 {
     return type_syntax_support.render(allocator, syntax_value);
 }
@@ -6952,11 +7056,9 @@ fn validateWherePredicates(
 ) !void {
     for (predicates) |predicate| {
         switch (predicate) {
-            .bound => |bound| try validateTypeExpression(bound.contract_name, context, span, diagnostics),
+            .bound => |bound| try validateTypeSyntax(bound.contract_type_syntax, context, span, diagnostics),
             .projection_equality => |projection| {
-                const value_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, projection.value_type_syntax);
-                defer diagnostics.allocator.free(value_type_name);
-                try validateTypeExpression(value_type_name, context, span, diagnostics);
+                try validateTypeSyntax(projection.value_type_syntax, context, span, diagnostics);
                 if (!projectionSubjectHasAssociatedType(active, module_id, module, predicates, projection.subject_name, projection.associated_name)) {
                     try diagnostics.add(.@"error", "type.where.associated", span, "invalid associated-output reference '{s}.{s}'", .{
                         projection.subject_name,
@@ -7019,7 +7121,13 @@ fn projectionSubjectHasAssociatedType(
         switch (predicate) {
             .bound => |bound| {
                 if (!std.mem.eql(u8, bound.subject_name, subject_name)) continue;
-                if (traitHasAssociatedType(active, module_id, module, baseTypeName(bound.contract_name), associated_name)) return true;
+                const contract_name = type_syntax_support.isPlainName(bound.contract_type_syntax) orelse blk: {
+                    var view = type_forms.View.fromSyntax(std.heap.page_allocator, bound.contract_type_syntax) catch break :blk null;
+                    defer view.deinit();
+                    break :blk type_forms.baseName(view);
+                };
+                if (contract_name == null) continue;
+                if (traitHasAssociatedType(active, module_id, module, contract_name.?, associated_name)) return true;
             },
             else => {},
         }
@@ -7079,9 +7187,7 @@ fn validateTraitMethodSignature(
                     const receiver = try parseMethodReceiverFromSyntax(allocator, "Self", first_parameter, span, diagnostics) orelse return;
                     var owned_receiver = receiver;
                     defer owned_receiver.deinit(allocator);
-                    const receiver_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, receiver.type_syntax, receiver.ty);
-                    defer allocator.free(receiver_type_name);
-                    try validateTypeExpression(receiver_type_name, context, span, diagnostics);
+                    if (receiver.type_syntax) |receiver_type_syntax| try validateTypeSyntax(receiver_type_syntax, context, span, diagnostics);
                     param_index = 1;
                 }
             }
@@ -7091,15 +7197,11 @@ fn validateTraitMethodSignature(
             const parameter = try parseOrdinaryParameterFromSyntax(allocator, method_syntax.signature.parameters[param_index], span, diagnostics) orelse continue;
             var owned_parameter = parameter;
             defer owned_parameter.deinit(allocator);
-            const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
-            defer allocator.free(parameter_type_name);
-            try validateTypeExpression(parameter_type_name, context, span, diagnostics);
+            if (parameter.type_syntax) |parameter_type_syntax| try validateTypeSyntax(parameter_type_syntax, context, span, diagnostics);
         }
 
         if (method_syntax.signature.return_type) |return_type| {
-            const return_type_name = try ownedTypeNameFromSyntax(allocator, return_type);
-            defer allocator.free(return_type_name);
-            if (return_type_name.len != 0) try validateTypeExpression(return_type_name, context, span, diagnostics);
+            try validateTypeSyntax(return_type, context, span, diagnostics);
         }
         try validateWherePredicates(active, module_id, module, method.where_predicates, context, span, diagnostics);
     }
@@ -7128,9 +7230,7 @@ fn validateTraitSignature(
     };
     try validateWherePredicates(active, module_id, module, trait_type.where_predicates, context, span, diagnostics);
     for (trait_type.associated_consts) |associated_const| {
-        const associated_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, associated_const.type_syntax);
-        defer diagnostics.allocator.free(associated_type_name);
-        try validateTypeExpression(associated_type_name, context, span, diagnostics);
+        try validateTypeSyntax(associated_const.type_syntax, context, span, diagnostics);
     }
     for (trait_type.methods) |*method| {
         try validateTraitMethodSignature(diagnostics.allocator, active, module_id, module, method, trait_type.generic_params, span, &type_scope, diagnostics);
@@ -7153,29 +7253,23 @@ fn validateImplBlock(
         .generic_params = impl_block.generic_params,
         .where_predicates = impl_block.where_predicates,
     };
-    const target_type_name = try ownedTypeNameFromSyntax( diagnostics.allocator, impl_block.target_type_syntax);
+    const target_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, impl_block.target_type_syntax);
     defer diagnostics.allocator.free(target_type_name);
-    try validateTypeExpression(target_type_name, context, span, diagnostics);
+    try validateTypeSyntax(impl_block.target_type_syntax, context, span, diagnostics);
     const target_base = baseTypeName(target_type_name);
     if (target_base.len != 0 and findTypeAliasSourceItem(active, module_id, target_base) != null) {
         try diagnostics.add(.@"error", "type.alias.impl", span, "type alias '{s}' cannot own impls in v1", .{target_base});
     }
     if (impl_block.trait_syntax) |trait_syntax| {
-        const trait_name = try ownedTypeNameFromSyntax(diagnostics.allocator, trait_syntax);
-        defer diagnostics.allocator.free(trait_name);
-        try validateTypeExpression(trait_name, context, span, diagnostics);
+        try validateTypeSyntax(trait_syntax, context, span, diagnostics);
     } else if (impl_block.associated_types.len != 0) {
         try diagnostics.add(.@"error", "type.impl.associated_inherent", span, "inherent impls cannot bind associated types", .{});
     }
     for (impl_block.associated_types) |binding| {
-        const binding_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, binding.value_type_syntax);
-        defer diagnostics.allocator.free(binding_type_name);
-        try validateTypeExpression(binding_type_name, context, span, diagnostics);
+        try validateTypeSyntax(binding.value_type_syntax, context, span, diagnostics);
     }
     for (impl_block.associated_consts) |binding| {
-        const const_type_name = try ownedTypeNameFromSyntax(diagnostics.allocator, binding.const_data.type_syntax);
-        defer diagnostics.allocator.free(const_type_name);
-        try validateTypeExpression(const_type_name, context, span, diagnostics);
+        try validateTypeSyntax(binding.const_data.type_syntax, context, span, diagnostics);
     }
     try validateWherePredicates(active, module_id, module, impl_block.where_predicates, context, span, diagnostics);
 }
@@ -7213,23 +7307,19 @@ fn functionSignatureForItem(
     const parameters = try allocator.alloc(typed.Parameter, function.parameters.items.len);
     errdefer allocator.free(parameters);
     for (function.parameters.items, 0..) |parameter, index| {
-        const parameter_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
-        defer allocator.free(parameter_type_name);
         parameters[index] = .{
             .name = parameter.name,
             .mode = parameter.mode,
             .type_syntax = if (parameter.type_syntax) |syntax_value| try syntax_value.clone(allocator) else null,
             .ty = try duplicateTypeRefIfOwned(
                 allocator,
-                try resolveValueTypeWithContext(parameter_type_name, context, item.span, diagnostics),
+                try resolveValueTypeFromSyntaxOrRef(parameter.type_syntax, parameter.ty, context, item.span, diagnostics),
             ),
         };
     }
-    const return_type_name = try ownedTypeNameFromSyntaxOrRef(allocator, function.return_type_syntax, function.return_type);
-    defer allocator.free(return_type_name);
     const return_type = try duplicateTypeRefIfOwned(
         allocator,
-        try resolveValueTypeWithContext(return_type_name, context, item.span, diagnostics),
+        try resolveValueTypeFromSyntaxOrRef(function.return_type_syntax, function.return_type, context, item.span, diagnostics),
     );
     try validateWherePredicates(active, module_id, module, function.where_predicates, context, item.span, diagnostics);
 
@@ -7270,10 +7360,16 @@ fn structSignatureForItem(
     try validateWherePredicates(active, module_id, module, struct_type.where_predicates, context, span, diagnostics);
 
     const fields = try allocator.alloc(typed.StructField, struct_type.fields.len);
-    errdefer allocator.free(fields);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
     for (struct_type.fields, 0..) |field, index| {
-        fields[index] = field;
-        fields[index].ty = try resolveValueTypeWithContext(field.type_name, context, span, diagnostics);
+        fields[index] = try field.clone(allocator);
+        try validateTypeSyntax(field.type_syntax, context, span, diagnostics);
+        fields[index].ty = try resolveValueTypeSyntaxWithContext(field.type_syntax, context, span, diagnostics);
+        initialized += 1;
     }
 
     return .{
@@ -7302,10 +7398,16 @@ fn unionSignatureForItem(
         .type_scope = &type_scope,
     };
     const fields = try allocator.alloc(typed.StructField, union_type.fields.len);
-    errdefer allocator.free(fields);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
     for (union_type.fields, 0..) |field, index| {
-        fields[index] = field;
-        fields[index].ty = try resolveValueTypeWithContext(field.type_name, context, span, diagnostics);
+        fields[index] = try field.clone(allocator);
+        try validateTypeSyntax(field.type_syntax, context, span, diagnostics);
+        fields[index].ty = try resolveValueTypeSyntaxWithContext(field.type_syntax, context, span, diagnostics);
+        initialized += 1;
     }
     return .{ .fields = fields };
 }
@@ -7345,12 +7447,14 @@ fn enumSignatureForItem(
         variants[index] = .{
             .name = variant.name,
             .payload = .none,
-            .discriminant = variant.discriminant,
+            .discriminant_source = variant.discriminant_source,
+            .discriminant_syntax = if (variant.discriminant_syntax) |expr| try expr.clone(allocator) else null,
         };
         initialized += 1;
         switch (variant.payload) {
             .none => {
-                if (variant.discriminant) |discriminant| {
+                if (variant.discriminant_source) |discriminant_source| {
+                    const discriminant_syntax = variant.discriminant_syntax orelse continue;
                     var scope = ConstExprScope.init(allocator);
                     defer scope.deinit();
                     try seedConstExprScope(active, module_id, &scope, module);
@@ -7359,11 +7463,12 @@ fn enumSignatureForItem(
                         for (sites.items) |*site| site.deinit(allocator);
                         sites.deinit();
                     }
-                    try appendConstRequiredExprSite(
+                    try appendConstRequiredExprSiteFromSyntax(
                         allocator,
                         &sites,
                         .enum_discriminant,
-                        discriminant,
+                        discriminant_source.text,
+                        discriminant_syntax,
                         variant.name,
                         enumDiscriminantExpectedType(attributes),
                         &scope,
@@ -7378,17 +7483,31 @@ fn enumSignatureForItem(
             },
             .tuple_fields => |tuple_fields| {
                 const lowered = try allocator.alloc(typed.TupleField, tuple_fields.len);
+                var field_initialized: usize = 0;
+                errdefer {
+                    for (lowered[0..field_initialized]) |*field| field.deinit(allocator);
+                    allocator.free(lowered);
+                }
                 for (tuple_fields, 0..) |field, field_index| {
-                    lowered[field_index] = field;
-                    lowered[field_index].ty = try resolveValueTypeWithContext(field.type_name, context, span, diagnostics);
+                    lowered[field_index] = try field.clone(allocator);
+                    try validateTypeSyntax(field.type_syntax, context, span, diagnostics);
+                    lowered[field_index].ty = try resolveValueTypeSyntaxWithContext(field.type_syntax, context, span, diagnostics);
+                    field_initialized += 1;
                 }
                 variants[index].payload = .{ .tuple_fields = lowered };
             },
             .named_fields => |named_fields| {
                 const lowered = try allocator.alloc(typed.StructField, named_fields.len);
+                var field_initialized: usize = 0;
+                errdefer {
+                    for (lowered[0..field_initialized]) |*field| field.deinit(allocator);
+                    allocator.free(lowered);
+                }
                 for (named_fields, 0..) |field, field_index| {
-                    lowered[field_index] = field;
-                    lowered[field_index].ty = try resolveValueTypeWithContext(field.type_name, context, span, diagnostics);
+                    lowered[field_index] = try field.clone(allocator);
+                    try validateTypeSyntax(field.type_syntax, context, span, diagnostics);
+                    lowered[field_index].ty = try resolveValueTypeSyntaxWithContext(field.type_syntax, context, span, diagnostics);
+                    field_initialized += 1;
                 }
                 variants[index].payload = .{ .named_fields = lowered };
             },
@@ -7507,11 +7626,10 @@ fn typeAliasSignatureFromSyntax(
     try validateWherePredicates(active, module_id, module, where_predicates, context, span, diagnostics);
 
     const target_syntax = signature.target orelse return error.InvalidParse;
-    const target_type_name = try type_syntax_support.render(allocator, target_syntax);
-    defer allocator.free(target_type_name);
+    try validateTypeSyntax(target_syntax, context, span, diagnostics);
     const target_type = try duplicateTypeRefIfOwned(
         allocator,
-        try resolveValueTypeWithContext(target_type_name, context, span, diagnostics),
+        try resolveValueTypeSyntaxWithContext(target_syntax, context, span, diagnostics),
     );
     return .{
         .generic_params = generic_params,
@@ -7549,7 +7667,7 @@ fn structSignatureFromSyntax(
         .none => try allocator.alloc(typed.StructField, 0),
         else => return error.InvalidParse,
     };
-    errdefer allocator.free(fields);
+    errdefer typed.deinitStructFields(allocator, fields);
 
     var struct_type = typed.StructData{
         .generic_params = header.generic_params,
@@ -7791,19 +7909,17 @@ fn implSignatureForItem(
         .where_predicates = impl_block.where_predicates,
     };
 
-    const target_type_name = try ownedTypeNameFromSyntax(allocator, impl_block.target_type_syntax);
-    defer allocator.free(target_type_name);
+    try validateTypeSyntax(impl_block.target_type_syntax, context, span, diagnostics);
     const target_type = try duplicateTypeRefIfOwned(
         allocator,
-        try resolveValueTypeWithContext(target_type_name, context, span, diagnostics),
+        try resolveValueTypeSyntaxWithContext(impl_block.target_type_syntax, context, span, diagnostics),
     );
 
     const trait_type = if (impl_block.trait_syntax) |trait_syntax| blk: {
-        const trait_name = try ownedTypeNameFromSyntax(allocator, trait_syntax);
-        defer allocator.free(trait_name);
+        try validateTypeSyntax(trait_syntax, context, span, diagnostics);
         break :blk try duplicateTypeRefIfOwned(
             allocator,
-            try resolveValueTypeWithContext(trait_name, context, span, diagnostics),
+            try resolveValueTypeSyntaxWithContext(trait_syntax, context, span, diagnostics),
         );
     } else null;
 
@@ -7872,9 +7988,8 @@ fn constSignatureForItem(
         .type_scope = &type_scope,
         .generic_params = generic_params,
     };
-    const type_name = try type_syntax_support.render(allocator, const_item.type_syntax);
-    defer allocator.free(type_name);
-    const resolved_type_ref = try resolveValueTypeWithContext(type_name, context, span, diagnostics);
+    try validateTypeSyntax(const_item.type_syntax, context, span, diagnostics);
+    const resolved_type_ref = try resolveValueTypeSyntaxWithContext(const_item.type_syntax, context, span, diagnostics);
 
     var initializer_type_ref: types.TypeRef = .unsupported;
     if (const_item.initializer_syntax) |initializer_syntax| {

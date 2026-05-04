@@ -1,5 +1,6 @@
 const std = @import("std");
 const layout = @import("../layout/root.zig");
+const ast = @import("../ast/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const target = @import("../target/root.zig");
@@ -10,6 +11,7 @@ const array_list = std.array_list;
 pub const Resolvers = struct {
     canonical_key: *const fn (*session.Session, types.TypeKey) anyerror!types.CanonicalTypeId,
     canonical_type_expression: *const fn (*session.Session, session.ModuleId, []const u8) anyerror!types.CanonicalTypeId,
+    canonical_type_syntax: *const fn (*session.Session, session.ModuleId, ast.TypeSyntax) anyerror!types.CanonicalTypeId,
     checked_signature: *const fn (*session.Session, session.ItemId) anyerror!query_types.CheckedSignature,
     layout_for_key: *const fn (*session.Session, layout.LayoutKey) anyerror!layout.LayoutResult,
 };
@@ -181,7 +183,7 @@ fn layoutStruct(
     var offset: u64 = 0;
     var max_alignment: u32 = 1;
     for (struct_type.fields) |field| {
-        const field_type = try resolvers.canonical_type_expression(active, module_id, field.type_name);
+        const field_type = try resolvers.canonical_type_syntax(active, module_id, field.type_syntax);
         const field_layout = try layoutForType(active, key, field_type, resolvers);
         if (field_layout.status != .sized) {
             return layout.unsupportedResult(active.allocator, key, "struct field has no sized layout");
@@ -212,7 +214,7 @@ fn layoutUnion(
     var max_size: u64 = 0;
     var max_alignment: u32 = 1;
     for (union_type.fields) |field| {
-        const field_type = try resolvers.canonical_type_expression(active, module_id, field.type_name);
+        const field_type = try resolvers.canonical_type_syntax(active, module_id, field.type_syntax);
         const field_layout = try layoutForType(active, key, field_type, resolvers);
         if (field_layout.status != .sized) {
             return layout.unsupportedResult(active.allocator, key, "union field has no sized layout");
@@ -264,8 +266,8 @@ fn layoutEnum(
             .none => {},
             else => return layout.unsupportedResult(active.allocator, key, "enum payload layout is not implemented"),
         }
-        const tag_value = if (variant.discriminant) |discriminant|
-            std.fmt.parseInt(i128, std.mem.trim(u8, discriminant, " \t\r\n"), 10) catch return layout.unsupportedResult(active.allocator, key, "enum discriminant layout requires an integer literal")
+        const tag_value = if (variant.discriminant_source) |discriminant|
+            std.fmt.parseInt(i128, std.mem.trim(u8, discriminant.text, " \t\r\n"), 10) catch return layout.unsupportedResult(active.allocator, key, "enum discriminant layout requires an integer literal")
         else
             @as(i128, @intCast(index));
         try appendVariant(active.allocator, &variants, variant.name, tag_value);

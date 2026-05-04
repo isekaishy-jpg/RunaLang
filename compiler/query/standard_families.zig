@@ -1,6 +1,10 @@
 const std = @import("std");
-const typed_text = @import("text.zig");
+const session = @import("../session/root.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
+
+const option_source_path = "libraries/std/option/mod.rna";
+const result_source_path = "libraries/std/result/mod.rna";
 
 pub const Family = enum {
     option,
@@ -16,11 +20,11 @@ pub const Family = enum {
 
 pub const VariantInfo = struct {
     family: Family,
-    concrete_type_name: []const u8,
+    concrete_type: types.TypeRef,
     family_name: []const u8,
     variant_name: []const u8,
     tag: i32,
-    payload_type_name: ?[]const u8 = null,
+    payload_type: ?types.TypeRef = null,
     payload_field_name: ?[]const u8 = null,
 };
 
@@ -64,17 +68,52 @@ pub fn familyFromName(name: []const u8) ?Family {
     return null;
 }
 
+pub fn familyForCanonicalType(active: *const session.Session, type_id: types.CanonicalTypeId) ?Family {
+    if (type_id.index >= active.caches.canonical_types.items.len) return null;
+    return switch (active.caches.canonical_types.items[type_id.index].key) {
+        .option => .option,
+        .result => .result,
+        .nominal => |nominal| familyForItemId(active, .{ .index = nominal.item_index }),
+        else => null,
+    };
+}
+
+pub fn familyForResolvedBase(
+    active: *const session.Session,
+    resolved_base: ?types.CanonicalTypeId,
+    base_name: []const u8,
+) ?Family {
+    if (resolved_base) |base| {
+        if (base.index < active.caches.canonical_types.items.len and active.caches.canonical_types.items[base.index].key != .unsupported) {
+            return familyForCanonicalType(active, base);
+        }
+    }
+    return familyFromName(base_name);
+}
+
+pub fn familyForItemId(active: *const session.Session, item_id: session.ItemId) ?Family {
+    if (item_id.index >= active.semantic_index.items.items.len) return null;
+    const item = active.item(item_id);
+    if (item.category != .type_decl or item.kind != .enum_type) return null;
+    const module = active.module(active.semantic_index.itemEntry(item_id).module_id);
+    const file_path = active.pipeline.sources.get(module.file_id).path;
+    if (std.mem.eql(u8, item.name, "Option") and pathEndsWithNormalized(file_path, option_source_path)) return .option;
+    if (std.mem.eql(u8, item.name, "Result") and pathEndsWithNormalized(file_path, result_source_path)) return .result;
+    return null;
+}
+
+pub fn itemIdForName(active: *const session.Session, name: []const u8) ?session.ItemId {
+    const family = familyFromName(name) orelse return null;
+    return itemIdForFamily(active, family);
+}
+
 pub fn variantForExpected(
     allocator: std.mem.Allocator,
     expected_type: types.TypeRef,
     family_name: []const u8,
     variant_name: []const u8,
 ) !?VariantInfo {
-    const concrete_type_name = switch (expected_type) {
-        .named => |name| name,
-        else => return null,
-    };
-    return variantForConcrete(allocator, concrete_type_name, family_name, variant_name);
+    return variantForTypeRef(allocator, expected_type, family_name, variant_name);
 }
 
 pub fn variantForSubject(
@@ -83,66 +122,15 @@ pub fn variantForSubject(
     family_name: []const u8,
     variant_name: []const u8,
 ) !?VariantInfo {
-    return variantForExpected(allocator, subject_type, family_name, variant_name);
+    return variantForTypeRef(allocator, subject_type, family_name, variant_name);
 }
 
-pub fn variantForConcrete(
+pub fn helperVariantForTypeRef(
     allocator: std.mem.Allocator,
-    concrete_type_name: []const u8,
-    family_name: []const u8,
-    variant_name: []const u8,
-) !?VariantInfo {
-    const family = familyFromName(family_name) orelse return null;
-    const args = (try applicationArgs(allocator, concrete_type_name, family)) orelse return null;
-    defer allocator.free(args);
-
-    switch (family) {
-        .option => {
-            if (args.len != 1) return null;
-            if (std.mem.eql(u8, variant_name, "None")) return .{
-                .family = .option,
-                .concrete_type_name = concrete_type_name,
-                .family_name = family.name(),
-                .variant_name = "None",
-                .tag = 0,
-            };
-            if (std.mem.eql(u8, variant_name, "Some")) return .{
-                .family = .option,
-                .concrete_type_name = concrete_type_name,
-                .family_name = family.name(),
-                .variant_name = "Some",
-                .tag = 1,
-                .payload_type_name = args[0],
-                .payload_field_name = "value",
-            };
-        },
-        .result => {
-            if (args.len != 2) return null;
-            if (std.mem.eql(u8, variant_name, "Ok")) return .{
-                .family = .result,
-                .concrete_type_name = concrete_type_name,
-                .family_name = family.name(),
-                .variant_name = "Ok",
-                .tag = 0,
-                .payload_type_name = args[0],
-                .payload_field_name = "value",
-            };
-            if (std.mem.eql(u8, variant_name, "Err")) return .{
-                .family = .result,
-                .concrete_type_name = concrete_type_name,
-                .family_name = family.name(),
-                .variant_name = "Err",
-                .tag = 1,
-                .payload_type_name = args[1],
-                .payload_field_name = "error",
-            };
-        },
-    }
-    return null;
-}
-
-pub fn helperVariant(concrete_type_name: []const u8, method_name: []const u8) ?[]const u8 {
-    const family = familyFromName(typed_text.baseTypeName(concrete_type_name)) orelse return null;
+    concrete_type: types.TypeRef,
+    method_name: []const u8,
+) !?[]const u8 {
+    const family = familyForTypeRef(allocator, concrete_type) orelse return null;
     for (helper_surfaces) |surface| {
         if (surface.family == family and std.mem.eql(u8, surface.method_name, method_name)) {
             return surface.true_variant_name;
@@ -151,23 +139,12 @@ pub fn helperVariant(concrete_type_name: []const u8, method_name: []const u8) ?[
     return null;
 }
 
-pub fn typeRefFromName(raw: []const u8) types.TypeRef {
-    const name = std.mem.trim(u8, raw, " \t\r\n");
-    const builtin = types.Builtin.fromName(name);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = name };
-}
-
 pub fn typeRefIsApplicationOf(
     allocator: std.mem.Allocator,
     ty: types.TypeRef,
     family: Family,
 ) !bool {
-    const concrete_type_name = switch (ty) {
-        .named => |name| name,
-        else => return false,
-    };
-    const args = (try applicationArgs(allocator, concrete_type_name, family)) orelse return false;
+    const args = try applicationArgRefsForTypeRef(allocator, ty, family) orelse return false;
     defer allocator.free(args);
     return switch (family) {
         .option => args.len == 1,
@@ -181,19 +158,18 @@ pub fn resultTypeArgsMatch(
     ok: types.TypeRef,
     err: types.TypeRef,
 ) !bool {
-    const concrete_type_name = switch (ty) {
-        .named => |name| name,
-        else => return false,
-    };
-    const args = (try applicationArgs(allocator, concrete_type_name, .result)) orelse return false;
+    const args = try applicationArgRefsForTypeRef(allocator, ty, .result) orelse return false;
     defer allocator.free(args);
     if (args.len != 2) return false;
-    return typeRefFromName(args[0]).eql(ok) and typeRefFromName(args[1]).eql(err);
+    return args[0].eql(ok) and args[1].eql(err);
 }
 
-pub fn exhaustiveVariantNames(allocator: std.mem.Allocator, raw_type_name: []const u8) !?[]const []const u8 {
-    const family = familyFromName(typed_text.baseTypeName(raw_type_name)) orelse return null;
-    const args = (try applicationArgs(allocator, raw_type_name, family)) orelse return null;
+pub fn exhaustiveVariantNamesForTypeRef(
+    allocator: std.mem.Allocator,
+    ty: types.TypeRef,
+) !?[]const []const u8 {
+    const family = familyForTypeRef(allocator, ty) orelse return null;
+    const args = (try applicationArgRefsForTypeRef(allocator, ty, family)) orelse return null;
     defer allocator.free(args);
     return switch (family) {
         .option => if (args.len == 1) &[_][]const u8{ "None", "Some" } else null,
@@ -201,13 +177,97 @@ pub fn exhaustiveVariantNames(allocator: std.mem.Allocator, raw_type_name: []con
     };
 }
 
-pub fn applicationArgs(allocator: std.mem.Allocator, raw_type_name: []const u8, family: Family) !?[]const []const u8 {
-    const name = std.mem.trim(u8, raw_type_name, " \t\r\n");
-    const open_index = std.mem.indexOfScalar(u8, name, '[') orelse return null;
-    const close_index = typed_text.findMatchingDelimiter(name, open_index, '[', ']') orelse return null;
-    if (std.mem.trim(u8, name[close_index + 1 ..], " \t\r\n").len != 0) return null;
-    const base_name = std.mem.trim(u8, name[0..open_index], " \t\r\n");
-    if (!std.mem.eql(u8, base_name, family.name())) return null;
-    const args = try typed_text.splitTopLevelCommaParts(allocator, name[open_index + 1 .. close_index]);
-    return args;
+pub fn applicationArgRefsForFamily(
+    allocator: std.mem.Allocator,
+    ty: types.TypeRef,
+    family: Family,
+) !?[]types.TypeRef {
+    return try applicationArgRefsForTypeRef(allocator, ty, family);
+}
+
+fn variantForTypeRef(
+    allocator: std.mem.Allocator,
+    concrete_type: types.TypeRef,
+    family_name: []const u8,
+    variant_name: []const u8,
+) !?VariantInfo {
+    const family = familyFromName(family_name) orelse return null;
+    const args = (try applicationArgRefsForTypeRef(allocator, concrete_type, family)) orelse return null;
+    defer allocator.free(args);
+
+    switch (family) {
+        .option => {
+            if (args.len != 1) return null;
+            if (std.mem.eql(u8, variant_name, "None")) return .{
+                .family = .option,
+                .concrete_type = concrete_type,
+                .family_name = family.name(),
+                .variant_name = "None",
+                .tag = 0,
+            };
+            if (std.mem.eql(u8, variant_name, "Some")) return .{
+                .family = .option,
+                .concrete_type = concrete_type,
+                .family_name = family.name(),
+                .variant_name = "Some",
+                .tag = 1,
+                .payload_type = args[0],
+                .payload_field_name = "value",
+            };
+        },
+        .result => {
+            if (args.len != 2) return null;
+            if (std.mem.eql(u8, variant_name, "Ok")) return .{
+                .family = .result,
+                .concrete_type = concrete_type,
+                .family_name = family.name(),
+                .variant_name = "Ok",
+                .tag = 0,
+                .payload_type = args[0],
+                .payload_field_name = "value",
+            };
+            if (std.mem.eql(u8, variant_name, "Err")) return .{
+                .family = .result,
+                .concrete_type = concrete_type,
+                .family_name = family.name(),
+                .variant_name = "Err",
+                .tag = 1,
+                .payload_type = args[1],
+                .payload_field_name = "error",
+            };
+        },
+    }
+    return null;
+}
+
+fn familyForTypeRef(allocator: std.mem.Allocator, ty: types.TypeRef) ?Family {
+    const base = type_support.baseTypeNameFromTypeRef(allocator, ty) catch return null;
+    return familyFromName(base orelse return null);
+}
+
+fn applicationArgRefsForTypeRef(
+    allocator: std.mem.Allocator,
+    ty: types.TypeRef,
+    family: Family,
+) !?[]types.TypeRef {
+    return try type_support.applicationArgsFromTypeRef(allocator, ty, family.name());
+}
+
+fn itemIdForFamily(active: *const session.Session, family: Family) ?session.ItemId {
+    for (active.semantic_index.items.items, 0..) |_, index| {
+        const item_id: session.ItemId = .{ .index = index };
+        if (familyForItemId(active, item_id) == family) return item_id;
+    }
+    return null;
+}
+
+fn pathEndsWithNormalized(path: []const u8, suffix: []const u8) bool {
+    if (path.len < suffix.len) return false;
+    const tail = path[path.len - suffix.len ..];
+    for (tail, suffix) |lhs, rhs| {
+        const lhs_normalized: u8 = if (lhs == '\\') '/' else lhs;
+        const rhs_normalized: u8 = if (rhs == '\\') '/' else rhs;
+        if (lhs_normalized != rhs_normalized) return false;
+    }
+    return true;
 }

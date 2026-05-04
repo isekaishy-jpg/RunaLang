@@ -1,22 +1,16 @@
 const std = @import("std");
 const ast = @import("../ast/root.zig");
-const callable_types = @import("callable_types.zig");
 const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
-const raw_pointer = @import("../raw_pointer/root.zig");
 const session = @import("../session/root.zig");
 const typed = @import("../typed/root.zig");
 const boundary_checks = @import("boundary_checks.zig");
+const type_text_syntax = @import("../parse/type_text_syntax.zig");
+const type_forms = @import("type_forms.zig");
+const type_lowering = @import("type_lowering.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
 const type_support = @import("type_support.zig");
-const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
-
-const baseTypeName = typed_text.baseTypeName;
-const findMatchingDelimiter = typed_text.findMatchingDelimiter;
-const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
-const parseBoundaryType = type_support.parseBoundaryType;
-const parseCallableTypeName = callable_types.parseCallableTypeName;
 
 pub const SignatureResolver = *const fn (active: *session.Session, item_id: session.ItemId) anyerror!query_types.CheckedSignature;
 
@@ -48,6 +42,28 @@ pub fn satisfiesTraitWithResolver(
     return satisfiesTraitKeyWithResolver(active, key, where_predicates, signature_resolver);
 }
 
+fn satisfiesTraitForTypeRef(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    self_type: types.TypeRef,
+    trait_name: []const u8,
+    where_predicates: []const typed.WherePredicate,
+) !query_types.TraitGoalResult {
+    return satisfiesTraitForTypeRefWithResolver(active, module_id, self_type, trait_name, where_predicates, cachedSignatureResolver);
+}
+
+pub fn satisfiesTraitForTypeRefWithResolver(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    self_type: types.TypeRef,
+    trait_name: []const u8,
+    where_predicates: []const typed.WherePredicate,
+    signature_resolver: SignatureResolver,
+) !query_types.TraitGoalResult {
+    const key = try traitGoalKeyFromTypeRef(active, module_id, self_type, trait_name, where_predicates);
+    return satisfiesTraitKeyWithResolver(active, key, where_predicates, signature_resolver);
+}
+
 pub fn traitGoalKeyFromNames(
     active: *session.Session,
     module_id: session.ModuleId,
@@ -61,6 +77,24 @@ pub fn traitGoalKeyFromNames(
         .trait_head = try canonicalTraitHead(active, module_id, trait_name),
         .self_head = try canonicalTypeHead(active, module_id, trimmed_self, where_predicates),
         .self_type_symbol = try active.internName(trimmed_self),
+        .where_env_symbol = try canonicalWhereEnvironment(active, where_predicates),
+    };
+}
+
+pub fn traitGoalKeyFromTypeRef(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    self_type: types.TypeRef,
+    trait_name: []const u8,
+    where_predicates: []const typed.WherePredicate,
+) !query_types.TraitGoalKey {
+    const rendered_self = try type_support.renderTypeRef(active.allocator, self_type);
+    defer active.allocator.free(rendered_self);
+    return .{
+        .module_id = module_id,
+        .trait_head = try canonicalTraitHead(active, module_id, trait_name),
+        .self_head = try canonicalTypeHeadFromTypeRef(active, module_id, self_type, where_predicates),
+        .self_type_symbol = try active.internName(rendered_self),
         .where_env_symbol = try canonicalWhereEnvironment(active, where_predicates),
     };
 }
@@ -114,6 +148,16 @@ pub fn typeNameIsSendInEnvironment(
     return result.satisfied;
 }
 
+pub fn typeRefIsSendInEnvironment(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    ty: types.TypeRef,
+    where_predicates: []const typed.WherePredicate,
+) bool {
+    const result = satisfiesTraitForTypeRef(active, module_id, ty, "Send", where_predicates) catch return false;
+    return result.satisfied;
+}
+
 pub fn typeNameIsEqInEnvironment(
     active: *session.Session,
     module_id: session.ModuleId,
@@ -124,6 +168,16 @@ pub fn typeNameIsEqInEnvironment(
     return result.satisfied;
 }
 
+pub fn typeRefIsEqInEnvironment(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    ty: types.TypeRef,
+    where_predicates: []const typed.WherePredicate,
+) bool {
+    const result = satisfiesTraitForTypeRef(active, module_id, ty, "Eq", where_predicates) catch return false;
+    return result.satisfied;
+}
+
 pub fn typeNameIsHashInEnvironment(
     active: *session.Session,
     module_id: session.ModuleId,
@@ -131,6 +185,16 @@ pub fn typeNameIsHashInEnvironment(
     where_predicates: []const typed.WherePredicate,
 ) bool {
     const result = satisfiesTrait(active, module_id, raw_type_name, "Hash", where_predicates) catch return false;
+    return result.satisfied;
+}
+
+pub fn typeRefIsHashInEnvironment(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    ty: types.TypeRef,
+    where_predicates: []const typed.WherePredicate,
+) bool {
+    const result = satisfiesTraitForTypeRef(active, module_id, ty, "Hash", where_predicates) catch return false;
     return result.satisfied;
 }
 
@@ -222,9 +286,9 @@ pub fn validateImplContractsWithResolver(
             }
             continue;
         };
-        if (std.mem.eql(u8, baseTypeName(trait_type.displayName()), "Send")) continue;
+        if (std.mem.eql(u8, baseTypeNameOrRaw(type_support.typeRefRawName(trait_type)), "Send")) continue;
 
-        const trait_signature = (try traitSignatureByName(active, checked.module_id, trait_type.displayName(), signature_resolver)) orelse continue;
+        const trait_signature = (try traitSignatureByName(active, checked.module_id, type_support.typeRefRawName(trait_type), signature_resolver)) orelse continue;
         for (impl_signature.associated_types) |binding| {
             if (!traitHasAssociatedType(trait_signature, binding.name)) {
                 try diagnostics.add(
@@ -232,7 +296,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_unknown",
                     checked.item.span,
                     "trait '{s}' has no associated type '{s}'",
-                    .{ baseTypeName(trait_type.displayName()), binding.name },
+                    .{ baseTypeNameOrRaw(type_support.typeRefRawName(trait_type)), binding.name },
                 );
             }
         }
@@ -243,7 +307,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_const_unknown",
                     checked.item.span,
                     "trait '{s}' has no associated const '{s}'",
-                    .{ baseTypeName(trait_type.displayName()), binding.name },
+                    .{ baseTypeNameOrRaw(type_support.typeRefRawName(trait_type)), binding.name },
                 );
             }
         }
@@ -254,7 +318,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_missing",
                     checked.item.span,
                     "trait impl for '{s}' is missing associated type '{s}'",
-                    .{ impl_signature.target_type.displayName(), required.name },
+                    .{ type_support.typeRefRawName(impl_signature.target_type), required.name },
                 );
             }
         }
@@ -265,7 +329,7 @@ pub fn validateImplContractsWithResolver(
                     "type.impl.associated_const_missing",
                     checked.item.span,
                     "trait impl for '{s}' is missing associated const '{s}'",
-                    .{ impl_signature.target_type.displayName(), required.name },
+                    .{ type_support.typeRefRawName(impl_signature.target_type), required.name },
                 );
             }
         }
@@ -273,8 +337,8 @@ pub fn validateImplContractsWithResolver(
         _ = satisfiesTraitWithResolver(
             active,
             checked.module_id,
-            impl_signature.target_type.displayName(),
-            trait_type.displayName(),
+            type_support.typeRefRawName(impl_signature.target_type),
+            type_support.typeRefRawName(trait_type),
             impl_signature.where_predicates,
             signature_resolver,
         ) catch |err| switch (err) {
@@ -381,11 +445,11 @@ fn implIndex(
             .impl_block => |impl_signature| impl_signature,
             else => continue,
         };
-        const impl_trait = impl_signature.trait_type orelse continue;
+        const impl_trait_syntax = impl_signature.trait_syntax orelse continue;
         try entries.append(.{
             .module_id = checked.module_id,
-            .trait_head = try canonicalTraitHead(active, checked.module_id, impl_trait.displayName()),
-            .self_head = try canonicalTypeHead(active, checked.module_id, impl_signature.target_type.displayName(), impl_signature.where_predicates),
+            .trait_head = try canonicalTraitHeadFromSyntax(active, checked.module_id, impl_trait_syntax),
+            .self_head = try canonicalTypeHeadFromSyntax(active, checked.module_id, impl_signature.target_type_syntax, impl_signature.where_predicates),
             .impl_id = .{ .index = index },
         });
     }
@@ -474,8 +538,8 @@ fn findSelectedImplSignatureAt(
         .impl_block => |impl_signature| impl_signature,
         else => return null,
     };
-    const impl_trait = impl_signature.trait_type orelse return null;
-    if (!traitHeadsEqual(try canonicalTraitHead(active, checked.module_id, impl_trait.displayName()), key.trait_head)) return null;
+    const impl_trait_syntax = impl_signature.trait_syntax orelse return null;
+    if (!traitHeadsEqual(try canonicalTraitHeadFromSyntax(active, checked.module_id, impl_trait_syntax), key.trait_head)) return null;
     if (!try implTargetMatchesGoal(active, checked.module_id, impl_signature, key)) return null;
     if (!implWherePredicatesSatisfied(active, checked.module_id, impl_signature, key, signature_resolver)) return null;
     return impl_signature;
@@ -501,7 +565,7 @@ fn implTargetMatchesGoal(
     impl_signature: query_types.ImplSignature,
     key: query_types.TraitGoalKey,
 ) !bool {
-    const impl_self_head = try canonicalTypeHead(active, module_id, impl_signature.target_type.displayName(), impl_signature.where_predicates);
+    const impl_self_head = try canonicalTypeHeadFromSyntax(active, module_id, impl_signature.target_type_syntax, impl_signature.where_predicates);
     if (!typeHeadsEqual(impl_self_head, key.self_head) and implTargetGenericName(impl_signature) == null) return false;
 
     var arena = std.heap.ArenaAllocator.init(active.allocator);
@@ -509,7 +573,7 @@ fn implTargetMatchesGoal(
     var substitutions = std.array_list.Managed(TypeSubstitution).init(arena.allocator());
     return matchTypePattern(
         arena.allocator(),
-        impl_signature.target_type.displayName(),
+        type_support.typeRefRawName(impl_signature.target_type),
         keySelfTypeName(active, key),
         impl_signature.generic_params,
         &substitutions,
@@ -533,19 +597,23 @@ fn implWherePredicatesSatisfied(
         switch (predicate) {
             .bound => |bound| {
                 const subject_name = substituteTypeName(arena.allocator(), bound.subject_name, substitutions.items) catch return false;
-                if (whereEnvironmentHasBound(caller_predicates, subject_name, bound.contract_name)) continue;
+                if (whereEnvironmentHasBound(active, module_id, caller_predicates, subject_name, bound.contract_type_syntax)) continue;
                 if (boundPredicateMatchesGoal(active, module_id, .{
                     .subject_name = subject_name,
-                    .contract_name = bound.contract_name,
+                    .contract_type_syntax = bound.contract_type_syntax,
                 }, caller_predicates, caller_key)) {
                     reportTraitCycle(active, caller_key) catch {};
                     return false;
                 }
-                const result = satisfiesTraitWithResolver(
+                const result = satisfiesTraitKeyWithResolver(
                     active,
-                    module_id,
-                    subject_name,
-                    bound.contract_name,
+                    .{
+                        .module_id = module_id,
+                        .trait_head = canonicalTraitHeadFromSyntax(active, module_id, bound.contract_type_syntax) catch return false,
+                        .self_head = canonicalTypeHead(active, module_id, subject_name, caller_predicates) catch return false,
+                        .self_type_symbol = active.internName(std.mem.trim(u8, subject_name, " \t")) catch return false,
+                        .where_env_symbol = canonicalWhereEnvironment(active, caller_predicates) catch return false,
+                    },
                     caller_predicates,
                     signature_resolver,
                 ) catch return false;
@@ -567,7 +635,7 @@ fn implWherePredicatesSatisfied(
 }
 
 fn implTargetGenericName(impl_signature: query_types.ImplSignature) ?[]const u8 {
-    const target = baseTypeName(impl_signature.target_type.displayName());
+    const target = baseNameFromSyntax(impl_signature.target_type_syntax) orelse baseTypeNameOrRaw(type_support.typeRefRawName(impl_signature.target_type));
     if (target.len == 0) return null;
     for (impl_signature.generic_params) |param| {
         if (param.kind != .type_param) continue;
@@ -589,7 +657,7 @@ fn collectTypeSubstitutions(
 ) !void {
     _ = try matchTypePattern(
         allocator,
-        impl_signature.target_type.displayName(),
+        type_support.typeRefRawName(impl_signature.target_type),
         concrete_self,
         impl_signature.generic_params,
         substitutions,
@@ -613,7 +681,7 @@ fn matchTypePattern(
     const concrete_args = try typeApplicationArgs(allocator, concrete_trimmed);
     if (pattern_args) |p_args| {
         const c_args = concrete_args orelse return false;
-        if (!std.mem.eql(u8, baseTypeName(pattern_trimmed), baseTypeName(concrete_trimmed))) return false;
+        if (!std.mem.eql(u8, baseTypeNameOrRaw(pattern_trimmed), baseTypeNameOrRaw(concrete_trimmed))) return false;
         if (p_args.len != c_args.len) return false;
         for (p_args, c_args) |pattern_arg, concrete_arg| {
             if (!try matchTypePattern(allocator, pattern_arg, concrete_arg, generic_params, substitutions)) return false;
@@ -666,7 +734,7 @@ fn substituteTypeName(
     if (!changed) return raw_name;
 
     var rendered = std.array_list.Managed(u8).init(allocator);
-    try rendered.appendSlice(baseTypeName(trimmed));
+    try rendered.appendSlice(baseTypeNameOrRaw(trimmed));
     try rendered.append('[');
     for (rendered_args.items, 0..) |arg, index| {
         if (index != 0) try rendered.appendSlice(", ");
@@ -683,11 +751,42 @@ fn substitutionFor(substitutions: []const TypeSubstitution, name: []const u8) ?[
     return null;
 }
 
+fn baseTypeNameOrRaw(raw: []const u8) []const u8 {
+    const ty = typeRefFromName(raw);
+    const base = type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, ty) catch null;
+    return base orelse std.mem.trim(u8, raw, " \t\r\n");
+}
+
+fn baseNameFromSyntax(syntax_value: ast.TypeSyntax) ?[]const u8 {
+    var view = type_forms.View.fromSyntax(std.heap.page_allocator, syntax_value) catch return null;
+    defer view.deinit();
+    return type_forms.baseName(view);
+}
+
 fn typeApplicationArgs(allocator: std.mem.Allocator, raw_name: []const u8) !?[][]const u8 {
-    const open_index = std.mem.indexOfScalar(u8, raw_name, '[') orelse return null;
-    const close_index = findMatchingDelimiter(raw_name, open_index, '[', ']') orelse return null;
-    if (std.mem.trim(u8, raw_name[close_index + 1 ..], " \t").len != 0) return null;
-    return try typed_text.splitTopLevelCommaParts(allocator, raw_name[open_index + 1 .. close_index]);
+    const ty = try typeRefFromStandaloneTypeText(allocator, raw_name);
+    const base_name = try type_support.baseTypeNameFromTypeRef(allocator, ty) orelse return null;
+    const refs = try type_support.applicationArgsFromTypeRef(allocator, ty, base_name) orelse return null;
+    defer allocator.free(refs);
+    const rendered = try allocator.alloc([]const u8, refs.len);
+    for (refs, 0..) |arg, index| rendered[index] = type_support.typeRefRawName(arg);
+    return rendered;
+}
+
+fn typeRefFromName(raw: []const u8) types.TypeRef {
+    return typeRefFromStandaloneTypeText(std.heap.page_allocator, raw) catch .unsupported;
+}
+
+fn typeRefFromStandaloneTypeText(allocator: std.mem.Allocator, raw: []const u8) !types.TypeRef {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .unsupported;
+    var syntax_value = (try type_text_syntax.lowerStandalone(allocator, trimmed)) orelse return .unsupported;
+    defer syntax_value.deinit(allocator);
+    return type_lowering.typeRefFromSyntax(allocator, syntax_value);
+}
+
+fn tryTypeTupleParts(active: *session.Session, ty: types.TypeRef) ?[]types.TypeRef {
+    return type_support.tupleElementTypes(active.allocator, ty) catch null;
 }
 
 fn genericTypeParamExists(generic_params: []const typed.GenericParam, name: []const u8) bool {
@@ -707,7 +806,7 @@ fn whereEnvironmentSatisfies(active: *session.Session, key: query_types.TraitGoa
         switch (predicate) {
             .bound => |bound| {
                 if (!typeHeadsEqual(canonicalTypeHead(active, key.module_id, bound.subject_name, predicates) catch return false, key.self_head)) continue;
-                if (traitHeadsEqual(canonicalTraitHead(active, key.module_id, bound.contract_name) catch return false, key.trait_head)) return true;
+                if (traitHeadsEqual(canonicalTraitHeadFromSyntax(active, key.module_id, bound.contract_type_syntax) catch return false, key.trait_head)) return true;
             },
             else => {},
         }
@@ -722,7 +821,7 @@ fn boundPredicateMatchesGoal(
     predicates: []const typed.WherePredicate,
     key: query_types.TraitGoalKey,
 ) bool {
-    const trait_head = canonicalTraitHead(active, module_id, bound.contract_name) catch return false;
+    const trait_head = canonicalTraitHeadFromSyntax(active, module_id, bound.contract_type_syntax) catch return false;
     if (!traitHeadsEqual(trait_head, key.trait_head)) return false;
     const self_head = canonicalTypeHead(active, module_id, bound.subject_name, predicates) catch return false;
     if (!typeHeadsEqual(self_head, key.self_head)) return false;
@@ -732,44 +831,36 @@ fn boundPredicateMatchesGoal(
 fn solveBuiltinSend(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8, signature_resolver: SignatureResolver) bool {
     var visiting = std.array_list.Managed([]const u8).init(active.allocator);
     defer visiting.deinit();
-    return solveBuiltinSendInner(active, module_id, raw_type_name, &visiting, signature_resolver);
+    return solveBuiltinSendInner(active, module_id, typeRefFromName(raw_type_name), &visiting, signature_resolver);
 }
 
 fn solveBuiltinSendInner(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    ty: types.TypeRef,
     visiting: *std.array_list.Managed([]const u8),
     signature_resolver: SignatureResolver,
 ) bool {
-    const boundary = parseBoundaryType(raw_type_name);
+    const boundary = type_support.boundaryFromTypeRef(ty);
     if (boundary.kind != .value) return false;
 
-    const trimmed = std.mem.trim(u8, boundary.inner_type_name, " \t");
+    const trimmed = type_support.typeRefRawName(boundary.inner_type);
     if (trimmed.len == 0) return false;
-    if ((parseCallableTypeName(trimmed, active.allocator) catch null) != null) return true;
-
-    if (std.mem.startsWith(u8, trimmed, "(") and std.mem.endsWith(u8, trimmed, ")")) {
-        const inner = trimmed[1 .. trimmed.len - 1];
-        const parts = typed_text.splitTopLevelCommaParts(active.allocator, inner) catch return false;
+    if ((type_support.callableFromTypeRef(active.allocator, ty) catch null) != null) return true;
+    if (tryTypeTupleParts(active, ty)) |parts| {
         defer active.allocator.free(parts);
         for (parts) |part| {
             if (!solveBuiltinSendInner(active, module_id, part, visiting, signature_resolver)) return false;
         }
         return true;
     }
-
-    if (std.mem.startsWith(u8, trimmed, "[")) {
-        const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse return false;
-        if (close_index + 1 != trimmed.len) return false;
-        const inner = trimmed[1..close_index];
-        const separator = findTopLevelHeaderScalar(inner, ';') orelse return false;
-        return solveBuiltinSendInner(active, module_id, std.mem.trim(u8, inner[0..separator], " \t"), visiting, signature_resolver);
+    if (type_support.fixedArrayElementType(active.allocator, ty) catch null) |element_type| {
+        return solveBuiltinSendInner(active, module_id, element_type, visiting, signature_resolver);
     }
 
-    if (isKnownStandardSendFamily(active, module_id, trimmed, visiting, signature_resolver)) return true;
+    if (isKnownStandardSendFamily(active, module_id, ty, visiting, signature_resolver)) return true;
 
-    const base_name = baseTypeName(trimmed);
+    const base_name = (type_support.baseTypeNameFromTypeRef(active.allocator, ty) catch trimmed) orelse trimmed;
     const builtin = types.Builtin.fromName(base_name);
     if (builtin != .unsupported) return true;
     if (types.CAbiAlias.fromName(base_name)) |alias| return alias != .c_void;
@@ -790,7 +881,7 @@ fn solveBuiltinSendInner(
     return switch (checked.facts) {
         .struct_type => |struct_type| blk: {
             for (struct_type.fields) |field| {
-                if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting, signature_resolver)) break :blk false;
+                if (!solveBuiltinSendInner(active, module_id, field.ty, visiting, signature_resolver)) break :blk false;
             }
             break :blk true;
         },
@@ -799,16 +890,16 @@ fn solveBuiltinSendInner(
                 switch (variant.payload) {
                     .none => {},
                     .tuple_fields => |fields| for (fields) |field| {
-                        if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting, signature_resolver)) break :blk false;
+                        if (!solveBuiltinSendInner(active, module_id, field.ty, visiting, signature_resolver)) break :blk false;
                     },
                     .named_fields => |fields| for (fields) |field| {
-                        if (!solveBuiltinSendInner(active, module_id, field.type_name, visiting, signature_resolver)) break :blk false;
+                        if (!solveBuiltinSendInner(active, module_id, field.ty, visiting, signature_resolver)) break :blk false;
                     },
                 }
             }
             break :blk true;
         },
-        .type_alias => |alias| solveBuiltinSendInner(active, checked.module_id, alias.target_type.displayName(), visiting, signature_resolver),
+        .type_alias => |alias| solveBuiltinSendInner(active, checked.module_id, alias.target_type, visiting, signature_resolver),
         .opaque_type, .union_type, .function, .const_item, .trait_type, .impl_block, .none => false,
     };
 }
@@ -816,13 +907,13 @@ fn solveBuiltinSendInner(
 fn solveBuiltinEq(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8, signature_resolver: SignatureResolver) bool {
     var visiting = std.array_list.Managed([]const u8).init(active.allocator);
     defer visiting.deinit();
-    return solveBuiltinEqHashInner(active, module_id, raw_type_name, .eq, &visiting, signature_resolver);
+    return solveBuiltinEqHashInner(active, module_id, typeRefFromName(raw_type_name), .eq, &visiting, signature_resolver);
 }
 
 fn solveBuiltinHash(active: *session.Session, module_id: session.ModuleId, raw_type_name: []const u8, signature_resolver: SignatureResolver) bool {
     var visiting = std.array_list.Managed([]const u8).init(active.allocator);
     defer visiting.deinit();
-    return solveBuiltinEqHashInner(active, module_id, raw_type_name, .hash, &visiting, signature_resolver);
+    return solveBuiltinEqHashInner(active, module_id, typeRefFromName(raw_type_name), .hash, &visiting, signature_resolver);
 }
 
 const EqHashContract = enum {
@@ -833,40 +924,32 @@ const EqHashContract = enum {
 fn solveBuiltinEqHashInner(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    ty: types.TypeRef,
     contract: EqHashContract,
     visiting: *std.array_list.Managed([]const u8),
     signature_resolver: SignatureResolver,
 ) bool {
-    const boundary = parseBoundaryType(raw_type_name);
+    const boundary = type_support.boundaryFromTypeRef(ty);
     if (boundary.kind != .value) return false;
 
-    const trimmed = std.mem.trim(u8, boundary.inner_type_name, " \t");
+    const trimmed = type_support.typeRefRawName(boundary.inner_type);
     if (trimmed.len == 0) return false;
-    if ((parseCallableTypeName(trimmed, active.allocator) catch null) != null) return true;
-    if (raw_pointer.parse(trimmed) != null) return true;
-
-    if (std.mem.startsWith(u8, trimmed, "(") and std.mem.endsWith(u8, trimmed, ")")) {
-        const inner = trimmed[1 .. trimmed.len - 1];
-        const parts = typed_text.splitTopLevelCommaParts(active.allocator, inner) catch return false;
+    if ((type_support.callableFromTypeRef(active.allocator, ty) catch null) != null) return true;
+    if ((type_support.rawPointerFromTypeRef(active.allocator, ty) catch null) != null) return true;
+    if (tryTypeTupleParts(active, ty)) |parts| {
         defer active.allocator.free(parts);
         for (parts) |part| {
             if (!solveBuiltinEqHashInner(active, module_id, part, contract, visiting, signature_resolver)) return false;
         }
         return true;
     }
-
-    if (std.mem.startsWith(u8, trimmed, "[")) {
-        const close_index = findMatchingDelimiter(trimmed, 0, '[', ']') orelse return false;
-        if (close_index + 1 != trimmed.len) return false;
-        const inner = trimmed[1..close_index];
-        const separator = findTopLevelHeaderScalar(inner, ';') orelse return false;
-        return solveBuiltinEqHashInner(active, module_id, std.mem.trim(u8, inner[0..separator], " \t"), contract, visiting, signature_resolver);
+    if (type_support.fixedArrayElementType(active.allocator, ty) catch null) |element_type| {
+        return solveBuiltinEqHashInner(active, module_id, element_type, contract, visiting, signature_resolver);
     }
 
-    if (isKnownStandardEqHashFamily(active, module_id, trimmed, contract, visiting, signature_resolver)) return true;
+    if (isKnownStandardEqHashFamily(active, module_id, ty, contract, visiting, signature_resolver)) return true;
 
-    const base_name = baseTypeName(trimmed);
+    const base_name = (type_support.baseTypeNameFromTypeRef(active.allocator, ty) catch trimmed) orelse trimmed;
     const builtin = types.Builtin.fromName(base_name);
     if (builtinEqHashSatisfies(builtin)) return true;
     if (types.CAbiAlias.fromName(base_name)) |alias| return alias != .c_void;
@@ -886,7 +969,7 @@ fn solveBuiltinEqHashInner(
     const item_id = resolveItemByName(active, module_id, base_name) orelse return false;
     const checked = signature_resolver(active, item_id) catch return false;
     return switch (checked.facts) {
-        .type_alias => |alias| solveBuiltinEqHashInner(active, checked.module_id, alias.target_type.displayName(), contract, visiting, signature_resolver),
+        .type_alias => |alias| solveBuiltinEqHashInner(active, checked.module_id, alias.target_type, contract, visiting, signature_resolver),
         else => false,
     };
 }
@@ -901,25 +984,22 @@ fn builtinEqHashSatisfies(builtin: types.Builtin) bool {
 fn isKnownStandardEqHashFamily(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    ty: types.TypeRef,
     contract: EqHashContract,
     visiting: *std.array_list.Managed([]const u8),
     signature_resolver: SignatureResolver,
 ) bool {
-    const base_name = baseTypeName(raw_type_name);
-    const open_index = std.mem.indexOfScalar(u8, raw_type_name, '[') orelse return false;
-    const close_index = findMatchingDelimiter(raw_type_name, open_index, '[', ']') orelse return false;
-    if (close_index + 1 != raw_type_name.len) return false;
-    const parts = typed_text.splitTopLevelCommaParts(active.allocator, raw_type_name[open_index + 1 .. close_index]) catch return false;
-    defer active.allocator.free(parts);
+    const base_name = (type_support.baseTypeNameFromTypeRef(active.allocator, ty) catch return false) orelse return false;
+    const refs = (type_support.applicationArgsFromTypeRef(active.allocator, ty, base_name) catch return false) orelse return false;
+    defer active.allocator.free(refs);
 
     if (std.mem.eql(u8, base_name, "Option")) {
-        return parts.len == 1 and solveBuiltinEqHashInner(active, module_id, parts[0], contract, visiting, signature_resolver);
+        return refs.len == 1 and solveBuiltinEqHashInner(active, module_id, refs[0], contract, visiting, signature_resolver);
     }
     if (std.mem.eql(u8, base_name, "Result")) {
-        return parts.len == 2 and
-            solveBuiltinEqHashInner(active, module_id, parts[0], contract, visiting, signature_resolver) and
-            solveBuiltinEqHashInner(active, module_id, parts[1], contract, visiting, signature_resolver);
+        return refs.len == 2 and
+            solveBuiltinEqHashInner(active, module_id, refs[0], contract, visiting, signature_resolver) and
+            solveBuiltinEqHashInner(active, module_id, refs[1], contract, visiting, signature_resolver);
     }
     return false;
 }
@@ -927,11 +1007,11 @@ fn isKnownStandardEqHashFamily(
 fn isKnownStandardSendFamily(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    ty: types.TypeRef,
     visiting: *std.array_list.Managed([]const u8),
     signature_resolver: SignatureResolver,
 ) bool {
-    const base_name = baseTypeName(raw_type_name);
+    const base_name = (type_support.baseTypeNameFromTypeRef(active.allocator, ty) catch return false) orelse return false;
     if (std.mem.eql(u8, base_name, "Str") or
         std.mem.eql(u8, base_name, "Bytes") or
         std.mem.eql(u8, base_name, "ByteBuffer") or
@@ -941,19 +1021,16 @@ fn isKnownStandardSendFamily(
         return true;
     }
 
-    const open_index = std.mem.indexOfScalar(u8, raw_type_name, '[') orelse return false;
-    const close_index = findMatchingDelimiter(raw_type_name, open_index, '[', ']') orelse return false;
-    if (close_index + 1 != raw_type_name.len) return false;
-    const parts = typed_text.splitTopLevelCommaParts(active.allocator, raw_type_name[open_index + 1 .. close_index]) catch return false;
-    defer active.allocator.free(parts);
+    const refs = (type_support.applicationArgsFromTypeRef(active.allocator, ty, base_name) catch return false) orelse return false;
+    defer active.allocator.free(refs);
 
     if (std.mem.eql(u8, base_name, "Option") or std.mem.eql(u8, base_name, "List")) {
-        return parts.len == 1 and solveBuiltinSendInner(active, module_id, parts[0], visiting, signature_resolver);
+        return refs.len == 1 and solveBuiltinSendInner(active, module_id, refs[0], visiting, signature_resolver);
     }
     if (std.mem.eql(u8, base_name, "Result") or std.mem.eql(u8, base_name, "Map")) {
-        return parts.len == 2 and
-            solveBuiltinSendInner(active, module_id, parts[0], visiting, signature_resolver) and
-            solveBuiltinSendInner(active, module_id, parts[1], visiting, signature_resolver);
+        return refs.len == 2 and
+            solveBuiltinSendInner(active, module_id, refs[0], visiting, signature_resolver) and
+            solveBuiltinSendInner(active, module_id, refs[1], visiting, signature_resolver);
     }
     return false;
 }
@@ -972,7 +1049,10 @@ fn canonicalWhereEnvironment(active: *session.Session, predicates: []const typed
             .bound => |bound| try std.fmt.allocPrint(
                 active.allocator,
                 "B:{s}:{s}",
-                .{ std.mem.trim(u8, bound.subject_name, " \t"), baseTypeName(bound.contract_name) },
+                .{
+                    std.mem.trim(u8, bound.subject_name, " \t"),
+                    baseNameFromSyntax(bound.contract_type_syntax) orelse bound.contract_type_syntax.text(),
+                },
             ),
             .projection_equality => |projection| blk: {
                 const projection_value_type_name = try projectionValueTypeName(active.allocator, projection);
@@ -1090,7 +1170,20 @@ pub fn canonicalTraitHead(
     module_id: session.ModuleId,
     raw_trait_name: []const u8,
 ) !query_types.CanonicalTraitHead {
-    const name = baseTypeName(raw_trait_name);
+    const name = baseTypeNameOrRaw(raw_trait_name);
+    if (std.mem.eql(u8, name, "Send")) return .builtin_send;
+    if (std.mem.eql(u8, name, "Eq")) return .builtin_eq;
+    if (std.mem.eql(u8, name, "Hash")) return .builtin_hash;
+    if (findTraitIdByName(active, module_id, name)) |trait_id| return .{ .trait_item = trait_id };
+    return .{ .opaque_name = try active.internName(name) };
+}
+
+pub fn canonicalTraitHeadFromSyntax(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    syntax_value: ast.TypeSyntax,
+) !query_types.CanonicalTraitHead {
+    const name = baseNameFromSyntax(syntax_value) orelse return canonicalTraitHead(active, module_id, syntax_value.text());
     if (std.mem.eql(u8, name, "Send")) return .builtin_send;
     if (std.mem.eql(u8, name, "Eq")) return .builtin_eq;
     if (std.mem.eql(u8, name, "Hash")) return .builtin_hash;
@@ -1104,12 +1197,40 @@ pub fn canonicalTypeHead(
     raw_type_name: []const u8,
     where_predicates: []const typed.WherePredicate,
 ) !query_types.CanonicalTypeHead {
-    const name = baseTypeName(raw_type_name);
+    const name = baseTypeNameOrRaw(raw_type_name);
     const builtin = types.Builtin.fromName(name);
     if (builtin != .unsupported) return .{ .builtin = builtin };
     if (whereEnvironmentMentionsSubject(where_predicates, name)) return .{ .generic_param = try active.internName(name) };
     if (resolveItemByName(active, module_id, name)) |item_id| return .{ .item = item_id };
     return .{ .opaque_name = try active.internName(name) };
+}
+
+pub fn canonicalTypeHeadFromSyntax(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    syntax_value: ast.TypeSyntax,
+    where_predicates: []const typed.WherePredicate,
+) !query_types.CanonicalTypeHead {
+    const name = baseNameFromSyntax(syntax_value) orelse return canonicalTypeHead(active, module_id, syntax_value.text(), where_predicates);
+    const builtin = types.Builtin.fromName(name);
+    if (builtin != .unsupported) return .{ .builtin = builtin };
+    if (whereEnvironmentMentionsSubject(where_predicates, name)) return .{ .generic_param = try active.internName(name) };
+    if (resolveItemByName(active, module_id, name)) |item_id| return .{ .item = item_id };
+    return .{ .opaque_name = try active.internName(name) };
+}
+
+pub fn canonicalTypeHeadFromTypeRef(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    ty: types.TypeRef,
+    where_predicates: []const typed.WherePredicate,
+) !query_types.CanonicalTypeHead {
+    if (try type_lowering.clonedSyntaxForTypeRef(active.allocator, ty)) |syntax_value| {
+        var owned = syntax_value;
+        defer owned.deinit(active.allocator);
+        return canonicalTypeHeadFromSyntax(active, module_id, owned, where_predicates);
+    }
+    return canonicalTypeHead(active, module_id, type_support.typeRefRawName(ty), where_predicates);
 }
 
 fn findTraitIdByName(active: *session.Session, module_id: session.ModuleId, name: []const u8) ?session.TraitId {
@@ -1225,12 +1346,19 @@ fn whereEnvironmentMentionsSubject(predicates: []const typed.WherePredicate, sub
     return false;
 }
 
-fn whereEnvironmentHasBound(predicates: []const typed.WherePredicate, subject_name: []const u8, contract_name: []const u8) bool {
+fn whereEnvironmentHasBound(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    predicates: []const typed.WherePredicate,
+    subject_name: []const u8,
+    contract_syntax: ast.TypeSyntax,
+) bool {
+    const contract_head = canonicalTraitHeadFromSyntax(active, module_id, contract_syntax) catch return false;
     for (predicates) |predicate| {
         switch (predicate) {
             .bound => |bound| {
                 if (std.mem.eql(u8, bound.subject_name, subject_name) and
-                    std.mem.eql(u8, baseTypeName(bound.contract_name), baseTypeName(contract_name))) return true;
+                    traitHeadsEqual(canonicalTraitHeadFromSyntax(active, module_id, bound.contract_type_syntax) catch return false, contract_head)) return true;
             },
             else => {},
         }

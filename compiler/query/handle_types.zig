@@ -2,8 +2,6 @@ const std = @import("std");
 const boundary_checks = @import("boundary_checks.zig");
 const session = @import("../session/root.zig");
 const standard_families = @import("standard_families.zig");
-const typed_text = @import("text.zig");
-const tuple_types = @import("tuple_types.zig");
 const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 
@@ -29,63 +27,41 @@ fn typeRefContainsHandleFamilyInner(
     signature_resolver: anytype,
     visited: *std.AutoHashMap(usize, void),
 ) anyerror!bool {
-    return switch (ty) {
-        .builtin, .unsupported => false,
-        .named => |name| typeNameContainsHandleFamily(active, module_id, name, signature_resolver, visited),
-    };
-}
-
-fn typeNameContainsHandleFamily(
-    active: *session.Session,
-    module_id: session.ModuleId,
-    raw_name: []const u8,
-    signature_resolver: anytype,
-    visited: *std.AutoHashMap(usize, void),
-) anyerror!bool {
-    const name = std.mem.trim(u8, raw_name, " \t\r\n");
-    if (name.len == 0) return false;
-
-    const boundary = type_support.parseBoundaryType(name);
+    const boundary = type_support.boundaryFromTypeRef(ty);
     if (boundary.isBoundary()) return false;
 
-    if (std.mem.startsWith(u8, name, "[")) {
-        const close_index = typed_text.findMatchingDelimiter(name, 0, '[', ']') orelse return false;
-        if (std.mem.trim(u8, name[close_index + 1 ..], " \t\r\n").len != 0) return false;
-        const inner = name[1..close_index];
-        const separator = typed_text.findTopLevelHeaderScalar(inner, ';') orelse return false;
-        const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
-        return typeNameContainsHandleFamily(active, module_id, element_name, signature_resolver, visited);
+    if (try type_support.fixedArrayElementType(active.allocator, ty)) |element_type| {
+        return typeRefContainsHandleFamilyInner(active, module_id, element_type, signature_resolver, visited);
     }
 
-    if (std.mem.startsWith(u8, name, "(")) {
-        const parts = (try tuple_types.splitTypeParts(active.allocator, name)) orelse return false;
+    if (try type_support.tupleElementTypes(active.allocator, ty)) |parts| {
         defer active.allocator.free(parts);
-        if (!tuple_types.validTupleParts(parts)) return false;
         for (parts) |part| {
-            if (try typeNameContainsHandleFamily(active, module_id, part, signature_resolver, visited)) return true;
+            if (try typeRefContainsHandleFamilyInner(active, module_id, part, signature_resolver, visited)) return true;
         }
         return false;
     }
 
-    if (std.mem.startsWith(u8, name, "*read ") or std.mem.startsWith(u8, name, "*edit ")) return false;
+    if ((try type_support.rawPointerFromTypeRef(active.allocator, ty)) != null) return false;
 
-    if (try standard_families.applicationArgs(active.allocator, name, .option)) |args| {
+    if (try standard_families.applicationArgRefsForFamily(active.allocator, ty, .option)) |args| {
         defer active.allocator.free(args);
         for (args) |arg| {
-            if (try typeNameContainsHandleFamily(active, module_id, arg, signature_resolver, visited)) return true;
+            if (try typeRefContainsHandleFamilyInner(active, module_id, arg, signature_resolver, visited)) return true;
         }
         return false;
     }
 
-    if (try standard_families.applicationArgs(active.allocator, name, .result)) |args| {
+    if (try standard_families.applicationArgRefsForFamily(active.allocator, ty, .result)) |args| {
         defer active.allocator.free(args);
         for (args) |arg| {
-            if (try typeNameContainsHandleFamily(active, module_id, arg, signature_resolver, visited)) return true;
+            if (try typeRefContainsHandleFamilyInner(active, module_id, arg, signature_resolver, visited)) return true;
         }
         return false;
     }
 
-    const item_id = resolveTypeItemId(active, module_id, typed_text.baseTypeName(name)) orelse return false;
+    const item_name = (try type_support.baseTypeNameFromTypeRef(active.allocator, ty)) orelse return false;
+    const item_id = resolveTypeItemId(active, module_id, item_name) orelse return false;
     if (itemIsHandleFamily(active, item_id)) return true;
 
     if (visited.contains(item_id.index)) return false;

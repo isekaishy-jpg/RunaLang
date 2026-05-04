@@ -1124,78 +1124,7 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
 }
 
 pub fn cloneConstExpr(allocator: Allocator, expr: *const ConstExpr) anyerror!*ConstExpr {
-    const result = try allocator.create(ConstExpr);
-    var initialized = false;
-    errdefer {
-        if (initialized) {
-            const_ir.destroyExpr(allocator, result);
-        } else {
-            allocator.destroy(result);
-        }
-    }
-
-    result.result_type = expr.result_type;
-    result.node = switch (expr.node) {
-        .literal => |value| .{ .literal = try const_ir.cloneValue(allocator, value) },
-        .const_ref => |name| .{ .const_ref = name },
-        .associated_const_ref => |ref| .{ .associated_const_ref = .{
-            .owner_name = ref.owner_name,
-            .const_name = ref.const_name,
-        } },
-        .enum_variant => |variant| .{ .enum_variant = .{
-            .enum_name = variant.enum_name,
-            .variant_name = variant.variant_name,
-        } },
-        .enum_tag => |variant| .{ .enum_tag = .{
-            .enum_name = variant.enum_name,
-            .variant_name = variant.variant_name,
-        } },
-        .enum_construct => |construct| .{ .enum_construct = .{
-            .enum_name = construct.enum_name,
-            .variant_name = construct.variant_name,
-            .args = try cloneConstExprSlice(allocator, construct.args),
-        } },
-        .constructor => |constructor| .{ .constructor = .{
-            .type_name = constructor.type_name,
-            .args = try cloneConstExprSlice(allocator, constructor.args),
-        } },
-        .field => |field| .{ .field = .{
-            .base = try cloneConstExpr(allocator, field.base),
-            .field_name = field.field_name,
-        } },
-        .array => |array| .{ .array = .{
-            .items = try cloneConstExprSlice(allocator, array.items),
-        } },
-        .array_repeat => |array_repeat| .{ .array_repeat = .{
-            .value = try cloneConstExpr(allocator, array_repeat.value),
-            .length = try cloneConstExpr(allocator, array_repeat.length),
-        } },
-        .index => |index| .{ .index = .{
-            .base = try cloneConstExpr(allocator, index.base),
-            .index = try cloneConstExpr(allocator, index.index),
-        } },
-        .conversion => |conversion| .{ .conversion = .{
-            .operand = try cloneConstExpr(allocator, conversion.operand),
-            .mode = conversion.mode,
-            .target_type = conversion.target_type,
-        } },
-        .unary => |unary| .{ .unary = .{
-            .op = unary.op,
-            .operand = try cloneConstExpr(allocator, unary.operand),
-        } },
-        .binary => |binary| blk: {
-            const lhs = try cloneConstExpr(allocator, binary.lhs);
-            errdefer const_ir.destroyExpr(allocator, lhs);
-            const rhs = try cloneConstExpr(allocator, binary.rhs);
-            break :blk .{ .binary = .{
-                .op = binary.op,
-                .lhs = lhs,
-                .rhs = rhs,
-            } };
-        },
-    };
-    initialized = true;
-    return result;
+    return const_ir.cloneExpr(allocator, expr);
 }
 
 fn cloneConstExprSlice(allocator: Allocator, exprs: []*ConstExpr) anyerror![]*ConstExpr {

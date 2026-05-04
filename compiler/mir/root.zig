@@ -38,7 +38,7 @@ pub const ImportedBinding = struct {
         if (self.function_parameter_types) |value| allocator.free(value);
         if (self.function_parameter_type_names) |value| allocator.free(value);
         if (self.function_parameter_modes) |value| allocator.free(value);
-        if (self.struct_fields) |fields| allocator.free(fields);
+        if (self.struct_fields) |fields| typed.deinitStructFields(allocator, fields);
         if (self.enum_variants) |variants| {
             for (variants) |*variant| variant.deinit(allocator);
             allocator.free(variants);
@@ -555,7 +555,7 @@ fn lowerModuleWithFacts(
             .function_parameter_types = if (binding.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
             .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
             .function_parameter_modes = if (binding.function_parameter_modes) |values| try allocator.dupe(typed.ParameterMode, values) else null,
-            .struct_fields = if (binding.struct_fields) |fields| try allocator.dupe(typed.StructField, fields) else null,
+            .struct_fields = if (binding.struct_fields) |fields| try typed.cloneStructFields(allocator, fields) else null,
             .enum_variants = if (binding.enum_variants) |variants| try duplicateImportedEnumVariants(allocator, variants) else null,
             .trait_methods = if (binding.trait_methods) |methods| try duplicateImportedTraitMethods(allocator, methods) else null,
         });
@@ -614,7 +614,7 @@ fn lowerModuleWithFacts(
                 for (struct_type.fields, 0..) |field, field_index| {
                     fields[field_index] = .{
                         .name = field.name,
-                        .type_name = field.type_name,
+                        .type_name = field.ty.displayName(),
                         .ty = field.ty,
                     };
                 }
@@ -632,7 +632,7 @@ fn lowerModuleWithFacts(
                                 const fields = try allocator.alloc(TupleField, tuple_fields.len);
                                 for (tuple_fields, 0..) |field, field_index| {
                                     fields[field_index] = .{
-                                        .type_name = field.type_name,
+                                        .type_name = field.ty.displayName(),
                                         .ty = field.ty,
                                     };
                                 }
@@ -643,7 +643,7 @@ fn lowerModuleWithFacts(
                                 for (named_fields, 0..) |field, field_index| {
                                     fields[field_index] = .{
                                         .name = field.name,
-                                        .type_name = field.type_name,
+                                        .type_name = field.ty.displayName(),
                                         .ty = field.ty,
                                     };
                                 }
@@ -714,7 +714,7 @@ pub fn mergeModules(allocator: Allocator, modules: []const *const Module) !Modul
                 .function_parameter_types = if (binding.function_parameter_types) |values| try allocator.dupe(types.TypeRef, values) else null,
                 .function_parameter_type_names = if (binding.function_parameter_type_names) |values| try allocator.dupe([]const u8, values) else null,
                 .function_parameter_modes = if (binding.function_parameter_modes) |values| try allocator.dupe(typed.ParameterMode, values) else null,
-                .struct_fields = if (binding.struct_fields) |fields| try allocator.dupe(typed.StructField, fields) else null,
+                .struct_fields = if (binding.struct_fields) |fields| try typed.cloneStructFields(allocator, fields) else null,
                 .enum_variants = if (binding.enum_variants) |variants| try duplicateImportedEnumVariants(allocator, variants) else null,
                 .trait_methods = if (binding.trait_methods) |methods| try duplicateImportedTraitMethods(allocator, methods) else null,
             });
@@ -1214,78 +1214,7 @@ fn cloneExpr(allocator: Allocator, expr: *const Expr) !*Expr {
 }
 
 fn cloneConstExpr(allocator: Allocator, expr: *const ConstExpr) anyerror!*ConstExpr {
-    const result = try allocator.create(ConstExpr);
-    var initialized = false;
-    errdefer {
-        if (initialized) {
-            const_ir.destroyExpr(allocator, result);
-        } else {
-            allocator.destroy(result);
-        }
-    }
-
-    result.result_type = expr.result_type;
-    result.node = switch (expr.node) {
-        .literal => |value| .{ .literal = try const_ir.cloneValue(allocator, value) },
-        .const_ref => |name| .{ .const_ref = name },
-        .associated_const_ref => |ref| .{ .associated_const_ref = .{
-            .owner_name = ref.owner_name,
-            .const_name = ref.const_name,
-        } },
-        .enum_variant => |variant| .{ .enum_variant = .{
-            .enum_name = variant.enum_name,
-            .variant_name = variant.variant_name,
-        } },
-        .enum_tag => |variant| .{ .enum_tag = .{
-            .enum_name = variant.enum_name,
-            .variant_name = variant.variant_name,
-        } },
-        .enum_construct => |construct| .{ .enum_construct = .{
-            .enum_name = construct.enum_name,
-            .variant_name = construct.variant_name,
-            .args = try cloneConstExprSlice(allocator, construct.args),
-        } },
-        .constructor => |constructor| .{ .constructor = .{
-            .type_name = constructor.type_name,
-            .args = try cloneConstExprSlice(allocator, constructor.args),
-        } },
-        .field => |field| .{ .field = .{
-            .base = try cloneConstExpr(allocator, field.base),
-            .field_name = field.field_name,
-        } },
-        .array => |array| .{ .array = .{
-            .items = try cloneConstExprSlice(allocator, array.items),
-        } },
-        .array_repeat => |array_repeat| .{ .array_repeat = .{
-            .value = try cloneConstExpr(allocator, array_repeat.value),
-            .length = try cloneConstExpr(allocator, array_repeat.length),
-        } },
-        .index => |index| .{ .index = .{
-            .base = try cloneConstExpr(allocator, index.base),
-            .index = try cloneConstExpr(allocator, index.index),
-        } },
-        .conversion => |conversion| .{ .conversion = .{
-            .operand = try cloneConstExpr(allocator, conversion.operand),
-            .mode = conversion.mode,
-            .target_type = conversion.target_type,
-        } },
-        .unary => |unary| .{ .unary = .{
-            .op = unary.op,
-            .operand = try cloneConstExpr(allocator, unary.operand),
-        } },
-        .binary => |binary| blk: {
-            const lhs = try cloneConstExpr(allocator, binary.lhs);
-            errdefer const_ir.destroyExpr(allocator, lhs);
-            const rhs = try cloneConstExpr(allocator, binary.rhs);
-            break :blk .{ .binary = .{
-                .op = binary.op,
-                .lhs = lhs,
-                .rhs = rhs,
-            } };
-        },
-    };
-    initialized = true;
-    return result;
+    return const_ir.cloneExpr(allocator, expr);
 }
 
 fn cloneConstExprSlice(allocator: Allocator, exprs: []*ConstExpr) anyerror![]*ConstExpr {
@@ -1304,20 +1233,14 @@ fn cloneConstExprSlice(allocator: Allocator, exprs: []*ConstExpr) anyerror![]*Co
 
 fn duplicateImportedEnumVariants(allocator: Allocator, variants: []typed.EnumVariant) ![]typed.EnumVariant {
     const cloned = try allocator.alloc(typed.EnumVariant, variants.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*variant| variant.deinit(allocator);
+        allocator.free(cloned);
+    }
     for (variants, 0..) |variant, index| {
-        cloned[index] = .{
-            .name = variant.name,
-            .discriminant = variant.discriminant,
-            .payload = switch (variant.payload) {
-                .none => .none,
-                .tuple_fields => |tuple_fields| blk: {
-                    const fields = try allocator.alloc(typed.TupleField, tuple_fields.len);
-                    @memcpy(fields, tuple_fields);
-                    break :blk .{ .tuple_fields = fields };
-                },
-                .named_fields => |named_fields| .{ .named_fields = try allocator.dupe(typed.StructField, named_fields) },
-            },
-        };
+        cloned[index] = try variant.clone(allocator);
+        initialized += 1;
     }
     return cloned;
 }

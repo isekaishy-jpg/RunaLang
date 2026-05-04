@@ -4,15 +4,15 @@ const c_va_list = @import("../abi/c/va_list.zig");
 const ast = @import("../ast/root.zig");
 const diag = @import("../diag/root.zig");
 const dynamic_library = @import("../runtime/dynamic_library/root.zig");
-const foreign_callable_types = @import("foreign_callable_types.zig");
 const query_attributes = @import("attributes.zig");
 const expression_parse = @import("expression_parse.zig");
 const pattern_parse = @import("pattern_parse.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
 const typed_expr = @import("../typed/expr.zig");
+const type_lowering = @import("type_lowering.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const type_support = @import("type_support.zig");
-const tuple_types = @import("tuple_types.zig");
 const query_text = @import("text.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
@@ -177,10 +177,9 @@ fn predeclareStructuredBlockConstBindings(
             .const_decl => |binding| {
                 const declared_type_syntax = binding.declared_type orelse continue;
                 const name = std.mem.trim(u8, binding.name.text, " \t");
-                const declared_type_name = std.mem.trim(u8, declared_type_syntax.text(), " \t");
-                if (declared_type_name.len == 0) continue;
-                const declared_type = try resolveDeclaredValueType(
-                    declared_type_name,
+                const declared_type = try resolveDeclaredValueTypeSyntax(
+                    diagnostics.allocator,
+                    declared_type_syntax,
                     struct_prototypes,
                     enum_prototypes,
                     span,
@@ -763,18 +762,14 @@ fn parseBindingStatementSyntax(
     const name = std.mem.trim(u8, binding.name.text, " \t");
     var declared_type: types.TypeRef = .unsupported;
     if (binding.declared_type) |declared_type_syntax| {
-        const declared_type_name = std.mem.trim(u8, declared_type_syntax.text(), " \t");
-        if (declared_type_name.len == 0) {
-            try diagnostics.add(.@"error", "type.binding.declared", span, "local binding '{s}' requires a type after ':'", .{name});
-        } else {
-            declared_type = try resolveDeclaredValueType(
-                declared_type_name,
-                struct_prototypes,
-                enum_prototypes,
-                span,
-                diagnostics,
-            );
-        }
+        declared_type = try resolveDeclaredValueTypeSyntax(
+            allocator,
+            declared_type_syntax,
+            struct_prototypes,
+            enum_prototypes,
+            span,
+            diagnostics,
+        );
     } else if (is_const) {
         try diagnostics.add(.@"error", "type.const.type", span, "local const '{s}' requires an explicit const-safe type", .{name});
     }
@@ -797,7 +792,7 @@ fn parseBindingStatementSyntax(
     const binding_type = if (!declared_type.isUnsupported()) declared_type else expr.ty;
 
     if (!declared_type.isUnsupported() and !expr.ty.isUnsupported() and
-        !type_support.callArgumentTypeCompatible(expr.ty, declared_type, declared_type.displayName(), &.{}, false))
+        !type_support.callArgumentTypeCompatible(expr.ty, declared_type, &.{}, false))
     {
         try diagnostics.add(.@"error", "type.binding.mismatch", span, "local binding '{s}' initializer type does not match declared type", .{name});
     }
@@ -807,6 +802,7 @@ fn parseBindingStatementSyntax(
     const lowered = Statement.BindingDecl{
         .name = name,
         .ty = binding_type,
+        .declared_type_syntax = if (binding.declared_type) |declared_type_syntax| try declared_type_syntax.clone(allocator) else null,
         .explicit_type = binding.declared_type != null,
         .span = span,
         .expr = expr,
@@ -923,7 +919,7 @@ fn resolveAssignmentTargetSyntax(
                 },
             };
             const field_name = std.mem.trim(u8, field.field_name.text, " \t");
-            if (tuple_types.projectionIndex(field_name) != null) {
+            if (tupleProjectionIndex(field_name) != null) {
                 try diagnostics.add(.@"error", "type.tuple.assign", span, "tuple field assignment is not part of v1", .{});
                 return null;
             }
@@ -941,8 +937,8 @@ fn resolveAssignmentTargetSyntax(
                 return null;
             }
 
-            const struct_name = switch (base_type) {
-                .named => |name| name,
+            const struct_name = (try type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, base_type)) orelse switch (base_type) {
+                .named => type_support.typeRefRawName(base_type),
                 else => {
                     try diagnostics.add(.@"error", "type.assign.target", span, "field assignment requires a struct-typed base expression", .{});
                     return null;
@@ -1111,56 +1107,68 @@ fn compoundAssignmentExpectedRhs(op: BinaryOp, lhs: types.TypeRef) types.TypeRef
     };
 }
 
-fn resolveDeclaredValueType(
-    type_name: []const u8,
+fn resolveDeclaredValueTypeSyntax(
+    allocator: Allocator,
+    syntax_value: ast.TypeSyntax,
     struct_prototypes: []const StructPrototype,
     enum_prototypes: []const EnumPrototype,
     span: source.Span,
     diagnostics: *diag.Bag,
 ) !types.TypeRef {
-    const builtin = types.Builtin.fromName(type_name);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    if (c_va_list.isTypeName(type_name)) return .{ .named = c_va_list.type_name };
-    if (dynamic_library.isTypeName(type_name)) return .{ .named = dynamic_library.type_name };
-    if (types.CAbiAlias.fromName(type_name) != null) return .{ .named = type_name };
-    if (rawPointerPointee(type_name) != null) return .{ .named = type_name };
-    if (foreign_callable_types.startsForeignCallableType(type_name)) return .{ .named = type_name };
-    const trimmed_type_name = std.mem.trim(u8, type_name, " \t");
-    if (std.mem.startsWith(u8, trimmed_type_name, "Option[") or
-        std.mem.startsWith(u8, trimmed_type_name, "Result["))
-    {
-        return .{ .named = type_name };
+    if (type_syntax_support.containsInvalid(syntax_value)) {
+        try diagnostics.add(.@"error", "type.binding.declared", span, "local binding type cannot be empty", .{});
+        return .unsupported;
     }
-    if (std.mem.startsWith(u8, trimmed_type_name, "[")) return .{ .named = type_name };
-    if (try tuple_types.isTupleTypeName(diagnostics.allocator, type_name)) return .{ .named = type_name };
-    if (findStructPrototype(struct_prototypes, type_name) != null) return .{ .named = type_name };
-    if (findEnumPrototype(enum_prototypes, type_name) != null) return .{ .named = type_name };
-    try diagnostics.add(.@"error", "type.binding.declared", span, "unsupported stage0 local binding type '{s}'", .{type_name});
+    const stable_ref = try type_lowering.typeRefFromSyntax(allocator, syntax_value);
+    if (stable_ref.isUnsupported()) {
+        try diagnostics.add(.@"error", "type.binding.declared", span, "local binding type cannot be empty", .{});
+        return .unsupported;
+    }
+
+    const builtin = type_syntax_support.builtinFromSyntax(syntax_value);
+    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
+
+    if (type_syntax_support.isPlainName(syntax_value)) |plain_name| {
+        const trimmed_name = std.mem.trim(u8, plain_name, " \t\r\n");
+        if (trimmed_name.len == 0) {
+            try diagnostics.add(.@"error", "type.binding.declared", span, "local binding type cannot be empty", .{});
+            return .unsupported;
+        }
+        if (c_va_list.isTypeName(trimmed_name)) return .{ .named = c_va_list.type_name };
+        if (dynamic_library.isTypeName(trimmed_name)) return .{ .named = dynamic_library.type_name };
+        if (types.CAbiAlias.fromName(trimmed_name) != null) return .{ .named = trimmed_name };
+        if (findStructPrototype(struct_prototypes, trimmed_name) != null) return .{ .named = trimmed_name };
+        if (findEnumPrototype(enum_prototypes, trimmed_name) != null) return .{ .named = trimmed_name };
+    }
+
+    if ((try type_support.rawPointerFromSyntax(allocator, syntax_value)) != null) return stable_ref;
+    if (try type_support.foreignCallableFromSyntax(allocator, syntax_value)) |callable| {
+        var owned = callable;
+        defer owned.deinit(allocator);
+        return stable_ref;
+    }
+    if (try type_support.applicationArgsFromSyntax(allocator, syntax_value, "Option")) |args| {
+        defer allocator.free(args);
+        return stable_ref;
+    }
+    if (try type_support.applicationArgsFromSyntax(allocator, syntax_value, "Result")) |args| {
+        defer allocator.free(args);
+        return stable_ref;
+    }
+    if ((try type_support.fixedArrayElementTypeFromSyntax(allocator, syntax_value)) != null) return stable_ref;
+    if (try type_support.tupleElementTypesFromSyntax(allocator, syntax_value)) |elements| {
+        defer allocator.free(elements);
+        return stable_ref;
+    }
+
+    const rendered_type_name = try type_syntax_support.render(allocator, syntax_value);
+    defer allocator.free(rendered_type_name);
+    try diagnostics.add(.@"error", "type.binding.declared", span, "unsupported stage0 local binding type '{s}'", .{rendered_type_name});
     return .unsupported;
 }
 
-fn rawPointerPointee(raw_type_name: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
-    if (std.mem.startsWith(u8, trimmed, "*read ")) return std.mem.trim(u8, trimmed["*read ".len..], " \t\r\n");
-    if (std.mem.startsWith(u8, trimmed, "*edit ")) return std.mem.trim(u8, trimmed["*edit ".len..], " \t\r\n");
-    return null;
-}
-
 fn fixedArrayElementType(ty: types.TypeRef) ?types.TypeRef {
-    const raw = switch (ty) {
-        .named => |name| std.mem.trim(u8, name, " \t\r\n"),
-        else => return null,
-    };
-    if (!std.mem.startsWith(u8, raw, "[")) return null;
-    const close_index = findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
-    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t\r\n").len != 0) return null;
-    const inner = raw[1..close_index];
-    const separator = findTopLevelHeaderScalar(inner, ';') orelse return null;
-    const element_name = std.mem.trim(u8, inner[0..separator], " \t\r\n");
-    if (element_name.len == 0) return null;
-    const builtin = types.Builtin.fromName(element_name);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = element_name };
+    return type_support.fixedArrayElementType(std.heap.page_allocator, ty) catch null;
 }
 
 fn simpleIndexTargetText(expr: *const ast.BodyExprSyntax) ?[]const u8 {
@@ -1198,6 +1206,12 @@ const NameSet = struct {
         return false;
     }
 };
+
+fn tupleProjectionIndex(raw: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(usize, trimmed, 10) catch null;
+}
 
 pub const Scope = struct {
     allocator: Allocator,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const array_list = std.array_list;
 const checked_body = @import("../query/checked_body.zig");
+const query_type_support = @import("../query/type_support.zig");
 const diag = @import("../diag/root.zig");
 const typed = @import("../typed/root.zig");
 const types = @import("../types/root.zig");
@@ -888,9 +889,5 @@ fn containsName(values: []const []const u8, needle: []const u8) bool {
 }
 
 fn typeRefRawName(ty: types.TypeRef) []const u8 {
-    return switch (ty) {
-        .builtin => |builtin| builtin.displayName(),
-        .named => |name| name,
-        .unsupported => "Unsupported",
-    };
+    return query_type_support.typeRefRawName(ty);
 }

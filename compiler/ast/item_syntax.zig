@@ -16,7 +16,6 @@ pub const SpanText = struct {
 };
 
 pub const BorrowAccess = enum {
-    hold,
     read,
     edit,
 };
@@ -45,6 +44,16 @@ pub const TypeNode = struct {
         member: SpanText,
     };
 
+    pub const FixedArray = struct {
+        length: SpanText,
+    };
+
+    pub const ForeignCallable = struct {
+        abi: SpanText,
+        parameter_count: u32,
+        has_variadic_tail: bool = false,
+    };
+
     pub const Payload = union(enum) {
         invalid,
         name_ref,
@@ -53,6 +62,9 @@ pub const TypeNode = struct {
         borrow: Borrow,
         raw_pointer: RawPointer,
         assoc: Assoc,
+        tuple,
+        fixed_array: FixedArray,
+        foreign_callable: ForeignCallable,
     };
 };
 
@@ -170,7 +182,7 @@ pub const GenericParamList = struct {
 
 pub const BoundWherePredicate = struct {
     subject_name: []const u8,
-    contract_name: []const u8,
+    contract_type: TypeSyntax,
     span: source.Span,
 };
 
@@ -448,20 +460,30 @@ pub const TuplePayload = struct {
 pub const EnumVariant = struct {
     name: ?SpanText = null,
     tuple_payload: ?TuplePayload = null,
-    discriminant: ?SpanText = null,
+    discriminant_source: ?SpanText = null,
+    discriminant_expr: ?*ExprSyntax = null,
     named_fields: []FieldDecl = &.{},
 
     pub fn clone(self: EnumVariant, allocator: Allocator) !EnumVariant {
-        return .{
+        var cloned = EnumVariant{
             .name = self.name,
             .tuple_payload = if (self.tuple_payload) |payload| try payload.clone(allocator) else null,
-            .discriminant = self.discriminant,
-            .named_fields = try cloneComplexSlice(allocator, FieldDecl, self.named_fields),
+            .discriminant_source = self.discriminant_source,
+            .discriminant_expr = null,
+            .named_fields = &.{},
         };
+        errdefer cloned.deinit(allocator);
+        if (self.discriminant_expr) |expr| cloned.discriminant_expr = try expr.clone(allocator);
+        cloned.named_fields = try cloneComplexSlice(allocator, FieldDecl, self.named_fields);
+        return cloned;
     }
 
     pub fn deinit(self: *EnumVariant, allocator: Allocator) void {
         if (self.tuple_payload) |*payload| payload.deinit(allocator);
+        if (self.discriminant_expr) |expr| {
+            expr.deinit(allocator);
+            allocator.destroy(expr);
+        }
         freeComplexSlice(allocator, FieldDecl, self.named_fields);
         self.* = .{};
     }
@@ -643,7 +665,11 @@ fn freeComplexSlice(allocator: Allocator, comptime T: type, items: []T) void {
 
 fn cloneWherePredicate(predicate: WherePredicate, allocator: Allocator) !WherePredicate {
     return switch (predicate) {
-        .bound => |bound| .{ .bound = bound },
+        .bound => |bound| .{ .bound = .{
+            .subject_name = bound.subject_name,
+            .contract_type = try bound.contract_type.clone(allocator),
+            .span = bound.span,
+        } },
         .projection_equality => |projection| .{ .projection_equality = .{
             .subject_name = projection.subject_name,
             .associated_name = projection.associated_name,
@@ -658,6 +684,7 @@ fn cloneWherePredicate(predicate: WherePredicate, allocator: Allocator) !WherePr
 
 fn deinitWherePredicate(predicate: *WherePredicate, allocator: Allocator) void {
     switch (predicate.*) {
+        .bound => |*bound| bound.contract_type.deinit(allocator),
         .projection_equality => |*projection| projection.value_type.deinit(allocator),
         else => {},
     }

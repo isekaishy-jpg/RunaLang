@@ -109,13 +109,57 @@ pub const ConstData = struct {
 pub const StructField = struct {
     name: []const u8,
     visibility: ast.Visibility,
-    type_name: []const u8,
+    type_syntax: ast.TypeSyntax,
     ty: types.TypeRef = .unsupported,
+
+    pub fn clone(self: StructField, allocator: Allocator) !StructField {
+        return .{
+            .name = self.name,
+            .visibility = self.visibility,
+            .type_syntax = try self.type_syntax.clone(allocator),
+            .ty = self.ty,
+        };
+    }
+
+    pub fn deinit(self: *StructField, allocator: Allocator) void {
+        self.type_syntax.deinit(allocator);
+        self.* = .{
+            .name = "",
+            .visibility = .private,
+            .type_syntax = .{
+                .source = .{
+                    .text = "",
+                    .span = .{ .file_id = 0, .start = 0, .end = 0 },
+                },
+            },
+            .ty = .unsupported,
+        };
+    }
 };
 
 pub const TupleField = struct {
-    type_name: []const u8,
+    type_syntax: ast.TypeSyntax,
     ty: types.TypeRef = .unsupported,
+
+    pub fn clone(self: TupleField, allocator: Allocator) !TupleField {
+        return .{
+            .type_syntax = try self.type_syntax.clone(allocator),
+            .ty = self.ty,
+        };
+    }
+
+    pub fn deinit(self: *TupleField, allocator: Allocator) void {
+        self.type_syntax.deinit(allocator);
+        self.* = .{
+            .type_syntax = .{
+                .source = .{
+                    .text = "",
+                    .span = .{ .file_id = 0, .start = 0, .end = 0 },
+                },
+            },
+            .ty = .unsupported,
+        };
+    }
 };
 
 pub const StructData = struct {
@@ -126,7 +170,7 @@ pub const StructData = struct {
     pub fn deinit(self: *StructData, allocator: Allocator) void {
         if (self.generic_params.len != 0) allocator.free(self.generic_params);
         typed_signatures.deinitWherePredicates(allocator, self.where_predicates);
-        allocator.free(self.fields);
+        deinitStructFields(allocator, self.fields);
     }
 };
 
@@ -134,7 +178,7 @@ pub const UnionData = struct {
     fields: []StructField,
 
     pub fn deinit(self: *UnionData, allocator: Allocator) void {
-        allocator.free(self.fields);
+        deinitStructFields(allocator, self.fields);
     }
 };
 
@@ -146,8 +190,8 @@ pub const EnumVariantPayload = union(enum) {
     pub fn deinit(self: *EnumVariantPayload, allocator: Allocator) void {
         switch (self.*) {
             .none => {},
-            .tuple_fields => |tuple_fields| allocator.free(tuple_fields),
-            .named_fields => |named_fields| allocator.free(named_fields),
+            .tuple_fields => |tuple_fields| deinitTupleFields(allocator, tuple_fields),
+            .named_fields => |named_fields| deinitStructFields(allocator, named_fields),
         }
     }
 };
@@ -155,10 +199,37 @@ pub const EnumVariantPayload = union(enum) {
 pub const EnumVariant = struct {
     name: []const u8,
     payload: EnumVariantPayload,
-    discriminant: ?[]const u8 = null,
+    discriminant_source: ?ast.SpanText = null,
+    discriminant_syntax: ?*ast.BodyExprSyntax = null,
+
+    pub fn clone(self: EnumVariant, allocator: Allocator) !EnumVariant {
+        var cloned = EnumVariant{
+            .name = self.name,
+            .payload = switch (self.payload) {
+                .none => .none,
+                .tuple_fields => |tuple_fields| .{ .tuple_fields = try cloneTupleFields(allocator, tuple_fields) },
+                .named_fields => |named_fields| .{ .named_fields = try cloneStructFields(allocator, named_fields) },
+            },
+            .discriminant_source = self.discriminant_source,
+            .discriminant_syntax = null,
+        };
+        errdefer cloned.deinit(allocator);
+        if (self.discriminant_syntax) |expr| cloned.discriminant_syntax = try expr.clone(allocator);
+        return cloned;
+    }
 
     pub fn deinit(self: *EnumVariant, allocator: Allocator) void {
         self.payload.deinit(allocator);
+        if (self.discriminant_syntax) |expr| {
+            expr.deinit(allocator);
+            allocator.destroy(expr);
+        }
+        self.* = .{
+            .name = "",
+            .payload = .none,
+            .discriminant_source = null,
+            .discriminant_syntax = null,
+        };
     }
 };
 
@@ -297,3 +368,43 @@ pub const ImplData = struct {
         allocator.free(self.methods);
     }
 };
+
+pub fn cloneStructFields(allocator: Allocator, fields: []const StructField) ![]StructField {
+    if (fields.len == 0) return &.{};
+    const cloned = try allocator.alloc(StructField, fields.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (fields, 0..) |field, index| {
+        cloned[index] = try field.clone(allocator);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn deinitStructFields(allocator: Allocator, fields: []StructField) void {
+    for (fields) |*field| field.deinit(allocator);
+    if (fields.len != 0) allocator.free(fields);
+}
+
+pub fn cloneTupleFields(allocator: Allocator, fields: []const TupleField) ![]TupleField {
+    if (fields.len == 0) return &.{};
+    const cloned = try allocator.alloc(TupleField, fields.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (fields, 0..) |field, index| {
+        cloned[index] = try field.clone(allocator);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn deinitTupleFields(allocator: Allocator, fields: []TupleField) void {
+    for (fields) |*field| field.deinit(allocator);
+    if (fields.len != 0) allocator.free(fields);
+}

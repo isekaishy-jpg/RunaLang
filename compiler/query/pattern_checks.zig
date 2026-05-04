@@ -5,7 +5,7 @@ const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const standard_families = @import("standard_families.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("text.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 const checked_body = @import("checked_body.zig");
 const query_types = @import("types.zig");
@@ -109,7 +109,7 @@ fn subjectSelectExhaustive(
             .bool => boolSubjectSelectExhaustive(statement),
             else => false,
         },
-        .named => |name| try enumSubjectSelectExhaustive(active, body.module_id, statement, name, signature_resolver),
+        .named => try enumSubjectSelectExhaustive(active, body.module_id, statement, subject.ty, signature_resolver),
         .unsupported => true,
     };
 }
@@ -275,13 +275,15 @@ fn enumSubjectSelectExhaustive(
     active: *session.Session,
     module_id: session.ModuleId,
     statement: checked_body.StatementSite,
-    raw_type_name: []const u8,
+    subject_type: types.TypeRef,
     signature_resolver: anytype,
 ) !bool {
-    const enum_name = typed_text.baseTypeName(raw_type_name);
+    const enum_name = (try type_support.baseTypeNameFromTypeRef(active.allocator, subject_type)) orelse return false;
     const subject_temp_name = statement.select_subject_temp_name orelse return false;
-    if (try standard_families.exhaustiveVariantNames(active.allocator, raw_type_name)) |variants| {
-        return standardSubjectSelectExhaustive(statement, subject_temp_name, raw_type_name, variants);
+    if (try standard_families.exhaustiveVariantNamesForTypeRef(active.allocator, subject_type)) |variants| {
+        const subject_type_name = try type_support.renderTypeRef(active.allocator, subject_type);
+        defer active.allocator.free(subject_type_name);
+        return standardSubjectSelectExhaustive(statement, subject_temp_name, subject_type_name, variants);
     }
     const item_id = resolveTypeItemId(active, module_id, enum_name) orelse return false;
     const signature = try signature_resolver(active, item_id);
@@ -363,20 +365,14 @@ fn repeatIterableSatisfied(
     site: checked_body.RepeatIterationSite,
     trait_resolver: anytype,
 ) !bool {
-    const type_name = switch (site.iterable_type) {
-        .named => |name| name,
-        else => return false,
-    };
+    const type_name = try type_support.renderTypeRef(active.allocator, site.iterable_type);
+    defer active.allocator.free(type_name);
     const result = trait_resolver(active, body.module_id, type_name, "Iterable", body.function.where_predicates) catch return false;
     return result.satisfied;
 }
 
 fn typeRefLabel(ty: types.TypeRef) []const u8 {
-    return switch (ty) {
-        .builtin => |builtin| builtin.displayName(),
-        .named => |name| name,
-        .unsupported => "Unsupported",
-    };
+    return type_support.typeRefRawName(ty);
 }
 
 fn resolveTypeItemId(active: *const session.Session, module_id: session.ModuleId, name: []const u8) ?session.ItemId {

@@ -3,13 +3,11 @@ const diag = @import("../diag/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const trait_solver = @import("trait_solver.zig");
+const type_forms = @import("type_forms.zig");
+const type_lowering = @import("type_lowering.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
+const type_support = @import("type_support.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("text.zig");
-
-const baseTypeName = typed_text.baseTypeName;
-const findMatchingDelimiter = typed_text.findMatchingDelimiter;
-const splitTopLevelCommaParts = typed_text.splitTopLevelCommaParts;
 
 pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
     for (active.semantic_index.impls.items, 0..) |impl_entry, impl_index| {
@@ -19,12 +17,12 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
             else => continue,
         };
 
-        const trait_name = impl_signature.trait_type orelse continue;
-        const trait_head = try trait_solver.canonicalTraitHead(active, checked.module_id, trait_name.displayName());
+        const trait_syntax = impl_signature.trait_syntax orelse continue;
+        const trait_head = try trait_solver.canonicalTraitHeadFromSyntax(active, checked.module_id, trait_syntax);
         const type_head = try canonicalImplTypeHead(
             active,
             checked.module_id,
-            impl_signature.target_type.displayName(),
+            impl_signature.target_type_syntax,
             impl_signature.generic_params,
             impl_signature.where_predicates,
         );
@@ -50,8 +48,8 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
                 checked.item.span,
                 "impl '{s} for {s}' violates the orphan-style coherence rule",
                 .{
-                    baseTypeName(trait_name.displayName()),
-                    baseTypeName(impl_signature.target_type.displayName()),
+                    baseNameFromSyntaxOrRef(trait_syntax, impl_signature.trait_type orelse .unsupported),
+                    baseNameFromSyntaxOrRef(impl_signature.target_type_syntax, impl_signature.target_type),
                 },
             );
         }
@@ -64,8 +62,8 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
                 .impl_block => |other_signature| other_signature,
                 else => continue,
             };
-            const other_trait_name = other_signature.trait_type orelse continue;
-            const other_trait_head = try trait_solver.canonicalTraitHead(active, other_checked.module_id, other_trait_name.displayName());
+            const other_trait_syntax = other_signature.trait_syntax orelse continue;
+            const other_trait_head = try trait_solver.canonicalTraitHeadFromSyntax(active, other_checked.module_id, other_trait_syntax);
 
             if (!trait_solver.traitHeadsEqual(trait_head, other_trait_head)) continue;
             if (!try implTargetsOverlap(active, checked.module_id, impl_signature, other_checked.module_id, other_signature)) continue;
@@ -76,8 +74,8 @@ pub fn validate(active: *session.Session, diagnostics: *diag.Bag) !void {
                 other_checked.item.span,
                 "overlapping impls are not allowed for trait '{s}' and type '{s}'",
                 .{
-                    baseTypeName(trait_name.displayName()),
-                    baseTypeName(impl_signature.target_type.displayName()),
+                    baseNameFromSyntaxOrRef(trait_syntax, impl_signature.trait_type orelse .unsupported),
+                    baseNameFromSyntaxOrRef(impl_signature.target_type_syntax, impl_signature.target_type),
                 },
             );
         }
@@ -91,52 +89,39 @@ fn implTargetsOverlap(
     rhs_module_id: session.ModuleId,
     rhs: query_types.ImplSignature,
 ) !bool {
-    const lhs_type_name = try ownedImplTargetTypeName(active.allocator, lhs);
-    defer active.allocator.free(lhs_type_name);
-    const rhs_type_name = try ownedImplTargetTypeName(active.allocator, rhs);
-    defer active.allocator.free(rhs_type_name);
     return typePatternsOverlap(
         active,
         lhs_module_id,
-        lhs_type_name,
+        lhs.target_type,
         lhs.generic_params,
         lhs.where_predicates,
         rhs_module_id,
-        rhs_type_name,
+        rhs.target_type,
         rhs.generic_params,
         rhs.where_predicates,
     );
 }
 
-fn ownedImplTargetTypeName(allocator: std.mem.Allocator, impl_signature: query_types.ImplSignature) ![]const u8 {
-    if (!type_syntax_support.containsInvalid(impl_signature.target_type_syntax)) {
-        return type_syntax_support.render(allocator, impl_signature.target_type_syntax);
-    }
-    return allocator.dupe(u8, impl_signature.target_type.displayName());
-}
-
 fn typePatternsOverlap(
     active: *session.Session,
     lhs_module_id: session.ModuleId,
-    lhs_raw: []const u8,
+    lhs: @import("../types/root.zig").TypeRef,
     lhs_generics: []const typed.GenericParam,
     lhs_where_predicates: []const typed.WherePredicate,
     rhs_module_id: session.ModuleId,
-    rhs_raw: []const u8,
+    rhs: @import("../types/root.zig").TypeRef,
     rhs_generics: []const typed.GenericParam,
     rhs_where_predicates: []const typed.WherePredicate,
 ) !bool {
-    const lhs = std.mem.trim(u8, lhs_raw, " \t");
-    const rhs = std.mem.trim(u8, rhs_raw, " \t");
-    const lhs_head = try canonicalImplTypeHead(active, lhs_module_id, lhs, lhs_generics, lhs_where_predicates);
-    const rhs_head = try canonicalImplTypeHead(active, rhs_module_id, rhs, rhs_generics, rhs_where_predicates);
+    const lhs_head = try canonicalImplTypeHeadFromTypeRef(active, lhs_module_id, lhs, lhs_generics, lhs_where_predicates);
+    const rhs_head = try canonicalImplTypeHeadFromTypeRef(active, rhs_module_id, rhs, rhs_generics, rhs_where_predicates);
     if (!typeHeadsCouldOverlap(lhs_head, rhs_head)) return false;
 
     var arena = std.heap.ArenaAllocator.init(active.allocator);
     defer arena.deinit();
 
-    const lhs_args = typeApplicationArgs(arena.allocator(), lhs) catch return true;
-    const rhs_args = typeApplicationArgs(arena.allocator(), rhs) catch return true;
+    const lhs_args = try typeApplicationArgs(arena.allocator(), lhs);
+    const rhs_args = try typeApplicationArgs(arena.allocator(), rhs);
     if (lhs_args == null and rhs_args == null) return true;
     if (lhs_args == null or rhs_args == null) return true;
     if (lhs_args.?.len != rhs_args.?.len) return false;
@@ -160,15 +145,34 @@ fn typePatternsOverlap(
 fn canonicalImplTypeHead(
     active: *session.Session,
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    syntax_value: @import("../ast/root.zig").TypeSyntax,
     generic_params: []const typed.GenericParam,
     where_predicates: []const typed.WherePredicate,
 ) !query_types.CanonicalTypeHead {
-    const name = baseTypeName(raw_type_name);
+    const name = baseNameFromSyntax(syntax_value) orelse return trait_solver.canonicalTypeHeadFromSyntax(active, module_id, syntax_value, where_predicates);
     if (genericParamOwnsName(generic_params, name)) {
         return .{ .generic_param = try active.internName(name) };
     }
-    return trait_solver.canonicalTypeHead(active, module_id, raw_type_name, where_predicates);
+    return trait_solver.canonicalTypeHeadFromSyntax(active, module_id, syntax_value, where_predicates);
+}
+
+fn canonicalImplTypeHeadFromTypeRef(
+    active: *session.Session,
+    module_id: session.ModuleId,
+    ty: @import("../types/root.zig").TypeRef,
+    generic_params: []const typed.GenericParam,
+    where_predicates: []const typed.WherePredicate,
+) !query_types.CanonicalTypeHead {
+    if (try type_lowering.clonedSyntaxForTypeRef(active.allocator, ty)) |syntax_value| {
+        var owned = syntax_value;
+        defer owned.deinit(active.allocator);
+        return canonicalImplTypeHead(active, module_id, owned, generic_params, where_predicates);
+    }
+    const name = type_support.typeRefRawName(ty);
+    if (genericParamOwnsName(generic_params, name)) {
+        return .{ .generic_param = try active.internName(name) };
+    }
+    return trait_solver.canonicalTypeHeadFromTypeRef(active, module_id, ty, where_predicates);
 }
 
 fn typeHeadsCouldOverlap(lhs: query_types.CanonicalTypeHead, rhs: query_types.CanonicalTypeHead) bool {
@@ -182,11 +186,23 @@ fn typeHeadsCouldOverlap(lhs: query_types.CanonicalTypeHead, rhs: query_types.Ca
     };
 }
 
-fn typeApplicationArgs(allocator: std.mem.Allocator, raw_name: []const u8) !?[][]const u8 {
-    const open_index = std.mem.indexOfScalar(u8, raw_name, '[') orelse return null;
-    const close_index = findMatchingDelimiter(raw_name, open_index, '[', ']') orelse return null;
-    if (std.mem.trim(u8, raw_name[close_index + 1 ..], " \t").len != 0) return null;
-    return try splitTopLevelCommaParts(allocator, raw_name[open_index + 1 .. close_index]);
+fn typeApplicationArgs(allocator: std.mem.Allocator, ty: @import("../types/root.zig").TypeRef) !?[]@import("../types/root.zig").TypeRef {
+    const base_name = try type_support.baseTypeNameFromTypeRef(allocator, ty) orelse return null;
+    return try type_support.applicationArgsFromTypeRef(allocator, ty, base_name);
+}
+
+fn baseNameFromSyntax(syntax_value: @import("../ast/root.zig").TypeSyntax) ?[]const u8 {
+    var view = type_forms.View.fromSyntax(std.heap.page_allocator, syntax_value) catch return null;
+    defer view.deinit();
+    return type_forms.baseName(view);
+}
+
+fn baseNameFromSyntaxOrRef(
+    syntax_value: @import("../ast/root.zig").TypeSyntax,
+    fallback: @import("../types/root.zig").TypeRef,
+) []const u8 {
+    return baseNameFromSyntax(syntax_value) orelse
+        ((type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, fallback) catch null) orelse type_support.typeRefRawName(fallback));
 }
 
 fn genericParamOwnsName(generic_params: []const typed.GenericParam, name: []const u8) bool {

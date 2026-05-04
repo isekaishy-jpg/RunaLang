@@ -1,18 +1,24 @@
 const std = @import("std");
 const abi = @import("../abi/root.zig");
+const ast = @import("../ast/root.zig");
 const backend_contract = @import("../backend_contract/root.zig");
 const dynamic_library = @import("../runtime/dynamic_library/root.zig");
 const layout = @import("../layout/root.zig");
 const query_types = @import("types.zig");
 const session = @import("../session/root.zig");
 const target = @import("../target/root.zig");
+const type_forms = @import("type_forms.zig");
+const type_lowering = @import("type_lowering.zig");
 const type_syntax_support = @import("../type_syntax_support.zig");
+const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 
 const array_list = std.array_list;
 
 pub const Resolvers = struct {
     canonical_type_expression: *const fn (*session.Session, session.ModuleId, []const u8) anyerror!types.CanonicalTypeId,
+    canonical_type_ref: *const fn (*session.Session, session.ModuleId, types.TypeRef) anyerror!types.CanonicalTypeId,
+    canonical_type_syntax: *const fn (*session.Session, session.ModuleId, ast.TypeSyntax) anyerror!types.CanonicalTypeId,
     checked_signature: *const fn (*session.Session, session.ItemId) anyerror!query_types.CheckedSignature,
     checked_body: *const fn (*session.Session, session.BodyId) anyerror!query_types.CheckedBody,
     statements_by_body: *const fn (*session.Session, session.BodyId) anyerror!query_types.StatementResult,
@@ -314,7 +320,7 @@ fn appendBoundarySurface(
     errdefer active.allocator.free(name);
     const input_type_name = try renderPackedInputType(active.allocator, function.parameters);
     errdefer active.allocator.free(input_type_name);
-    const output_type_name = try active.allocator.dupe(u8, function.return_type.displayName());
+    const output_type_name = try renderTypeNameFromSyntaxOrRef(active.allocator, function.return_type_syntax, function.return_type);
     errdefer active.allocator.free(output_type_name);
     const capability_families = try collectCapabilityFamilies(active, module_id, function, resolvers);
     errdefer freeStringSlice(active.allocator, capability_families);
@@ -344,9 +350,7 @@ fn appendConstDescriptor(
     resolvers: Resolvers,
 ) !void {
     const id = const_id orelse return;
-    const type_name = try type_syntax_support.render(active.allocator, const_item.type_syntax);
-    defer active.allocator.free(type_name);
-    const type_id = try resolvers.canonical_type_expression(active, module_id, type_name);
+    const type_id = try resolvers.canonical_type_syntax(active, module_id, const_item.type_syntax);
     const type_layout = try resolvers.layout_for_key(active, .{
         .type_id = type_id,
         .target_name = key.target_name,
@@ -381,7 +385,7 @@ fn reprContextForType(
 
 fn renderPackedInputType(allocator: std.mem.Allocator, parameters: anytype) ![]const u8 {
     if (parameters.len == 0) return allocator.dupe(u8, "Unit");
-    if (parameters.len == 1) return allocator.dupe(u8, parameters[0].ty.displayName());
+    if (parameters.len == 1) return renderTypeNameFromSyntaxOrRef(allocator, parameters[0].type_syntax, parameters[0].ty);
 
     var rendered = array_list.Managed(u8).init(allocator);
     errdefer rendered.deinit();
@@ -389,7 +393,9 @@ fn renderPackedInputType(allocator: std.mem.Allocator, parameters: anytype) ![]c
     try rendered.append('(');
     for (parameters, 0..) |parameter, index| {
         if (index != 0) try rendered.appendSlice(", ");
-        try rendered.appendSlice(parameter.ty.displayName());
+        const type_name = try renderTypeNameFromSyntaxOrRef(allocator, parameter.type_syntax, parameter.ty);
+        defer allocator.free(type_name);
+        try rendered.appendSlice(type_name);
     }
     try rendered.append(')');
     return rendered.toOwnedSlice();
@@ -408,9 +414,9 @@ fn collectCapabilityFamilies(
     }
 
     for (function.parameters) |parameter| {
-        try appendCapabilityFamily(active, &families, module_id, parameter.ty.displayName(), resolvers);
+        try appendCapabilityFamily(active, &families, module_id, parameter.type_syntax, parameter.ty, resolvers);
     }
-    try appendCapabilityFamily(active, &families, module_id, function.return_type.displayName(), resolvers);
+    try appendCapabilityFamily(active, &families, module_id, function.return_type_syntax, function.return_type, resolvers);
     return families.toOwnedSlice();
 }
 
@@ -418,10 +424,14 @@ fn appendCapabilityFamily(
     active: *session.Session,
     families: *array_list.Managed([]const u8),
     module_id: session.ModuleId,
-    raw_type_name: []const u8,
+    type_syntax: ?ast.TypeSyntax,
+    ty: types.TypeRef,
     resolvers: Resolvers,
 ) !void {
-    const type_name = baseBoundaryTypeName(raw_type_name);
+    const type_name = if (type_syntax) |syntax_value|
+        capabilityBoundaryTypeNameFromSyntax(syntax_value) orelse baseBoundaryTypeName(ty)
+    else
+        baseBoundaryTypeName(ty);
     if (type_name.len == 0) return;
 
     const item_id = resolveTypeItemId(active, module_id, type_name) orelse return;
@@ -454,17 +464,53 @@ fn resolveTypeItemId(active: *const session.Session, module_id: session.ModuleId
     return null;
 }
 
-fn baseBoundaryTypeName(raw_type_name: []const u8) []const u8 {
-    var trimmed = std.mem.trim(u8, raw_type_name, " \t");
-    if (trimmed.len == 0) return "";
-    if (std.mem.startsWith(u8, trimmed, "hold[")) {
-        const closing = std.mem.indexOfScalar(u8, trimmed, ']') orelse return trimmed;
-        trimmed = std.mem.trim(u8, trimmed[closing + 1 ..], " \t");
+fn baseBoundaryTypeName(ty: types.TypeRef) []const u8 {
+    const boundary = type_support.boundaryFromTypeRef(ty);
+    var view = type_forms.View.fromTypeRef(std.heap.page_allocator, boundary.inner_type) catch return type_support.typeRefRawName(boundary.inner_type);
+    defer view.deinit();
+    return type_forms.baseName(view) orelse type_support.typeRefRawName(boundary.inner_type);
+}
+
+fn renderTypeNameFromSyntaxOrRef(
+    allocator: std.mem.Allocator,
+    type_syntax: ?ast.TypeSyntax,
+    ty: types.TypeRef,
+) ![]const u8 {
+    if (type_syntax) |syntax_value| {
+        if (!type_syntax_support.containsInvalid(syntax_value)) {
+            return type_syntax_support.render(allocator, syntax_value);
+        }
     }
-    if (std.mem.startsWith(u8, trimmed, "read ")) trimmed = std.mem.trim(u8, trimmed["read ".len..], " \t");
-    if (std.mem.startsWith(u8, trimmed, "edit ")) trimmed = std.mem.trim(u8, trimmed["edit ".len..], " \t");
-    if (std.mem.indexOfAny(u8, trimmed, "[(")) |index| return std.mem.trim(u8, trimmed[0..index], " \t");
-    return trimmed;
+    return type_support.renderTypeRef(allocator, ty);
+}
+
+fn capabilityBoundaryTypeNameFromSyntax(syntax_value: ast.TypeSyntax) ?[]const u8 {
+    var view = type_forms.View.fromSyntax(std.heap.page_allocator, syntax_value) catch return null;
+    defer view.deinit();
+    const root = view.rootNode();
+    return switch (root.payload) {
+        .borrow => blk: {
+            const children = view.rootChildren();
+            if (children.len == 0) break :blk null;
+            break :blk baseNameAtNode(view.syntax, children[children.len - 1]);
+        },
+        else => type_forms.baseName(view),
+    };
+}
+
+fn baseNameAtNode(syntax_value: ast.TypeSyntax, node_index: usize) ?[]const u8 {
+    const node = syntax_value.nodes[node_index];
+    return switch (node.payload) {
+        .name_ref => std.mem.trim(u8, node.source.text, " \t\r\n"),
+        .apply => blk: {
+            const children = syntax_value.childNodeIndices(node_index);
+            if (children.len == 0) break :blk null;
+            const base = syntax_value.nodes[children[0]];
+            if (base.payload != .name_ref) break :blk null;
+            break :blk std.mem.trim(u8, base.source.text, " \t\r\n");
+        },
+        else => null,
+    };
 }
 
 fn checkedBodyUsesDynamicLibrary(checked_body: query_types.CheckedBody) bool {

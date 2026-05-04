@@ -2,19 +2,18 @@ const std = @import("std");
 const array_list = std.array_list;
 const c_va_list = @import("../abi/c/va_list.zig");
 const ast = @import("../ast/root.zig");
-const callable_types = @import("callable_types.zig");
 const dynamic_library = @import("../runtime/dynamic_library/root.zig");
-const foreign_callable_types = @import("foreign_callable_types.zig");
 const raw_pointer = @import("../raw_pointer/root.zig");
 const typed_decls = @import("../typed/declarations.zig");
 const typed_expr = @import("../typed/expr.zig");
 const signatures = @import("signatures.zig");
 const diag = @import("../diag/root.zig");
+const type_text_syntax = @import("../parse/type_text_syntax.zig");
 const source = @import("../source/root.zig");
 const standard_families = @import("standard_families.zig");
-const typed_text = @import("text.zig");
+const type_forms = @import("type_forms.zig");
+const type_lowering = @import("type_lowering.zig");
 const type_support = @import("type_support.zig");
-const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const BinaryOp = typed_expr.BinaryOp;
@@ -22,9 +21,6 @@ const Expr = typed_expr.Expr;
 const ParameterMode = typed_decls.ParameterMode;
 const GenericParam = signatures.GenericParam;
 const WherePredicate = signatures.WherePredicate;
-const baseTypeName = typed_text.baseTypeName;
-const findMatchingDelimiter = typed_text.findMatchingDelimiter;
-const findTopLevelHeaderScalar = typed_text.findTopLevelHeaderScalar;
 const BoundaryType = type_support.BoundaryType;
 const boundaryAccessCompatible = type_support.boundaryAccessCompatible;
 const boundaryInnerTypeCompatible = type_support.boundaryInnerTypeCompatible;
@@ -39,11 +35,6 @@ const findMethodPrototype = type_support.findMethodPrototype;
 const findPrototype = type_support.findPrototype;
 const findStructPrototype = type_support.findStructPrototype;
 const inferExprBoundaryTypeInScope = type_support.inferExprBoundaryTypeInScope;
-const parseBoundaryType = type_support.parseBoundaryType;
-const makeCallableTypeName = callable_types.makeCallableTypeName;
-const makeCallableInputTypeName = callable_types.makeCallableInputTypeName;
-const parseCallableTypeName = callable_types.parseCallableTypeName;
-const shallowTypeRefFromName = callable_types.shallowTypeRefFromName;
 
 fn validateBorrowArguments(
     self: anytype,
@@ -140,7 +131,7 @@ const LifetimeBinding = struct {
 
 fn validateRetainedCallArguments(
     self: anytype,
-    parameter_type_names: []const []const u8,
+    parameter_types: []const types.TypeRef,
     generic_params: []const GenericParam,
     where_predicates: []const WherePredicate,
     args: []const *Expr,
@@ -150,8 +141,8 @@ fn validateRetainedCallArguments(
     defer lifetime_bindings.deinit();
 
     for (args, 0..) |arg, index| {
-        if (index >= parameter_type_names.len) break;
-        const expected = parseBoundaryType(parameter_type_names[index]);
+        if (index >= parameter_types.len) break;
+        const expected = type_support.boundaryFromTypeRef(parameter_types[index]);
         if (expected.kind != .retained_read and expected.kind != .retained_edit) continue;
 
         const actual = inferExprBoundaryTypeInScope(self.scope, arg);
@@ -181,7 +172,7 @@ fn validateRetainedCallArguments(
             continue;
         }
 
-        if (!boundaryInnerTypeCompatible(actual.inner_type_name, expected.inner_type_name, generic_params, true)) {
+        if (!boundaryInnerTypeCompatible(actual.inner_type, expected.inner_type, generic_params, true)) {
             continue;
         }
 
@@ -233,13 +224,13 @@ fn validateRetainedCallArguments(
 
 fn validateRetainedStorageArguments(
     self: anytype,
-    field_type_names: []const []const u8,
+    field_types: []const types.TypeRef,
     args: []const *Expr,
     container_name: []const u8,
 ) !void {
     for (args, 0..) |arg, index| {
-        if (index >= field_type_names.len) break;
-        const expected = parseBoundaryType(field_type_names[index]);
+        if (index >= field_types.len) break;
+        const expected = type_support.boundaryFromTypeRef(field_types[index]);
         if (expected.kind != .retained_read and expected.kind != .retained_edit) continue;
 
         const actual = inferExprBoundaryTypeInScope(self.scope, arg);
@@ -349,9 +340,8 @@ fn validateDirectCallArguments(
     const fixed_count = cVariadicFixedParameterCount(parameter_types.len, parameter_type_names);
     for (args[0..@min(args.len, fixed_count)], 0..) |arg, index| {
         const expected = parameter_types[index];
-        const expected_type_name = if (index < parameter_type_names.len) parameter_type_names[index] else expected.displayName();
         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
-            !callArgumentTypeCompatible(arg.ty, expected, expected_type_name, generic_params, false))
+            !callArgumentTypeCompatible(arg.ty, expected, generic_params, false))
         {
             try self.diagnostics.add(.@"error", "type.call.arg", self.span, "call to '{s}' argument {d} has wrong type", .{
                 callee_name,
@@ -374,7 +364,7 @@ fn validateDirectCallArguments(
     try validateBorrowArguments(self, parameter_modes, args, callee_name);
     try validateRetainedCallArguments(
         self,
-        parameter_type_names,
+        parameter_types,
         generic_params,
         where_predicates,
         args,
@@ -382,16 +372,16 @@ fn validateDirectCallArguments(
     );
 }
 
-fn foreignCallablePrototypeCompatible(syntax: foreign_callable_types.Syntax, prototype: anytype) bool {
-    if (syntax.variadic_tail != null) return false;
-    if (syntax.parameters.len != prototype.parameter_type_names.len) return false;
+fn foreignCallablePrototypeCompatible(syntax: type_forms.ForeignCallable, prototype: anytype) bool {
+    if (syntax.variadic) return false;
+    if (syntax.parameters.len != prototype.parameter_types.len) return false;
     for (prototype.parameter_modes) |mode| {
         if (mode != .owned and mode != .take) return false;
     }
-    for (syntax.parameters, prototype.parameter_type_names) |expected, actual| {
-        if (!std.mem.eql(u8, std.mem.trim(u8, expected, " \t\r\n"), std.mem.trim(u8, actual, " \t\r\n"))) return false;
+    for (syntax.parameters, prototype.parameter_types) |expected, actual| {
+        if (!expected.eql(actual) and !type_support.callArgumentTypeCompatible(actual, expected, &.{}, false)) return false;
     }
-    return std.mem.eql(u8, std.mem.trim(u8, syntax.return_type, " \t\r\n"), prototype.return_type.displayName());
+    return syntax.return_type.eql(prototype.return_type);
 }
 
 fn ExprParser(
@@ -429,14 +419,14 @@ fn ExprParser(
                 const target = try self.parseConversionTarget();
                 if (target.mode == .explicit_checked) {
                     const result_type_name = try std.fmt.allocPrint(self.allocator, "Result[{s}, ConvertError]", .{target.target_type_name});
-                    errdefer self.allocator.free(result_type_name);
-                    const converted = try self.makeExpr(.{ .named = result_type_name }, .{ .conversion = .{
+                    defer self.allocator.free(result_type_name);
+                    const converted = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, result_type_name), .{ .conversion = .{
                         .operand = expr,
                         .mode = target.mode,
                         .target_type = target.target_type,
                         .target_type_name = target.target_type_name,
                     } });
-                    converted.owned_type_name = result_type_name;
+                    if (converted.ty == .named) converted.owned_type_name = try self.allocator.dupe(u8, converted.ty.named);
                     expr = converted;
                     continue;
                 }
@@ -488,11 +478,11 @@ fn ExprParser(
                 };
             }
 
-            const target_type = shallowTypeRefFromName(target_token.lexeme);
+            const target_type = typeRefFromName(target_token.lexeme);
             return .{
                 .mode = mode,
                 .target_type = target_type,
-                .target_type_name = target_type.displayName(),
+                .target_type_name = type_support.typeRefRawName(target_type),
             };
         }
 
@@ -747,14 +737,15 @@ fn ExprParser(
             const pointee_name = type_support.typeRefRawName(place.ty);
             const access = if (std.mem.eql(u8, mode_token.lexeme, "read")) raw_pointer.Access.read else .edit;
             const type_name = try raw_pointer.makeTypeName(self.allocator, access, pointee_name);
+            defer self.allocator.free(type_name);
             const callee = if (access == .read) raw_pointer.address_read_callee else raw_pointer.address_edit_callee;
             const args = try self.allocator.alloc(*Expr, 1);
             args[0] = place;
-            const expr = try self.makeExpr(.{ .named = type_name }, .{ .call = .{
+            const expr = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, type_name), .{ .call = .{
                 .callee = callee,
                 .args = args,
             } });
-            expr.owned_type_name = @constCast(type_name);
+            if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
             return expr;
         }
 
@@ -771,7 +762,7 @@ fn ExprParser(
                     if (std.mem.eql(u8, token.lexeme, "true")) return self.makeExpr(types.TypeRef.fromBuiltin(.bool), .{ .bool_lit = true });
                     if (std.mem.eql(u8, token.lexeme, "false")) return self.makeExpr(types.TypeRef.fromBuiltin(.bool), .{ .bool_lit = false });
                     if (std.mem.eql(u8, token.lexeme, "null")) {
-                        if (self.expected_type == .named and raw_pointer.parse(self.expected_type.named) != null) {
+                        if ((try type_support.rawPointerFromTypeRef(self.allocator, self.expected_type)) != null) {
                             return self.makeExpr(self.expected_type, .{ .identifier = "NULL" });
                         }
                         try self.diagnostics.add(.@"error", "type.raw_pointer.null", self.span, "null is valid only where a raw pointer type is expected", .{});
@@ -838,14 +829,8 @@ fn ExprParser(
 
             const prototype = findPrototype(self.prototypes, callee_name);
             const struct_prototype = findStructPrototype(self.struct_prototypes, callee_name);
-            const callable = switch (callee_expr.ty) {
-                .named => |type_name| try parseCallableTypeName(type_name, self.allocator),
-                else => null,
-            };
-            var foreign_callable = switch (callee_expr.ty) {
-                .named => |type_name| try foreign_callable_types.parseSyntax(self.allocator, type_name),
-                else => null,
-            };
+            const callable = try type_support.callableFromTypeRef(self.allocator, callee_expr.ty);
+            var foreign_callable = try type_support.foreignCallableFromTypeRef(self.allocator, callee_expr.ty);
             defer if (foreign_callable) |*syntax| syntax.deinit(self.allocator);
 
             var args = array_list.Managed(*Expr).init(self.allocator);
@@ -926,9 +911,8 @@ fn ExprParser(
                     });
                 } else {
                     for (combined_args, prototype_method.parameter_types, 0..) |arg, expected, index| {
-                        const expected_type_name = if (index < prototype_method.parameter_type_names.len) prototype_method.parameter_type_names[index] else expected.displayName();
                         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
-                            !callArgumentTypeCompatible(arg.ty, expected, expected_type_name, prototype_method.generic_params, true))
+                            !callArgumentTypeCompatible(arg.ty, expected, prototype_method.generic_params, true))
                         {
                             try self.diagnostics.add(.@"error", "type.method.arg", self.span, "method call to '{s}.{s}' argument {d} has wrong type", .{
                                 target.target_type,
@@ -940,7 +924,7 @@ fn ExprParser(
                     try validateBorrowArguments(self, prototype_method.parameter_modes, combined_args, prototype_method.function_name);
                     try validateRetainedCallArguments(
                         self,
-                        prototype_method.parameter_type_names,
+                        prototype_method.parameter_types,
                         prototype_method.generic_params,
                         prototype_method.where_predicates,
                         combined_args,
@@ -992,7 +976,7 @@ fn ExprParser(
                         } else {
                             for (args.items, tuple_fields, 0..) |arg, field, field_index| {
                                 if (!arg.ty.isUnsupported() and !field.ty.isUnsupported() and
-                                    !callArgumentTypeCompatible(arg.ty, field.ty, field.type_name, &.{}, false))
+                                    !callArgumentTypeCompatible(arg.ty, field.ty, &.{}, false))
                                 {
                                     try self.diagnostics.add(.@"error", "type.enum.ctor.arg", self.span, "constructor call to '{s}.{s}' argument {d} has wrong type", .{
                                         target.enum_name,
@@ -1001,10 +985,10 @@ fn ExprParser(
                                     });
                                 }
                             }
-                            const field_type_names = try self.allocator.alloc([]const u8, tuple_fields.len);
-                            defer self.allocator.free(field_type_names);
-                            for (tuple_fields, 0..) |field, field_index| field_type_names[field_index] = field.type_name;
-                            try validateRetainedStorageArguments(self, field_type_names, args.items, target.enum_name);
+                            const field_types = try self.allocator.alloc(types.TypeRef, tuple_fields.len);
+                            defer self.allocator.free(field_types);
+                            for (tuple_fields, 0..) |field, field_index| field_types[field_index] = field.ty;
+                            try validateRetainedStorageArguments(self, field_types, args.items, target.enum_name);
                         }
                         break :blk self.makeExpr(.{ .named = target.enum_name }, .{ .enum_construct = .{
                             .enum_name = target.enum_name,
@@ -1026,7 +1010,7 @@ fn ExprParser(
                         } else {
                             for (args.items, named_fields, 0..) |arg, field, field_index| {
                                 if (!arg.ty.isUnsupported() and !field.ty.isUnsupported() and
-                                    !callArgumentTypeCompatible(arg.ty, field.ty, field.type_name, &.{}, false))
+                                    !callArgumentTypeCompatible(arg.ty, field.ty, &.{}, false))
                                 {
                                     try self.diagnostics.add(.@"error", "type.enum.ctor.arg", self.span, "constructor call to '{s}.{s}' field {d} has wrong type", .{
                                         target.enum_name,
@@ -1035,10 +1019,10 @@ fn ExprParser(
                                     });
                                 }
                             }
-                            const field_type_names = try self.allocator.alloc([]const u8, named_fields.len);
-                            defer self.allocator.free(field_type_names);
-                            for (named_fields, 0..) |field, field_index| field_type_names[field_index] = field.type_name;
-                            try validateRetainedStorageArguments(self, field_type_names, args.items, target.enum_name);
+                            const field_types = try self.allocator.alloc(types.TypeRef, named_fields.len);
+                            defer self.allocator.free(field_types);
+                            for (named_fields, 0..) |field, field_index| field_types[field_index] = field.ty;
+                            try validateRetainedStorageArguments(self, field_types, args.items, target.enum_name);
                         }
                         break :blk self.makeExpr(.{ .named = target.enum_name }, .{ .enum_construct = .{
                             .enum_name = target.enum_name,
@@ -1065,7 +1049,7 @@ fn ExprParser(
                 } else {
                     for (args.items, value.fields, 0..) |arg, field, field_index| {
                         if (!arg.ty.isUnsupported() and !field.ty.isUnsupported() and
-                            !callArgumentTypeCompatible(arg.ty, field.ty, field.type_name, &.{}, false))
+                            !callArgumentTypeCompatible(arg.ty, field.ty, &.{}, false))
                         {
                             try self.diagnostics.add(.@"error", "type.ctor.arg", self.span, "constructor call to '{s}' field {d} has wrong type", .{
                                 callee_name,
@@ -1073,10 +1057,10 @@ fn ExprParser(
                             });
                         }
                     }
-                    const field_type_names = try self.allocator.alloc([]const u8, value.fields.len);
-                    defer self.allocator.free(field_type_names);
-                    for (value.fields, 0..) |field, field_index| field_type_names[field_index] = field.type_name;
-                    try validateRetainedStorageArguments(self, field_type_names, args.items, callee_name);
+                    const field_types = try self.allocator.alloc(types.TypeRef, value.fields.len);
+                    defer self.allocator.free(field_types);
+                    for (value.fields, 0..) |field, field_index| field_types[field_index] = field.ty;
+                    try validateRetainedStorageArguments(self, field_types, args.items, callee_name);
                 }
                 return self.makeExpr(.{ .named = value.name }, .{ .constructor = .{
                     .type_name = value.name,
@@ -1117,23 +1101,22 @@ fn ExprParser(
                 if (!self.unsafe_context) {
                     try self.diagnostics.add(.@"error", "abi.c.fnptr.unsafe", self.span, "calling a foreign function pointer requires #unsafe", .{});
                 }
-                if (syntax.variadic_tail != null) {
+                if (syntax.variadic) {
                     try self.diagnostics.add(.@"error", "abi.c.fnptr.variadic", self.span, "variadic foreign function pointer calls are not implemented in stage0", .{});
                 }
                 if (syntax.parameters.len != args.items.len) {
                     try self.diagnostics.add(.@"error", "abi.c.fnptr.arity", self.span, "foreign function pointer call has wrong arity", .{});
                 } else {
-                    for (args.items, syntax.parameters, 0..) |arg, expected_type_name, index| {
-                        const expected = shallowTypeRefFromName(expected_type_name);
+                    for (args.items, syntax.parameters, 0..) |arg, expected, index| {
                         if (!arg.ty.isUnsupported() and !expected.isUnsupported() and
-                            !callArgumentTypeCompatible(arg.ty, expected, expected_type_name, &.{}, false))
+                            !callArgumentTypeCompatible(arg.ty, expected, &.{}, false))
                         {
                             try self.diagnostics.add(.@"error", "abi.c.fnptr.arg", self.span, "foreign function pointer argument {d} has wrong type", .{index + 1});
                         }
                     }
                 }
 
-                return self.makeExpr(shallowTypeRefFromName(syntax.return_type), .{ .call = .{
+                return self.makeExpr(syntax.return_type, .{ .call = .{
                     .callee = callee_name,
                     .args = try args.toOwnedSlice(),
                 } });
@@ -1142,7 +1125,7 @@ fn ExprParser(
                     try self.diagnostics.add(.@"error", "type.call.qualifier", self.span, "callable values must use ':: call'", .{});
                 }
 
-                return self.makeExpr(shallowTypeRefFromName(value.output_type_name), .{ .call = .{
+                return self.makeExpr(value.output_type, .{ .call = .{
                     .callee = callee_name,
                     .args = try args.toOwnedSlice(),
                 } });
@@ -1170,22 +1153,23 @@ fn ExprParser(
 
             if (std.mem.eql(u8, callee_name, dynamic_library.open_name)) {
                 try self.validateDynamicOpenArgs(args);
-                return self.makeExpr(.{ .named = dynamic_library.open_result_type_name }, .{ .call = .{
+                const expr = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, dynamic_library.open_result_type_name), .{ .call = .{
                     .callee = dynamic_library.open_callee,
                     .args = try self.cloneArgSlice(args),
                 } });
+                if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
+                return expr;
             }
             if (std.mem.eql(u8, callee_name, dynamic_library.lookup_name)) {
                 if (!self.unsafe_context) {
                     try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.unsafe", self.span, "dynamic-library symbol lookup requires #unsafe", .{});
                 }
                 try self.validateDynamicLookupArgs(args);
-                const result_type_name = try self.dynamicLookupResultTypeName();
-                const expr = try self.makeExpr(.{ .named = result_type_name }, .{ .call = .{
+                const expr = try self.makeExpr(try self.dynamicLookupResultType(), .{ .call = .{
                     .callee = dynamic_library.lookup_callee,
                     .args = try self.cloneArgSlice(args),
                 } });
-                expr.owned_type_name = @constCast(result_type_name);
+                if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
                 return expr;
             }
             if (std.mem.eql(u8, callee_name, dynamic_library.close_name)) {
@@ -1193,10 +1177,12 @@ fn ExprParser(
                     try self.diagnostics.add(.@"error", "runtime.dynamic.close.unsafe", self.span, "dynamic-library close requires #unsafe", .{});
                 }
                 try self.validateDynamicCloseArgs(args);
-                return self.makeExpr(.{ .named = dynamic_library.close_result_type_name }, .{ .call = .{
+                const expr = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, dynamic_library.close_result_type_name), .{ .call = .{
                     .callee = dynamic_library.close_callee,
                     .args = try self.cloneArgSlice(args),
                 } });
+                if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
+                return expr;
             }
             return null;
         }
@@ -1222,7 +1208,7 @@ fn ExprParser(
                 try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.arity", self.span, "lookup_symbol expects a DynamicLibrary and symbol name", .{});
                 return;
             }
-            if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+            if (!args[0].ty.isUnsupported() and !std.mem.eql(u8, type_support.typeRefRawName(args[0].ty), dynamic_library.type_name)) {
                 try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.library", self.span, "lookup_symbol first argument must be DynamicLibrary", .{});
             }
             if (!args[1].ty.isUnsupported() and !args[1].ty.eql(types.TypeRef.fromBuiltin(.str))) {
@@ -1235,22 +1221,15 @@ fn ExprParser(
                 try self.diagnostics.add(.@"error", "runtime.dynamic.close.arity", self.span, "close_library expects exactly one DynamicLibrary argument", .{});
                 return;
             }
-            if (!args[0].ty.isUnsupported() and !args[0].ty.isNamed(dynamic_library.type_name)) {
+            if (!args[0].ty.isUnsupported() and !std.mem.eql(u8, type_support.typeRefRawName(args[0].ty), dynamic_library.type_name)) {
                 try self.diagnostics.add(.@"error", "runtime.dynamic.close.library", self.span, "close_library argument must be DynamicLibrary", .{});
             }
         }
 
-        fn dynamicLookupResultTypeName(self: *@This()) ![]const u8 {
-            switch (self.expected_type) {
-                .named => |name| {
-                    if (try dynamicLookupResultOkType(self.allocator, name)) |ok_type| {
-                        return try std.fmt.allocPrint(self.allocator, "Result[{s}, {s}]", .{ ok_type, dynamic_library.lookup_error_type_name });
-                    }
-                },
-                else => {},
-            }
+        fn dynamicLookupResultType(self: *@This()) !types.TypeRef {
+            if ((try dynamicLookupResultOkType(self.allocator, self.expected_type)) != null) return self.expected_type;
             try self.diagnostics.add(.@"error", "runtime.dynamic.lookup.type", self.span, "lookup_symbol requires contextual type Result[T, SymbolLookupError] where T is a foreign function pointer or raw pointer", .{});
-            return try self.allocator.dupe(u8, "Result[Unsupported, SymbolLookupError]");
+            return try typeRefFromStandaloneTypeText(self.allocator, "Result[Unsupported, SymbolLookupError]");
         }
 
         fn parseStandardFamilyMethodInvocation(
@@ -1259,10 +1238,10 @@ fn ExprParser(
             target: Expr.MethodTarget,
             explicit_args: []const *Expr,
         ) anyerror!?*Expr {
-            const variant_name = standard_families.helperVariant(target.target_type, target.method_name) orelse return null;
+            const variant_name = (try standard_families.helperVariantForTypeRef(self.allocator, target.base.ty, target.method_name)) orelse return null;
             if (explicit_args.len != 0) {
                 try self.diagnostics.add(.@"error", "type.standard.helper_arity", self.span, "standard helper '{s}.{s}' does not take explicit arguments", .{
-                    baseTypeName(target.target_type),
+                    baseTypeNameOrRaw(target.target_type),
                     target.method_name,
                 });
             }
@@ -1273,7 +1252,7 @@ fn ExprParser(
             } });
             const variant_expr = try self.makeExpr(types.TypeRef.fromBuiltin(.i32), .{ .enum_tag = .{
                 .enum_name = target.target_type,
-                .enum_symbol = baseTypeName(target.target_type),
+                .enum_symbol = baseTypeNameOrRaw(target.target_type),
                 .variant_name = variant_name,
             } });
 
@@ -1290,28 +1269,28 @@ fn ExprParser(
             target: Expr.EnumVariantValue,
             args: []const *Expr,
         ) anyerror!?*Expr {
-            const maybe_variant = try standard_families.variantForConcrete(self.allocator, target.enum_name, target.enum_symbol, target.variant_name);
+            const maybe_variant = try standard_families.variantForExpected(self.allocator, typeRefFromName(target.enum_name), target.enum_symbol, target.variant_name);
             const variant = maybe_variant orelse return null;
-            const payload_type_name = variant.payload_type_name orelse {
+            const payload_type = variant.payload_type orelse {
                 if (args.len != 0) {
                     try self.diagnostics.add(.@"error", "type.enum.ctor.arity", self.span, "unit variant '{s}.{s}' does not take constructor args", .{
                         variant.family_name,
                         variant.variant_name,
                     });
-                    return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_construct = .{
-                        .enum_name = variant.concrete_type_name,
+                    return self.makeExpr(variant.concrete_type, .{ .enum_construct = .{
+                        .enum_name = type_support.typeRefRawName(variant.concrete_type),
                         .enum_symbol = variant.family_name,
                         .variant_name = variant.variant_name,
                         .args = try self.allocator.dupe(*Expr, args),
                     } });
                 }
-                return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_variant = .{
-                    .enum_name = variant.concrete_type_name,
+                return self.makeExpr(variant.concrete_type, .{ .enum_variant = .{
+                    .enum_name = type_support.typeRefRawName(variant.concrete_type),
                     .enum_symbol = variant.family_name,
                     .variant_name = variant.variant_name,
                 } });
             };
-            const expected = standard_families.typeRefFromName(payload_type_name);
+            const expected = payload_type;
             const unit_payload = expected.eql(types.TypeRef.fromBuiltin(.unit));
             const arity_ok = if (unit_payload) args.len == 0 or args.len == 1 else args.len == 1;
             if (!arity_ok) {
@@ -1320,15 +1299,15 @@ fn ExprParser(
                     variant.variant_name,
                 });
             } else if (args.len == 1 and !args[0].ty.isUnsupported() and !expected.isUnsupported() and
-                !callArgumentTypeCompatible(args[0].ty, expected, payload_type_name, &.{}, false))
+                !callArgumentTypeCompatible(args[0].ty, expected, &.{}, false))
             {
                 try self.diagnostics.add(.@"error", "type.enum.ctor.arg", self.span, "constructor call to '{s}.{s}' argument 1 has wrong type", .{
                     variant.family_name,
                     variant.variant_name,
                 });
             }
-            return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_construct = .{
-                .enum_name = variant.concrete_type_name,
+            return self.makeExpr(variant.concrete_type, .{ .enum_construct = .{
+                .enum_name = type_support.typeRefRawName(variant.concrete_type),
                 .enum_symbol = variant.family_name,
                 .variant_name = variant.variant_name,
                 .args = try self.allocator.dupe(*Expr, args),
@@ -1372,7 +1351,7 @@ fn ExprParser(
                     try self.diagnostics.add(.@"error", "abi.c.valist.next_type", self.span, "CVaList.next type '{s}' is not C ABI-safe after promotion", .{type_arg});
                 }
                 break :blk .{
-                    .result_type = shallowTypeRefFromName(type_arg),
+                    .result_type = typeRefFromName(type_arg),
                     .callee = c_va_list.next_callee,
                 };
             } else return null;
@@ -1424,13 +1403,14 @@ fn ExprParser(
                     };
                 };
                 const type_name = try raw_pointer.makeTypeName(self.allocator, pointer.access, target_type);
+                defer self.allocator.free(type_name);
                 break :blk .{
-                    .result_type = .{ .named = type_name },
+                    .result_type = try typeRefFromStandaloneTypeText(self.allocator, type_name),
                     .callee = raw_pointer.cast_callee,
                     .expected_args = 0,
                 };
             } else if (std.mem.eql(u8, method_name, "offset")) .{
-                .result_type = .{ .named = target.target_type },
+                .result_type = typeRefFromName(target.target_type),
                 .callee = raw_pointer.offset_callee,
                 .expected_args = 1,
             } else if (std.mem.eql(u8, method_name, "load")) blk: {
@@ -1438,7 +1418,7 @@ fn ExprParser(
                     try self.diagnostics.add(.@"error", "type.raw_pointer.load.pointee", self.span, "raw-pointer load requires a raw-memory-safe pointee type", .{});
                 }
                 break :blk .{
-                    .result_type = shallowTypeRefFromName(pointer.pointee),
+                    .result_type = typeRefFromName(pointer.pointee),
                     .callee = raw_pointer.load_callee,
                     .expected_args = 0,
                 };
@@ -1472,7 +1452,7 @@ fn ExprParser(
                 }
             }
             if (std.mem.eql(u8, method_name, "store") and explicit_args.len == 1 and
-                !explicit_args[0].ty.isUnsupported() and !callArgumentTypeCompatible(explicit_args[0].ty, shallowTypeRefFromName(pointer.pointee), pointer.pointee, &.{}, false))
+                !explicit_args[0].ty.isUnsupported() and !callArgumentTypeCompatible(explicit_args[0].ty, typeRefFromName(pointer.pointee), &.{}, false))
             {
                 try self.diagnostics.add(.@"error", "type.raw_pointer.store.value", self.span, "raw-pointer store value has the wrong type", .{});
             }
@@ -1487,7 +1467,7 @@ fn ExprParser(
                 .args = combined_args,
             } });
             if (std.mem.eql(u8, method_name, "cast") and operation.result_type == .named) {
-                expr.owned_type_name = @constCast(operation.result_type.named);
+                expr.owned_type_name = try self.allocator.dupe(u8, operation.result_type.named);
             }
             return expr;
         }
@@ -1496,17 +1476,13 @@ fn ExprParser(
             _ = self.advance();
             const field_token = self.advance();
             if (field_token.kind == .integer) {
-                const index = tuple_types.projectionIndex(field_token.lexeme) orelse {
+                const index = tupleProjectionIndex(field_token.lexeme) orelse {
                     base_expr.deinit(self.allocator);
                     self.allocator.destroy(base_expr);
                     try self.diagnostics.add(.@"error", "type.tuple.projection", self.span, "tuple projection must use a non-negative field index", .{});
                     return makeUnsupportedExpr(self.allocator);
                 };
-                const tuple_name = switch (base_expr.ty) {
-                    .named => |name| name,
-                    else => "",
-                };
-                const element_type = try tuple_types.projectionElementType(self.allocator, tuple_name, index) orelse {
+                const element_type = try type_support.tupleElementType(self.allocator, base_expr.ty, index) orelse {
                     base_expr.deinit(self.allocator);
                     self.allocator.destroy(base_expr);
                     try self.diagnostics.add(.@"error", "type.tuple.projection", self.span, "invalid tuple projection '.{s}'", .{field_token.lexeme});
@@ -1581,11 +1557,11 @@ fn ExprParser(
                             });
                             return makeUnsupportedExpr(self.allocator);
                         };
-                        if (variant.payload_type_name == null) {
+                        if (variant.payload_type == null) {
                             base_expr.deinit(self.allocator);
                             self.allocator.destroy(base_expr);
-                            return self.makeExpr(.{ .named = variant.concrete_type_name }, .{ .enum_variant = .{
-                                .enum_name = variant.concrete_type_name,
+                            return self.makeExpr(variant.concrete_type, .{ .enum_variant = .{
+                                .enum_name = type_support.typeRefRawName(variant.concrete_type),
                                 .enum_symbol = variant.family_name,
                                 .variant_name = variant.variant_name,
                             } });
@@ -1599,7 +1575,7 @@ fn ExprParser(
                         base_expr.deinit(self.allocator);
                         self.allocator.destroy(base_expr);
                         return self.makeExpr(.unsupported, .{ .enum_constructor_target = .{
-                            .enum_name = variant.concrete_type_name,
+                            .enum_name = type_support.typeRefRawName(variant.concrete_type),
                             .enum_symbol = variant.family_name,
                             .variant_name = variant.variant_name,
                         } });
@@ -1614,14 +1590,12 @@ fn ExprParser(
                 else => {},
             }
 
-            const target_type_name = switch (base_expr.ty) {
-                .named => |name| parseBoundaryType(name).inner_type_name,
-                else => blk: {
-                    try self.diagnostics.add(.@"error", "type.field.base", self.span, "field projection requires a struct-typed base expression", .{});
-                    break :blk "";
-                },
-            };
-            const struct_name = baseTypeName(target_type_name);
+            const target_type_name = type_support.typeRefRawName(type_support.boundaryFromTypeRef(base_expr.ty).inner_type);
+            if (target_type_name.len == 0 or std.mem.eql(u8, target_type_name, "Unsupported")) {
+                try self.diagnostics.add(.@"error", "type.field.base", self.span, "field projection requires a struct-typed base expression", .{});
+                return makeUnsupportedExpr(self.allocator);
+            }
+            const struct_name = baseTypeNameOrRaw(target_type_name);
             const method_type_arg = try self.parseOptionalMethodTypeArgument(target_type_name, field_token.lexeme);
 
             if (findStructPrototype(self.struct_prototypes, struct_name)) |prototype| {
@@ -1724,8 +1698,7 @@ fn ExprParser(
 
         fn parseTupleExpression(self: *@This()) anyerror!*Expr {
             const expected_parts = switch (self.expected_type) {
-                .named => |name| try tuple_types.splitTypeParts(self.allocator, name),
-                else => null,
+                else => try type_support.tupleElementTypes(self.allocator, self.expected_type),
             };
             defer if (expected_parts) |parts| self.allocator.free(parts);
 
@@ -1736,7 +1709,7 @@ fn ExprParser(
 
             while (true) {
                 const expected_element = if (expected_parts) |parts|
-                    if (items.items.len < parts.len) tuple_types.shallowTypeRefFromName(parts[items.items.len]) else types.TypeRef.unsupported
+                    if (items.items.len < parts.len) parts[items.items.len] else types.TypeRef.unsupported
                 else
                     types.TypeRef.unsupported;
                 const previous_expected = self.expected_type;
@@ -1764,23 +1737,24 @@ fn ExprParser(
                 try self.diagnostics.add(.@"error", "type.tuple.arity", self.span, "tuple expressions must have at least two elements", .{});
             }
             if (expected_parts) |parts| {
-                if (tuple_types.validTupleParts(parts) and parts.len != items.items.len) {
+                if (parts.len != items.items.len) {
                     try self.diagnostics.add(.@"error", "type.tuple.arity", self.span, "tuple expression arity does not match the expected tuple type", .{});
                 }
                 for (items.items, 0..) |item, index| {
                     if (index >= parts.len) break;
-                    const expected = tuple_types.shallowTypeRefFromName(parts[index]);
+                    const expected = parts[index];
                     if (!item.ty.isUnsupported() and !expected.isUnsupported() and
-                        !callArgumentTypeCompatible(item.ty, expected, parts[index], &.{}, false))
+                        !callArgumentTypeCompatible(item.ty, expected, &.{}, false))
                     {
                         try self.diagnostics.add(.@"error", "type.expr.tuple.item", self.span, "tuple element {d} has the wrong type", .{index});
                     }
                 }
             }
 
-            const type_name = try tuple_types.makeTypeNameFromRefs(self.allocator, element_types.items);
-            const expr = try self.makeExpr(.{ .named = type_name }, .{ .tuple = .{ .items = try items.toOwnedSlice() } });
-            expr.owned_type_name = @constCast(type_name);
+            const type_name = try makeTupleTypeNameFromRefs(self.allocator, element_types.items);
+            defer self.allocator.free(type_name);
+            const expr = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, type_name), .{ .tuple = .{ .items = try items.toOwnedSlice() } });
+            if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
             return expr;
         }
 
@@ -1836,11 +1810,12 @@ fn ExprParser(
                         .integer => |literal_length| {
                             if (literal_length >= 0) {
                                 const inferred_name = try makeFixedArrayTypeName(self.allocator, first.ty, @intCast(literal_length));
-                                const expr = try self.makeExpr(.{ .named = inferred_name }, .{ .array_repeat = .{
+                                defer self.allocator.free(inferred_name);
+                                const expr = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, inferred_name), .{ .array_repeat = .{
                                     .value = first,
                                     .length = length,
                                 } });
-                                expr.owned_type_name = @constCast(inferred_name);
+                                if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
                                 return expr;
                             }
                         },
@@ -1867,7 +1842,7 @@ fn ExprParser(
                 const item = try self.parseConversion();
                 self.expected_type = previous_expected;
                 if (!inferred_element_type.isUnsupported() and !item.ty.isUnsupported() and
-                    !callArgumentTypeCompatible(item.ty, inferred_element_type, inferred_element_type.displayName(), &.{}, false))
+                    !callArgumentTypeCompatible(item.ty, inferred_element_type, &.{}, false))
                 {
                     element_mismatch = true;
                     try self.diagnostics.add(.@"error", "type.expr.array.element", self.span, "array literal elements must have one element type", .{});
@@ -1890,8 +1865,9 @@ fn ExprParser(
             if (result_type.isUnsupported()) {
                 if (!inferred_element_type.isUnsupported() and !element_mismatch) {
                     const inferred_name = try makeFixedArrayTypeName(self.allocator, inferred_element_type, items.items.len);
-                    const expr = try self.makeExpr(.{ .named = inferred_name }, .{ .array = .{ .items = try items.toOwnedSlice() } });
-                    expr.owned_type_name = @constCast(inferred_name);
+                    defer self.allocator.free(inferred_name);
+                    const expr = try self.makeExpr(try typeRefFromStandaloneTypeText(self.allocator, inferred_name), .{ .array = .{ .items = try items.toOwnedSlice() } });
+                    if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
                     return expr;
                 }
                 try self.diagnostics.add(.@"error", "type.expr.array.type", self.span, "array literal requires a fixed array contextual type", .{});
@@ -2015,8 +1991,7 @@ fn ExprParser(
                 return expr;
             }
             if (self.expected_type == .named) {
-                const expected_name = self.expected_type.named;
-                if (try foreign_callable_types.parseSyntax(self.allocator, expected_name)) |syntax| {
+                if (try type_support.foreignCallableFromTypeRef(self.allocator, self.expected_type)) |syntax| {
                     var owned_syntax = syntax;
                     defer owned_syntax.deinit(self.allocator);
                     if (foreignCallablePrototypeCompatible(owned_syntax, prototype)) {
@@ -2028,16 +2003,17 @@ fn ExprParser(
             if (!usesOwnedPackedCallableInput(prototype.parameter_modes)) {
                 return expr;
             }
-            const input_type_name = try makeCallableInputTypeName(self.allocator, prototype.parameter_type_names);
+            const input_type_name = try makeCallableInputTypeNameFromRefs(self.allocator, prototype.parameter_types);
             defer self.allocator.free(input_type_name);
-            const callable_type_name = try makeCallableTypeName(
+            const callable_type_name = try makeCallableTypeNameFromRefs(
                 self.allocator,
                 prototype.is_suspend,
                 input_type_name,
-                prototype.return_type.displayName(),
+                prototype.return_type,
             );
-            expr.owned_type_name = @constCast(callable_type_name);
-            expr.ty = .{ .named = callable_type_name };
+            defer self.allocator.free(callable_type_name);
+            expr.ty = try typeRefFromStandaloneTypeText(self.allocator, callable_type_name);
+            if (expr.ty == .named) expr.owned_type_name = try self.allocator.dupe(u8, expr.ty.named);
             return expr;
         }
 
@@ -2102,10 +2078,11 @@ fn isComparisonExpr(expr: *const Expr) bool {
 fn typesEqualityComparable(lhs: types.TypeRef, rhs: types.TypeRef) bool {
     if (lhs.eql(rhs)) return typeSupportsBuiltinEquality(lhs);
     if (lhs == .named and rhs == .named) {
-        const lhs_pointer = raw_pointer.parse(lhs.named) orelse return false;
-        const rhs_pointer = raw_pointer.parse(rhs.named) orelse return false;
-        return std.mem.eql(u8, lhs_pointer.pointee, rhs_pointer.pointee) and
-            (lhs_pointer.access == rhs_pointer.access or lhs_pointer.access == .read or rhs_pointer.access == .read);
+        const lhs_pointer = type_support.rawPointerFromTypeRef(std.heap.page_allocator, lhs) catch return false;
+        const rhs_pointer = type_support.rawPointerFromTypeRef(std.heap.page_allocator, rhs) catch return false;
+        if (lhs_pointer == null or rhs_pointer == null) return false;
+        return lhs_pointer.?.pointee.eql(rhs_pointer.?.pointee) and
+            (lhs_pointer.?.access == rhs_pointer.?.access or lhs_pointer.?.access == .read or rhs_pointer.?.access == .read);
     }
     return false;
 }
@@ -2121,8 +2098,8 @@ fn typeSupportsBuiltinEquality(ty: types.TypeRef) bool {
             .str, .unsupported => false,
         },
         .named => |name| blk: {
-            if (raw_pointer.parse(name) != null) break :blk true;
-            if (foreign_callable_types.startsForeignCallableType(name)) break :blk true;
+            if ((type_support.rawPointerFromTypeRef(std.heap.page_allocator, ty) catch null) != null) break :blk true;
+            if ((type_support.foreignCallableFromTypeRef(std.heap.page_allocator, ty) catch null) != null) break :blk true;
             if (types.CAbiAlias.fromName(name)) |alias| break :blk alias != .c_void;
             if (std.mem.eql(u8, name, "Char") or std.mem.eql(u8, name, "IndexRange")) break :blk true;
             break :blk false;
@@ -2147,10 +2124,7 @@ fn typeSupportsBuiltinOrdering(ty: types.TypeRef) bool {
 }
 
 fn typeIsRawPointer(ty: types.TypeRef) bool {
-    return switch (ty) {
-        .named => |name| raw_pointer.parse(name) != null,
-        else => false,
-    };
+    return (type_support.rawPointerFromTypeRef(std.heap.page_allocator, ty) catch null) != null;
 }
 
 fn usesOwnedPackedCallableInput(parameter_modes: []const ParameterMode) bool {
@@ -2160,28 +2134,72 @@ fn usesOwnedPackedCallableInput(parameter_modes: []const ParameterMode) bool {
     return true;
 }
 
+fn typeRefFromName(raw: []const u8) types.TypeRef {
+    return typeRefFromStandaloneTypeText(std.heap.page_allocator, raw) catch .unsupported;
+}
+
+fn typeRefFromStandaloneTypeText(allocator: Allocator, raw: []const u8) !types.TypeRef {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .unsupported;
+    var syntax_value = (try type_text_syntax.lowerStandalone(allocator, trimmed)) orelse return .unsupported;
+    defer syntax_value.deinit(allocator);
+    return try type_lowering.typeRefFromSyntax(allocator, syntax_value);
+}
+
+fn baseTypeNameOrRaw(raw: []const u8) []const u8 {
+    const ty = typeRefFromName(raw);
+    const base = type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, ty) catch null;
+    return base orelse std.mem.trim(u8, raw, " \t\r\n");
+}
+
+fn tupleProjectionIndex(raw: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(usize, trimmed, 10) catch null;
+}
+
+fn makeTupleTypeNameFromRefs(allocator: Allocator, refs: []const types.TypeRef) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append('(');
+    for (refs, 0..) |ty, index| {
+        if (index != 0) try out.appendSlice(", ");
+        try out.appendSlice(type_support.typeRefRawName(ty));
+    }
+    try out.append(')');
+    return out.toOwnedSlice();
+}
+
+fn makeCallableInputTypeNameFromRefs(allocator: Allocator, parameter_types: []const types.TypeRef) ![]const u8 {
+    if (parameter_types.len == 0) return allocator.dupe(u8, "Unit");
+    if (parameter_types.len == 1) return allocator.dupe(u8, type_support.typeRefRawName(parameter_types[0]));
+    return makeTupleTypeNameFromRefs(allocator, parameter_types);
+}
+
+fn makeCallableTypeNameFromRefs(
+    allocator: Allocator,
+    is_suspend: bool,
+    input_type_name: []const u8,
+    output_type: types.TypeRef,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}[{s}, {s}]", .{
+        if (is_suspend) "__suspend_callread" else "__callread",
+        std.mem.trim(u8, input_type_name, " \t"),
+        type_support.typeRefRawName(output_type),
+    });
+}
+
 const FixedArrayShape = struct {
     element_type: types.TypeRef,
     length: ?usize,
 };
 
 fn fixedArrayShape(ty: types.TypeRef) ?FixedArrayShape {
-    const raw = switch (ty) {
-        .named => |name| std.mem.trim(u8, name, " \t"),
-        else => return null,
-    };
-    if (!std.mem.startsWith(u8, raw, "[")) return null;
-    const close_index = findMatchingDelimiter(raw, 0, '[', ']') orelse return null;
-    if (std.mem.trim(u8, raw[close_index + 1 ..], " \t").len != 0) return null;
-    const inner = raw[1..close_index];
-    const separator = findTopLevelHeaderScalar(inner, ';') orelse return null;
-    const element_type = std.mem.trim(u8, inner[0..separator], " \t");
-    const length_text = std.mem.trim(u8, inner[separator + 1 ..], " \t");
-    if (element_type.len == 0) return null;
-    const builtin = types.Builtin.fromName(element_type);
+    const shape = type_support.fixedArrayShapeFromTypeRef(std.heap.page_allocator, ty) catch return null;
+    const typed_shape = shape orelse return null;
     return .{
-        .element_type = if (builtin != .unsupported) types.TypeRef.fromBuiltin(builtin) else .{ .named = element_type },
-        .length = std.fmt.parseInt(usize, length_text, 10) catch null,
+        .element_type = typed_shape.element_type,
+        .length = if (typed_shape.length) |length| @intCast(length) else null,
     };
 }
 
@@ -2196,31 +2214,26 @@ fn fixedArrayLength(ty: types.TypeRef) ?usize {
 }
 
 fn makeFixedArrayTypeName(allocator: Allocator, element_type: types.TypeRef, length: usize) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "[{s}; {d}]", .{ element_type.displayName(), length });
+    return std.fmt.allocPrint(allocator, "[{s}; {d}]", .{ type_support.typeRefRawName(element_type), length });
 }
 
-fn dynamicLookupTypeSupported(allocator: Allocator, raw_type_name: []const u8) !bool {
-    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
-    if (std.mem.startsWith(u8, trimmed, "*read ") or std.mem.startsWith(u8, trimmed, "*edit ")) return true;
-    var syntax = try foreign_callable_types.parseSyntax(allocator, trimmed) orelse return false;
-    defer syntax.deinit(allocator);
-    return syntax.variadic_tail == null;
+fn dynamicLookupTypeSupported(allocator: Allocator, ty: types.TypeRef) !bool {
+    if ((try type_support.rawPointerFromTypeRef(allocator, ty)) != null) return true;
+    if (try type_support.foreignCallableFromTypeRef(allocator, ty)) |callable| {
+        var owned = callable;
+        defer owned.deinit(allocator);
+        return !owned.variadic;
+    }
+    return false;
 }
 
-fn dynamicLookupResultOkType(allocator: Allocator, raw_type_name: []const u8) !?[]const u8 {
-    const trimmed = std.mem.trim(u8, raw_type_name, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "Result[")) return null;
-    const open_index = "Result".len;
-    const close_index = findMatchingDelimiter(trimmed, open_index, '[', ']') orelse return null;
-    if (std.mem.trim(u8, trimmed[close_index + 1 ..], " \t\r\n").len != 0) return null;
-    const args = try typed_text.splitTopLevelCommaParts(allocator, trimmed[open_index + 1 .. close_index]);
+fn dynamicLookupResultOkType(allocator: Allocator, ty: types.TypeRef) !?types.TypeRef {
+    const args = try type_support.applicationArgsFromTypeRef(allocator, ty, "Result") orelse return null;
     defer allocator.free(args);
     if (args.len != 2) return null;
-    const ok_type = std.mem.trim(u8, args[0], " \t\r\n");
-    const err_type = std.mem.trim(u8, args[1], " \t\r\n");
-    if (!std.mem.eql(u8, err_type, dynamic_library.lookup_error_type_name)) return null;
-    if (!try dynamicLookupTypeSupported(allocator, ok_type)) return null;
-    return ok_type;
+    if (!std.mem.eql(u8, type_support.typeRefRawName(args[1]), dynamic_library.lookup_error_type_name)) return null;
+    if (!try dynamicLookupTypeSupported(allocator, args[0])) return null;
+    return args[0];
 }
 
 fn isAddressablePlace(expr: *const Expr) bool {

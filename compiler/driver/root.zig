@@ -416,7 +416,7 @@ fn deinitGlobalItemMetadata(allocator: Allocator, item: *GlobalItem) void {
     if (item.function_parameter_types) |value| allocator.free(value);
     if (item.function_parameter_type_names) |value| allocator.free(value);
     if (item.function_parameter_modes) |value| allocator.free(value);
-    if (item.struct_fields) |fields| allocator.free(fields);
+    if (item.struct_fields) |fields| typed.deinitStructFields(allocator, fields);
     if (item.enum_variants) |variants| {
         for (variants) |*variant| variant.deinit(allocator);
         allocator.free(variants);
@@ -452,7 +452,7 @@ fn resolveSinglePackageImports(allocator: Allocator, pipeline: *Pipeline) !void 
             if (entry.value_ptr.function_parameter_types) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_type_names) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_modes) |value| allocator.free(value);
-            if (entry.value_ptr.struct_fields) |fields| allocator.free(fields);
+            if (entry.value_ptr.struct_fields) |fields| typed.deinitStructFields(allocator, fields);
             if (entry.value_ptr.enum_variants) |variants| {
                 for (variants) |*variant| variant.deinit(allocator);
                 allocator.free(variants);
@@ -655,7 +655,7 @@ fn resolveGraphImports(allocator: Allocator, pipeline: *Pipeline, graph: GraphIn
             if (entry.value_ptr.function_parameter_types) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_type_names) |value| allocator.free(value);
             if (entry.value_ptr.function_parameter_modes) |value| allocator.free(value);
-            if (entry.value_ptr.struct_fields) |fields| allocator.free(fields);
+            if (entry.value_ptr.struct_fields) |fields| typed.deinitStructFields(allocator, fields);
             if (entry.value_ptr.enum_variants) |variants| {
                 for (variants) |*variant| variant.deinit(allocator);
                 allocator.free(variants);
@@ -847,9 +847,7 @@ fn findDependencyPackage(dependencies: []const GraphDependency, alias: []const u
 }
 
 fn duplicateStructFields(allocator: Allocator, fields: []const typed.StructField) ![]typed.StructField {
-    const duplicated = try allocator.alloc(typed.StructField, fields.len);
-    @memcpy(duplicated, fields);
-    return duplicated;
+    return typed.cloneStructFields(allocator, fields);
 }
 
 fn resolveStructFieldsForImport(allocator: Allocator, module: *const typed.Module, fields: []const typed.StructField) ![]typed.StructField {
@@ -860,7 +858,7 @@ fn resolveStructFieldsForImport(allocator: Allocator, module: *const typed.Modul
 
 fn resolveStructFieldsInPlace(module: *const typed.Module, fields: []typed.StructField) void {
     for (fields) |*field| {
-        field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+        field.ty = resolveModuleValueTypeSyntax(module, field.ty, field.type_syntax);
     }
 }
 
@@ -870,7 +868,7 @@ fn resolveEnumVariantsInPlace(module: *const typed.Module, variants: []typed.Enu
             .none => {},
             .tuple_fields => |tuple_fields| {
                 for (tuple_fields) |*field| {
-                    field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+                    field.ty = resolveModuleValueTypeSyntax(module, field.ty, field.type_syntax);
                 }
             },
             .named_fields => |named_fields| resolveStructFieldsInPlace(module, named_fields),
@@ -881,28 +879,22 @@ fn resolveEnumVariantsInPlace(module: *const typed.Module, variants: []typed.Enu
 fn resolveStructFieldsForImportOld(allocator: Allocator, module: *const typed.Module, fields: []const typed.StructField) ![]typed.StructField {
     const duplicated = try duplicateStructFields(allocator, fields);
     for (duplicated) |*field| {
-        field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+        field.ty = resolveModuleValueTypeSyntax(module, field.ty, field.type_syntax);
     }
     return duplicated;
 }
 
 fn duplicateEnumVariants(allocator: Allocator, variants: []const typed.EnumVariant) ![]typed.EnumVariant {
     const duplicated = try allocator.alloc(typed.EnumVariant, variants.len);
-    errdefer allocator.free(duplicated);
+    var initialized: usize = 0;
+    errdefer {
+        for (duplicated[0..initialized]) |*variant| variant.deinit(allocator);
+        allocator.free(duplicated);
+    }
 
     for (variants, 0..) |variant, variant_index| {
-        duplicated[variant_index] = .{
-            .name = variant.name,
-            .payload = switch (variant.payload) {
-                .none => .none,
-                .tuple_fields => |tuple_fields| blk: {
-                    const fields = try allocator.alloc(typed.TupleField, tuple_fields.len);
-                    @memcpy(fields, tuple_fields);
-                    break :blk .{ .tuple_fields = fields };
-                },
-                .named_fields => |named_fields| .{ .named_fields = try duplicateStructFields(allocator, named_fields) },
-            },
-        };
+        duplicated[variant_index] = try variant.clone(allocator);
+        initialized += 1;
     }
 
     return duplicated;
@@ -938,17 +930,23 @@ fn resolveEnumVariantsForImport(allocator: Allocator, module: *const typed.Modul
             .none => {},
             .tuple_fields => |tuple_fields| {
                 for (tuple_fields) |*field| {
-                    field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+                    field.ty = resolveModuleValueTypeSyntax(module, field.ty, field.type_syntax);
                 }
             },
             .named_fields => |named_fields| {
                 for (named_fields) |*field| {
-                    field.ty = resolveModuleValueType(module, field.ty, field.type_name);
+                    field.ty = resolveModuleValueTypeSyntax(module, field.ty, field.type_syntax);
                 }
             },
         }
     }
     return duplicated;
+}
+
+fn resolveModuleValueTypeSyntax(module: *const typed.Module, current: types.TypeRef, type_syntax: @import("../ast/root.zig").TypeSyntax) types.TypeRef {
+    if (!current.isUnsupported()) return current;
+    const type_name = type_syntax_support.isPlainName(type_syntax) orelse return .unsupported;
+    return resolveModuleValueType(module, current, type_name);
 }
 
 fn resolveModuleValueType(module: *const typed.Module, current: types.TypeRef, type_name: []const u8) types.TypeRef {

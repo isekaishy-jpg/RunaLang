@@ -4,11 +4,11 @@ const ast = @import("../ast/root.zig");
 const diag = @import("../diag/root.zig");
 const source = @import("../source/root.zig");
 const standard_families = @import("standard_families.zig");
+const type_support = @import("type_support.zig");
 const typed_expr = @import("../typed/expr.zig");
 const signatures = @import("signatures.zig");
 const typed_statement = @import("../typed/statement.zig");
 const typed_text = @import("text.zig");
-const tuple_types = @import("tuple_types.zig");
 const types = @import("../types/root.zig");
 const Allocator = std.mem.Allocator;
 const Expr = typed_expr.Expr;
@@ -301,23 +301,12 @@ fn parseTuplePatternSyntax(
     pattern_diagnostics: *PatternDiagnosticCollector,
     binding_names: *BindingNameSet,
 ) anyerror!SubjectPattern {
-    const subject_type_name = switch (subject.ty) {
-        .named => |name| name,
-        else => {
-            try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", span, "tuple subject patterns require a tuple-typed subject", .{});
-            return try makeInvalidSubjectPattern(allocator);
-        },
-    };
-    const parts = (try tuple_types.splitTypeParts(allocator, subject_type_name)) orelse {
+    const part_types = (try type_support.tupleElementTypes(allocator, subject.ty)) orelse {
         try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", span, "tuple subject patterns require a tuple-typed subject", .{});
         return try makeInvalidSubjectPattern(allocator);
     };
-    defer allocator.free(parts);
-    if (!tuple_types.validTupleParts(parts)) {
-        try pattern_diagnostics.add(.@"error", "type.pattern.tuple_subject", span, "tuple subject patterns require a tuple-typed subject", .{});
-        return try makeInvalidSubjectPattern(allocator);
-    }
-    if (items.len != parts.len) {
+    defer allocator.free(part_types);
+    if (items.len != part_types.len) {
         try pattern_diagnostics.add(.@"error", "type.pattern.tuple_arity", span, "tuple pattern has wrong arity", .{});
         return try makeInvalidSubjectPattern(allocator);
     }
@@ -334,8 +323,8 @@ fn parseTuplePatternSyntax(
     }
 
     var irrefutable = true;
-    for (items, parts, 0..) |item_pattern, part, index| {
-        const field_subject = try makeFieldExpr(allocator, subject, tuple_types.shallowTypeRefFromName(part), tuplePayloadFieldName(index));
+    for (items, part_types, 0..) |item_pattern, part_type, index| {
+        const field_subject = try makeFieldExpr(allocator, subject, part_type, tuplePayloadFieldName(index));
         defer {
             field_subject.deinit(allocator);
             allocator.destroy(field_subject);
@@ -452,8 +441,8 @@ fn parseStructPatternSyntax(
     pattern_diagnostics: *PatternDiagnosticCollector,
     binding_names: *BindingNameSet,
 ) anyerror!SubjectPattern {
-    const subject_struct_name = switch (subject.ty) {
-        .named => |name| name,
+    const subject_struct_name = (try type_support.baseTypeNameFromTypeRef(allocator, subject.ty)) orelse switch (subject.ty) {
+        .named => type_support.typeRefRawName(subject.ty),
         else => {
             try pattern_diagnostics.add(.@"error", "type.pattern.struct_subject", span, "struct patterns require a struct-typed subject", .{});
             return try makeInvalidSubjectPattern(allocator);
@@ -898,9 +887,9 @@ fn parseStandardEnumVariantSubjectPatternSyntax(
     };
 
     const subject_tag = try makeFieldExpr(allocator, subject, types.TypeRef.fromBuiltin(.i32), "tag");
-    const tag_condition = try makeEqExpr(allocator, subject_tag, try makeEnumTagExprRaw(allocator, variant.concrete_type_name, variant.family_name, variant.variant_name));
+    const tag_condition = try makeEqExpr(allocator, subject_tag, try makeEnumTagExprRaw(allocator, type_support.typeRefRawName(variant.concrete_type), variant.family_name, variant.variant_name));
 
-    const payload_type_name = variant.payload_type_name orelse {
+    const payload_type = variant.payload_type orelse {
         switch (aggregate.payload) {
             .none => {},
             else => {
@@ -954,7 +943,7 @@ fn parseStandardEnumVariantSubjectPatternSyntax(
         subject,
         variant.variant_name,
         variant.payload_field_name.?,
-        standard_families.typeRefFromName(payload_type_name),
+        payload_type,
     );
     defer {
         field_subject.deinit(allocator);

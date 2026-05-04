@@ -1,6 +1,5 @@
 const std = @import("std");
 const diag = @import("../diag/root.zig");
-const typed_text = @import("text.zig");
 const type_support = @import("type_support.zig");
 const types = @import("../types/root.zig");
 const checked_body = @import("checked_body.zig");
@@ -94,8 +93,8 @@ fn validateDispatchSite(
                 );
             }
 
-            const input_type_name = site.input_type_name orelse return;
-            const input_parts = try callableInputTypeParts(allocator, input_type_name);
+            const input_type = site.input_type orelse return;
+            const input_parts = try callableInputTypes(allocator, input_type);
             defer allocator.free(input_parts);
             if (site.arg_count != input_parts.len) {
                 summary.rejected_arity_count += 1;
@@ -109,11 +108,10 @@ fn validateDispatchSite(
                 return;
             }
 
-            for (input_parts, 0..) |expected_type_name, index| {
-                const expected_type = shallowTypeRefFromName(expected_type_name);
+            for (input_parts, 0..) |expected_type, index| {
                 const actual_type = site.arg_types[index];
                 if (!actual_type.isUnsupported() and !expected_type.isUnsupported() and
-                    !type_support.callArgumentTypeCompatible(actual_type, expected_type, expected_type_name, &.{}, false))
+                    !type_support.callArgumentTypeCompatible(actual_type, expected_type, &.{}, false))
                 {
                     summary.rejected_arg_count += 1;
                     try diagnostics.add(
@@ -129,42 +127,14 @@ fn validateDispatchSite(
     }
 }
 
-fn callableInputTypeParts(allocator: std.mem.Allocator, input_type_name: []const u8) ![][]const u8 {
-    const trimmed = std.mem.trim(u8, input_type_name, " \t");
-    if (std.mem.eql(u8, trimmed, "Unit")) return allocator.alloc([]const u8, 0);
+fn callableInputTypes(allocator: std.mem.Allocator, input_type: types.TypeRef) ![]types.TypeRef {
+    if (input_type.eql(types.TypeRef.fromBuiltin(.unit))) return allocator.alloc(types.TypeRef, 0);
 
-    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
-        const inside = trimmed[1 .. trimmed.len - 1];
-        if (hasTopLevelComma(inside)) return typed_text.splitTopLevelCommaParts(allocator, inside);
+    if (try type_support.tupleElementTypes(allocator, input_type)) |parts| {
+        return parts;
     }
 
-    const parts = try allocator.alloc([]const u8, 1);
-    parts[0] = trimmed;
+    const parts = try allocator.alloc(types.TypeRef, 1);
+    parts[0] = input_type;
     return parts;
-}
-
-fn hasTopLevelComma(raw: []const u8) bool {
-    var paren_depth: usize = 0;
-    var bracket_depth: usize = 0;
-    for (raw) |byte| {
-        switch (byte) {
-            '(' => paren_depth += 1,
-            ')' => {
-                if (paren_depth > 0) paren_depth -= 1;
-            },
-            '[' => bracket_depth += 1,
-            ']' => {
-                if (bracket_depth > 0) bracket_depth -= 1;
-            },
-            ',' => if (paren_depth == 0 and bracket_depth == 0) return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn shallowTypeRefFromName(raw: []const u8) types.TypeRef {
-    const builtin = types.Builtin.fromName(raw);
-    if (builtin != .unsupported) return types.TypeRef.fromBuiltin(builtin);
-    return .{ .named = raw };
 }

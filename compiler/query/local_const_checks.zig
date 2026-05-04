@@ -4,7 +4,8 @@ const diag = @import("../diag/root.zig");
 const session = @import("../session/root.zig");
 const source = @import("../source/root.zig");
 const typed = @import("../typed/root.zig");
-const typed_text = @import("text.zig");
+const type_support = @import("type_support.zig");
+const standard_families = @import("standard_families.zig");
 const types = @import("../types/root.zig");
 const checked_body = @import("checked_body.zig");
 const query_types = @import("types.zig");
@@ -468,20 +469,25 @@ fn reportArrayRepetitionLengthError(diagnostics: *diag.Bag, span: ?source.Span, 
 }
 
 fn constSafeType(env: *LocalEnv, ty: types.TypeRef) bool {
+    if (constSafeKnownNominalType(env, ty)) |is_safe| return is_safe;
+    if (type_support.fixedArrayElementType(env.allocator, ty) catch null) |element_ty| {
+        return constSafeType(env, element_ty);
+    }
     return switch (ty) {
         .builtin => |builtin| switch (builtin) {
             .bool, .i32, .u32, .index, .isize, .str => true,
             .unit, .unsupported => false,
         },
-        .named => |name| constSafeNamedType(env, name),
+        .named => |name| constSafeNamedNominalType(
+            env,
+            (type_support.baseTypeNameFromTypeRef(env.allocator, ty) catch null) orelse name,
+        ),
         .unsupported => false,
     };
 }
 
-fn constSafeNamedType(env: *LocalEnv, name: []const u8) bool {
+fn constSafeNamedNominalType(env: *LocalEnv, name: []const u8) bool {
     const trimmed = std.mem.trim(u8, name, " \t");
-    if (std.mem.startsWith(u8, trimmed, "[")) return constSafeArrayType(env, trimmed);
-    if (constSafeKnownNominalType(env, trimmed)) |is_safe| return is_safe;
     const item_id = typeItemId(env, trimmed) orelse return false;
     const signature = env.resolve_signature(env.active, item_id) catch return false;
     return switch (signature.facts) {
@@ -507,46 +513,19 @@ fn constSafeNamedType(env: *LocalEnv, name: []const u8) bool {
     };
 }
 
-fn constSafeKnownNominalType(env: *LocalEnv, name: []const u8) ?bool {
+fn constSafeKnownNominalType(env: *LocalEnv, ty: types.TypeRef) ?bool {
+    const name = (type_support.baseTypeNameFromTypeRef(env.allocator, ty) catch null) orelse type_support.typeRefRawName(ty);
     if (std.mem.eql(u8, name, "ConvertError")) return true;
-
-    const open_index = std.mem.indexOfScalar(u8, name, '[') orelse {
-        if (std.mem.eql(u8, name, "Option") or std.mem.eql(u8, name, "Result")) return false;
-        return null;
-    };
-    const close_index = typed_text.findMatchingDelimiter(name, open_index, '[', ']') orelse return false;
-    if (std.mem.trim(u8, name[close_index + 1 ..], " \t").len != 0) return false;
-
-    const base_name = std.mem.trim(u8, name[0..open_index], " \t");
-    const args = name[open_index + 1 .. close_index];
-    if (std.mem.eql(u8, base_name, "Option")) {
-        if (typed_text.findTopLevelHeaderScalar(args, ',') != null) return false;
-        return constSafeTypeName(env, args);
+    if (standard_families.applicationArgRefsForFamily(env.allocator, ty, .option) catch null) |args| {
+        defer env.allocator.free(args);
+        if (args.len != 1) return false;
+        return constSafeType(env, args[0]);
     }
-    if (std.mem.eql(u8, base_name, "Result")) {
-        const separator = typed_text.findTopLevelHeaderScalar(args, ',') orelse return false;
-        const ok_type = args[0..separator];
-        const err_type = args[separator + 1 ..];
-        return constSafeTypeName(env, ok_type) and constSafeTypeName(env, err_type);
+    if (standard_families.applicationArgRefsForFamily(env.allocator, ty, .result) catch null) |args| {
+        defer env.allocator.free(args);
+        if (args.len != 2) return false;
+        return constSafeType(env, args[0]) and constSafeType(env, args[1]);
     }
+    if (std.mem.eql(u8, name, "Option") or std.mem.eql(u8, name, "Result")) return false;
     return null;
-}
-
-fn constSafeTypeName(env: *LocalEnv, raw: []const u8) bool {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) return false;
-    const builtin = types.Builtin.fromName(trimmed);
-    if (builtin != .unsupported) return constSafeType(env, types.TypeRef.fromBuiltin(builtin));
-    return constSafeNamedType(env, trimmed);
-}
-
-fn constSafeArrayType(env: *LocalEnv, name: []const u8) bool {
-    const trimmed = std.mem.trim(u8, name, " \t");
-    const close_index = typed_text.findMatchingDelimiter(trimmed, 0, '[', ']') orelse return false;
-    const inner = trimmed[1..close_index];
-    const separator = typed_text.findTopLevelHeaderScalar(inner, ';') orelse return false;
-    const element = std.mem.trim(u8, inner[0..separator], " \t");
-    const builtin = types.Builtin.fromName(element);
-    const element_ty = if (builtin != .unsupported) types.TypeRef.fromBuiltin(builtin) else types.TypeRef{ .named = element };
-    return constSafeType(env, element_ty);
 }

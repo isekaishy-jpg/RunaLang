@@ -29,6 +29,22 @@ fn associatedTypeEqualsForTest(
     return compiler.query.associatedTypeEqualsKey(active, key, associated_name, value_type_name, where_predicates);
 }
 
+fn canonicalTypeForTextForTest(
+    active: *compiler.session.Session,
+    module_id: compiler.session.ModuleId,
+    raw: []const u8,
+) !compiler.types.CanonicalTypeId {
+    var syntax_value = (try compiler.parse.type_text_syntax.lowerStandalone(std.testing.allocator, raw)) orelse return error.UnexpectedStructure;
+    defer syntax_value.deinit(std.testing.allocator);
+    return compiler.query.testing.canonicalTypeForSyntax(active, module_id, syntax_value);
+}
+
+fn typeRefFromTextForTest(raw: []const u8) !compiler.types.TypeRef {
+    var syntax_value = (try compiler.parse.type_text_syntax.lowerStandalone(std.testing.allocator, raw)) orelse return error.UnexpectedStructure;
+    defer syntax_value.deinit(std.testing.allocator);
+    return compiler.query.testing.typeRefFromSyntax(syntax_value);
+}
+
 test "scaffold roots exist" {
     const required = [_][]const u8{
         "cmd",
@@ -192,9 +208,10 @@ test "std option and result language surfaces declare canonical helpers" {
             .option => "Option[I32]",
             .result => "Result[I32, Bool]",
         };
+        const concrete_type = try typeRefFromTextForTest(concrete_type_name);
         try std.testing.expectEqualStrings(
             surface.true_variant_name,
-            compiler.query.standard_families.helperVariant(concrete_type_name, surface.method_name).?,
+            (try compiler.query.standard_families.helperVariantForTypeRef(std.testing.allocator, concrete_type, surface.method_name)).?,
         );
     }
 
@@ -1541,8 +1558,8 @@ test "canonical type query uses semantic ids for nominal names" {
     defer active.deinit();
     try std.testing.expect(active.moduleCount() >= 2);
 
-    const first = try compiler.query.testing.canonicalTypeForName(&active, .{ .index = 0 }, "Thing");
-    const second = try compiler.query.testing.canonicalTypeForName(&active, .{ .index = 1 }, "Thing");
+    const first = try canonicalTypeForTextForTest(&active, .{ .index = 0 }, "Thing");
+    const second = try canonicalTypeForTextForTest(&active, .{ .index = 1 }, "Thing");
     try std.testing.expect(!first.eql(second));
 
     const first_key = compiler.query.testing.canonicalTypeKey(&active, first) orelse return error.UnexpectedStructure;
@@ -1581,7 +1598,7 @@ test "canonical type query interns structural arrays callables and C aliases" {
 
     const module_id = compiler.session.ModuleId{ .index = 0 };
     const i32_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, compiler.types.TypeRef.fromBuiltin(.i32));
-    const c_int_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CInt");
+    const c_int_type = try canonicalTypeForTextForTest(&active, module_id, "CInt");
     try std.testing.expect(!i32_type.eql(c_int_type));
     switch (compiler.query.testing.canonicalTypeKey(&active, c_int_type) orelse return error.UnexpectedStructure) {
         .c_abi_alias => |alias| try std.testing.expectEqual(compiler.types.CAbiAlias.c_int, alias),
@@ -1635,9 +1652,9 @@ test "canonical type query interns standard option and result families" {
     defer active.deinit();
 
     const module_id = compiler.session.ModuleId{ .index = 0 };
-    const option_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Option[I32]");
+    const option_type = try canonicalTypeForTextForTest(&active, module_id, "Option[I32]");
     const option_key = compiler.query.testing.canonicalTypeKey(&active, option_type) orelse return error.UnexpectedStructure;
-    const i32_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "I32");
+    const i32_type = try canonicalTypeForTextForTest(&active, module_id, "I32");
     switch (option_key) {
         .option => |option| try std.testing.expect(option.payload.eql(i32_type)),
         else => return error.UnexpectedStructure,
@@ -1651,9 +1668,9 @@ test "canonical type query interns standard option and result families" {
     try std.testing.expect(!option_abi.passable);
     try std.testing.expect(!option_abi.returnable);
 
-    const result_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Result[I32, Bool]");
+    const result_type = try canonicalTypeForTextForTest(&active, module_id, "Result[I32, Bool]");
     const result_key = compiler.query.testing.canonicalTypeKey(&active, result_type) orelse return error.UnexpectedStructure;
-    const bool_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Bool");
+    const bool_type = try canonicalTypeForTextForTest(&active, module_id, "Bool");
     switch (result_key) {
         .result => |result| {
             try std.testing.expect(result.ok.eql(i32_type));
@@ -1670,14 +1687,51 @@ test "canonical type query interns standard option and result families" {
     try std.testing.expect(!result_abi.passable);
     try std.testing.expect(!result_abi.returnable);
 
-    const nested_result_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Result[Result[I32, Bool], Option[Bool]]");
+    const nested_result_type = try canonicalTypeForTextForTest(&active, module_id, "Result[Result[I32, Bool], Option[Bool]]");
     const nested_key = compiler.query.testing.canonicalTypeKey(&active, nested_result_type) orelse return error.UnexpectedStructure;
     switch (nested_key) {
         .result => |result| {
             try std.testing.expect(result.ok.eql(result_type));
-            const option_bool_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Option[Bool]");
+            const option_bool_type = try canonicalTypeForTextForTest(&active, module_id, "Option[Bool]");
             try std.testing.expect(result.err.eql(option_bool_type));
         },
+        else => return error.UnexpectedStructure,
+    }
+}
+
+test "canonical type query keeps non-std Option applications nominal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.rna",
+        .data =
+        \\enum Option[T]:
+        \\    Some(T)
+        \\    None
+        \\    
+        \\fn main() -> I32:
+        \\    return 1
+        ,
+    });
+
+    const main_path = try std.fs.path.join(std.testing.allocator, &.{ root, "main.rna" });
+    defer std.testing.allocator.free(main_path);
+
+    var active = try compiler.session.prepareFiles(std.testing.allocator, std.testing.io, &.{main_path});
+    defer active.deinit();
+
+    const module_id = compiler.session.ModuleId{ .index = 0 };
+    const option_type = try canonicalTypeForTextForTest(&active, module_id, "Option[I32]");
+    const option_key = compiler.query.testing.canonicalTypeKey(&active, option_type) orelse return error.UnexpectedStructure;
+    switch (option_key) {
+        .generic_application => |application| {
+            try std.testing.expectEqual(@as(?compiler.query.standard_families.Family, null), compiler.query.standard_families.familyForCanonicalType(&active, application.base));
+        },
+        .option, .result => return error.UnexpectedStructure,
         else => return error.UnexpectedStructure,
     }
 }
@@ -1707,7 +1761,7 @@ test "canonical type query marks capability handles as handle families" {
     defer active.deinit();
 
     const module_id = compiler.session.ModuleId{ .index = 0 };
-    const handle_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Handle");
+    const handle_type = try canonicalTypeForTextForTest(&active, module_id, "Handle");
     const handle_key = compiler.query.testing.canonicalTypeKey(&active, handle_type) orelse return error.UnexpectedStructure;
     const target_type = switch (handle_key) {
         .handle => |handle| handle.target,
@@ -1755,12 +1809,12 @@ test "type aliases canonicalize to targets without nominal identity" {
     try std.testing.expect(alias.target_type.eql(compiler.types.TypeRef.fromBuiltin(.i32)));
     try std.testing.expect(count_signature.surface.nominal_item_id == null);
 
-    const count_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Count");
-    const i32_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "I32");
+    const count_type = try canonicalTypeForTextForTest(&active, module_id, "Count");
+    const i32_type = try canonicalTypeForTextForTest(&active, module_id, "I32");
     try std.testing.expect(count_type.eql(i32_type));
 
-    const word_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Word");
-    const c_uint_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CUInt");
+    const word_type = try canonicalTypeForTextForTest(&active, module_id, "Word");
+    const c_uint_type = try canonicalTypeForTextForTest(&active, module_id, "CUInt");
     try std.testing.expect(word_type.eql(c_uint_type));
 
     const main_signature = try compiler.query.checkedSignature(&active, compiler.query.testing.findItemIdByName(&active, "main").?);
@@ -2123,7 +2177,7 @@ test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" 
     try std.testing.expectEqual(@as(u64, 8), pointer_layout.size.?);
     try std.testing.expect(pointer_layout.foreign_stable);
 
-    const point_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Point");
+    const point_type = try canonicalTypeForTextForTest(&active, module_id, "Point");
     const point_layout = try compiler.query.layoutForCanonicalType(&active, point_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"struct", point_layout.storage);
     try std.testing.expect(point_layout.foreign_stable);
@@ -2132,18 +2186,18 @@ test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" 
     try std.testing.expectEqual(@as(u64, 0), point_layout.fields[0].offset);
     try std.testing.expectEqual(@as(u64, 4), point_layout.fields[1].offset);
 
-    const plain_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Plain");
+    const plain_type = try canonicalTypeForTextForTest(&active, module_id, "Plain");
     const plain_layout = try compiler.query.layoutForCanonicalType(&active, plain_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"struct", plain_layout.storage);
     try std.testing.expect(!plain_layout.foreign_stable);
 
-    const union_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "NumberBits");
+    const union_type = try canonicalTypeForTextForTest(&active, module_id, "NumberBits");
     const union_layout = try compiler.query.layoutForCanonicalType(&active, union_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"union", union_layout.storage);
     try std.testing.expect(union_layout.foreign_stable);
     try std.testing.expectEqual(@as(u64, 4), union_layout.size.?);
 
-    const status_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Status");
+    const status_type = try canonicalTypeForTextForTest(&active, module_id, "Status");
     const status_layout = try compiler.query.layoutForCanonicalType(&active, status_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"enum", status_layout.storage);
     try std.testing.expect(status_layout.foreign_stable);
@@ -2152,7 +2206,7 @@ test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" 
     try std.testing.expectEqual(@as(i128, 0), status_layout.variants[0].tag_value);
     try std.testing.expectEqual(@as(i128, 1), status_layout.variants[1].tag_value);
 
-    const option_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Option[I32]");
+    const option_type = try canonicalTypeForTextForTest(&active, module_id, "Option[I32]");
     const option_layout = try compiler.query.layoutForCanonicalType(&active, option_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, option_layout.status);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"enum", option_layout.storage);
@@ -2163,7 +2217,7 @@ test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" 
     try std.testing.expectEqual(@as(i128, 1), option_layout.variants[1].tag_value);
     try std.testing.expectEqual(option_type.index, option_layout.key.type_id.index);
 
-    const result_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Result[I32, Bool]");
+    const result_type = try canonicalTypeForTextForTest(&active, module_id, "Result[I32, Bool]");
     const result_layout = try compiler.query.layoutForCanonicalType(&active, result_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.LayoutStatus.sized, result_layout.status);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"enum", result_layout.storage);
@@ -2173,7 +2227,7 @@ test "stage0 layout covers scalars arrays aggregates enums opaque and pointers" 
     try std.testing.expectEqual(@as(i128, 0), result_layout.variants[0].tag_value);
     try std.testing.expectEqual(@as(i128, 1), result_layout.variants[1].tag_value);
 
-    const token_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Token");
+    const token_type = try canonicalTypeForTextForTest(&active, module_id, "Token");
     const token_layout = try compiler.query.layoutForCanonicalType(&active, token_type, target_name, .default);
     try std.testing.expectEqual(compiler.layout.LayoutStatus.unsized, token_layout.status);
     try std.testing.expectEqual(compiler.layout.StorageShape.@"opaque", token_layout.storage);
@@ -2275,7 +2329,7 @@ test "c and system abi classification covers first wave stage0 surfaces" {
 
     const module_id = compiler.session.ModuleId{ .index = 0 };
     const target_name = compiler.target.hostName();
-    const c_int_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CInt");
+    const c_int_type = try canonicalTypeForTextForTest(&active, module_id, "CInt");
     const c_int_abi = try compiler.query.abiTypeForKey(&active, .{
         .type_id = c_int_type,
         .target_name = target_name,
@@ -2285,9 +2339,7 @@ test "c and system abi classification covers first wave stage0 surfaces" {
     try std.testing.expect(c_int_abi.passable);
     try std.testing.expect(c_int_abi.returnable);
 
-    const c_callback_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, .{
-        .named = "extern[\"c\"] fn(CInt, CInt) -> CInt",
-    });
+    const c_callback_type = try canonicalTypeForTextForTest(&active, module_id, "extern[\"c\"] fn(CInt, CInt) -> CInt");
     switch (compiler.query.testing.canonicalTypeKey(&active, c_callback_type) orelse return error.UnexpectedStructure) {
         .callable => |callable| {
             try std.testing.expectEqual(compiler.types.CallableAbi.c, callable.abi);
@@ -2323,9 +2375,7 @@ test "c and system abi classification covers first wave stage0 surfaces" {
     try std.testing.expect(c_callback_surface.callable_safe);
     try std.testing.expect(c_callback_surface.callback);
 
-    const system_callback_type = try compiler.query.testing.canonicalTypeForTypeRef(&active, module_id, .{
-        .named = "extern[\"system\"] fn(*read CVoid) -> CVoid",
-    });
+    const system_callback_type = try canonicalTypeForTextForTest(&active, module_id, "extern[\"system\"] fn(*read CVoid) -> CVoid");
     const system_callback_abi = try compiler.query.abiTypeForKey(&active, .{
         .type_id = system_callback_type,
         .target_name = target_name,
@@ -2365,7 +2415,7 @@ test "c and system abi classification covers first wave stage0 surfaces" {
     try std.testing.expect(!array_abi.passable);
     try std.testing.expect(!array_abi.returnable);
 
-    const c_char_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "CChar");
+    const c_char_type = try canonicalTypeForTextForTest(&active, module_id, "CChar");
     const read_c_char_type = try compiler.query.testing.canonicalTypeForKey(&active, .{ .raw_pointer = .{
         .access = .read,
         .pointee = c_char_type,
@@ -2379,7 +2429,7 @@ test "c and system abi classification covers first wave stage0 surfaces" {
     try std.testing.expect(read_c_char_abi.passable);
     try std.testing.expect(read_c_char_abi.returnable);
 
-    const point_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Point");
+    const point_type = try canonicalTypeForTextForTest(&active, module_id, "Point");
     const point_abi = try compiler.query.abiTypeForKey(&active, .{
         .type_id = point_type,
         .target_name = target_name,
@@ -2388,7 +2438,7 @@ test "c and system abi classification covers first wave stage0 surfaces" {
     try std.testing.expect(point_abi.safe);
     try std.testing.expect(point_abi.passable);
 
-    const plain_type = try compiler.query.testing.canonicalTypeForName(&active, module_id, "Plain");
+    const plain_type = try canonicalTypeForTextForTest(&active, module_id, "Plain");
     const plain_abi = try compiler.query.abiTypeForKey(&active, .{
         .type_id = plain_type,
         .target_name = target_name,
@@ -10591,7 +10641,12 @@ test "trait solver satisfies builtin Send from where environment" {
     const where_env = [_]compiler.typed.WherePredicate{
         .{ .bound = .{
             .subject_name = "T",
-            .contract_name = "Send",
+            .contract_type_syntax = .{
+                .source = .{
+                    .text = "Send",
+                    .span = .{ .file_id = 0, .start = 0, .end = 4 },
+                },
+            },
         } },
     };
 

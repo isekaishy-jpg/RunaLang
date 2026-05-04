@@ -6,12 +6,12 @@ const callee_helpers = @import("callee_helpers.zig");
 const boundary_checks = @import("boundary_checks.zig");
 const query_types = @import("types.zig");
 const domain_state_types = @import("domain_state_types.zig");
+const type_text_syntax = @import("../parse/type_text_syntax.zig");
+const type_forms = @import("type_forms.zig");
+const type_lowering = @import("type_lowering.zig");
+const type_syntax_support = @import("../type_syntax_support.zig");
 const type_support = @import("type_support.zig");
-const typed_text = @import("text.zig");
 const types = @import("../types/root.zig");
-
-const parseBoundaryType = type_support.parseBoundaryType;
-const baseTypeName = typed_text.baseTypeName;
 
 pub const DomainTypeRef = struct {
     item_id: session.ItemId,
@@ -79,7 +79,8 @@ pub fn validateSignature(
     };
 
     for (function.parameters) |parameter| {
-        if (classifyTypeName(active, checked.module_id, parameter.ty.displayName())) |domain_ref| {
+        if (classifyTypeRef(active, checked.module_id, parameter.ty)) |domain_ref| {
+            const target_name = targetTypeNameFromSyntaxOrType(active, parameter.type_syntax, parameter.ty);
             try diagnostics.add(
                 .@"error",
                 "type.domain_state.boundary_param",
@@ -88,13 +89,14 @@ pub fn validateSignature(
                 .{
                     item.name,
                     kindLabel(domain_ref.kind),
-                    baseTypeName(parseBoundaryType(parameter.ty.displayName()).inner_type_name),
+                    target_name,
                 },
             );
         }
     }
 
-    if (classifyTypeName(active, checked.module_id, function.return_type.displayName())) |domain_ref| {
+    if (classifyTypeRef(active, checked.module_id, function.return_type)) |domain_ref| {
+        const target_name = targetTypeNameFromSyntaxOrType(active, function.return_type_syntax, function.return_type);
         try diagnostics.add(
             .@"error",
             "type.domain_state.boundary_return",
@@ -103,7 +105,7 @@ pub fn validateSignature(
             .{
                 item.name,
                 kindLabel(domain_ref.kind),
-                baseTypeName(parseBoundaryType(function.return_type.displayName()).inner_type_name),
+                target_name,
             },
         );
     }
@@ -142,10 +144,10 @@ fn validateRootDeclaration(
     var invalid_anchor_count: usize = 0;
 
     for (fields) |field| {
-        const boundary = parseBoundaryType(field.type_name);
+        const boundary = boundaryFromSyntaxOrType(field.type_syntax, field.ty);
         if (!isRetainedBoundary(boundary.kind)) continue;
 
-        const target_name = baseTypeName(boundary.inner_type_name);
+        const target_name = targetTypeNameFromSyntaxOrType(active, field.type_syntax, field.ty);
         if (target_name.len == 0) {
             invalid_anchor_count += 1;
             try diagnostics.add(.@"error", "type.domain_root.parent_anchor_target", checked.item.span, "#domain_root '{s}' retained parent-anchor field '{s}' must target a different #domain_root type", .{ checked.item.name, field.name });
@@ -210,10 +212,10 @@ fn validateContextDeclaration(
     var invalid_anchor_count: usize = 0;
 
     for (fields) |field| {
-        const boundary = parseBoundaryType(field.type_name);
+        const boundary = boundaryFromSyntaxOrType(field.type_syntax, field.ty);
         if (!isRetainedBoundary(boundary.kind)) continue;
 
-        const target_name = baseTypeName(boundary.inner_type_name);
+        const target_name = targetTypeNameFromSyntaxOrType(active, field.type_syntax, field.ty);
         const domain_ref = if (target_name.len == 0)
             null
         else
@@ -256,24 +258,21 @@ fn validateContextDeclaration(
     }
 }
 
-pub fn classifyTypeName(
-    active: *const session.Session,
-    module_id: session.ModuleId,
-    raw_type_name: []const u8,
-) ?DomainTypeRef {
-    const boundary = parseBoundaryType(raw_type_name);
-    const target_name = baseTypeName(boundary.inner_type_name);
-    if (target_name.len == 0) return null;
-
-    return resolveDomainTypeByName(active, module_id, target_name);
-}
-
 pub fn classifyExpr(
     active: *const session.Session,
     module_id: session.ModuleId,
     expr: *const typed.Expr,
 ) ?DomainTypeRef {
-    return classifyTypeName(active, module_id, type_support.typeRefRawName(expr.ty));
+    return classifyTypeRef(active, module_id, expr.ty);
+}
+
+pub fn classifyTypeName(
+    active: *const session.Session,
+    module_id: session.ModuleId,
+    raw_type_name: []const u8,
+) ?DomainTypeRef {
+    const ty = typeRefFromStandaloneTypeText(std.heap.page_allocator, raw_type_name) catch return null;
+    return classifyTypeRef(active, module_id, ty);
 }
 
 pub fn classifyTypeRef(
@@ -281,10 +280,10 @@ pub fn classifyTypeRef(
     module_id: session.ModuleId,
     ty: types.TypeRef,
 ) ?DomainTypeRef {
-    return switch (ty) {
-        .named => |name| classifyTypeName(active, module_id, name),
-        else => null,
-    };
+    const boundary = type_support.boundaryFromTypeRef(ty);
+    const target_name = targetTypeNameForTypeRef(active, boundary.inner_type);
+    if (target_name.len == 0) return null;
+    return resolveDomainTypeByName(active, module_id, target_name);
 }
 
 pub fn resolveBoundaryApiFunction(
@@ -343,10 +342,10 @@ fn singleValidAnchor(
 ) ?Anchor {
     var found: ?Anchor = null;
     for (fields) |field| {
-        const boundary = parseBoundaryType(field.type_name);
+        const boundary = boundaryFromSyntaxOrType(field.type_syntax, field.ty);
         if (!isRetainedBoundary(boundary.kind)) continue;
 
-        const target_name = baseTypeName(boundary.inner_type_name);
+        const target_name = targetTypeNameFromSyntaxOrType(active, field.type_syntax, field.ty);
         if (target_name.len == 0) continue;
         if (reject_self_target and std.mem.eql(u8, target_name, owner_name)) continue;
 
@@ -419,4 +418,79 @@ fn kindLabel(kind: DomainTypeRef.Kind) []const u8 {
         .root => "#domain_root",
         .context => "#domain_context",
     };
+}
+
+fn targetTypeName(active: *const session.Session, raw: []const u8) []const u8 {
+    return targetTypeNameConst(active, raw);
+}
+
+fn targetTypeNameConst(active: *const session.Session, raw: []const u8) []const u8 {
+    _ = active;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const ty = typeRefFromStandaloneTypeText(std.heap.page_allocator, trimmed) catch return trimmed;
+    return type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, ty) catch trimmed orelse trimmed;
+}
+
+fn targetTypeNameForTypeRef(active: *const session.Session, ty: types.TypeRef) []const u8 {
+    _ = active;
+    return type_support.baseTypeNameFromTypeRef(std.heap.page_allocator, ty) catch "" orelse "";
+}
+
+fn boundaryFromSyntaxOrType(type_syntax: ?@import("../ast/root.zig").TypeSyntax, ty: types.TypeRef) type_support.BoundaryType {
+    if (type_syntax) |syntax_value| {
+        if (!type_syntax_support.containsInvalid(syntax_value)) {
+            return type_support.boundaryFromSyntax(std.heap.page_allocator, syntax_value) catch type_support.boundaryFromTypeRef(ty);
+        }
+    }
+    return type_support.boundaryFromTypeRef(ty);
+}
+
+fn targetTypeNameFromSyntaxOrType(
+    active: *const session.Session,
+    type_syntax: ?@import("../ast/root.zig").TypeSyntax,
+    ty: types.TypeRef,
+) []const u8 {
+    if (type_syntax) |syntax_value| {
+        if (targetTypeNameFromSyntax(syntax_value)) |name| return name;
+    }
+    const boundary = type_support.boundaryFromTypeRef(ty);
+    return targetTypeNameForTypeRef(active, boundary.inner_type);
+}
+
+fn targetTypeNameFromSyntax(syntax_value: @import("../ast/root.zig").TypeSyntax) ?[]const u8 {
+    if (type_syntax_support.containsInvalid(syntax_value)) return null;
+    var view = type_forms.View.fromSyntax(std.heap.page_allocator, syntax_value) catch return null;
+    defer view.deinit();
+    const root = view.rootNode();
+    return switch (root.payload) {
+        .borrow => blk: {
+            const children = view.rootChildren();
+            if (children.len == 0) break :blk null;
+            break :blk baseNameAtNode(view.syntax, children[children.len - 1]);
+        },
+        else => type_forms.baseName(view),
+    };
+}
+
+fn baseNameAtNode(syntax_value: @import("../ast/root.zig").TypeSyntax, node_index: usize) ?[]const u8 {
+    const node = syntax_value.nodes[node_index];
+    return switch (node.payload) {
+        .name_ref => std.mem.trim(u8, node.source.text, " \t\r\n"),
+        .apply => blk: {
+            const children = syntax_value.childNodeIndices(node_index);
+            if (children.len == 0) break :blk null;
+            const base = syntax_value.nodes[children[0]];
+            if (base.payload != .name_ref) break :blk null;
+            break :blk std.mem.trim(u8, base.source.text, " \t\r\n");
+        },
+        else => null,
+    };
+}
+
+fn typeRefFromStandaloneTypeText(allocator: std.mem.Allocator, raw: []const u8) !types.TypeRef {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .unsupported;
+    var syntax_value = (try type_text_syntax.lowerStandalone(allocator, trimmed)) orelse return .unsupported;
+    defer syntax_value.deinit(allocator);
+    return type_lowering.typeRefFromSyntax(allocator, syntax_value);
 }
